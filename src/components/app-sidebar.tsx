@@ -1,28 +1,42 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import {
-  Sparkles,
-  FileText,
-  Plug,
-  Settings,
-  ChevronsUpDown,
-} from "lucide-react";
+import { FileText, Users, Settings } from "lucide-react";
 import { NucleusMark } from "@/components/brand";
-import { currentUser } from "@/lib/mock";
+import { UserMenu } from "@/components/user-menu";
 import { cn } from "@/lib/utils";
 
+// Real, reachable destinations only. "Ask" was removed (it rendered the same
+// dashboard; the Ask panel lives on /dashboard). "Sources" was removed (the
+// connectors feature is out of scope — no real connected sources exist).
+// `adminOnly` items are hidden from non-admins (server access is also gated; this
+// just avoids dead-end links into a forbidden page).
 const nav = [
-  { label: "Ask", href: "/dashboard?view=ask", icon: Sparkles, match: "ask" },
   { label: "Documents", href: "/dashboard", icon: FileText, match: "documents" },
-  { label: "Sources", href: "/settings?tab=sources", icon: Plug, match: "sources" },
-  { label: "Settings", href: "/settings", icon: Settings, match: "settings" },
+  { label: "Admin", href: "/settings", icon: Users, match: "admin", adminOnly: true },
 ];
 
 export function AppSidebar({ active }: { active: string }) {
   const pathname = usePathname();
   void pathname; // pathname kept for future client-side active detection
+
+  // Resolve the real role to gate admin-only nav (the dashboard is reachable by
+  // everyone; Settings/Users is admin-only). Defaults to hiding admin items until
+  // the role is known, so a member never briefly sees a dead-end link.
+  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/me")
+      .then((r) => r.json())
+      .then((d) => alive && setIsAdmin(d?.user?.role === "admin"))
+      .catch(() => alive && setIsAdmin(false));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const visibleNav = nav.filter((item) => !item.adminOnly || isAdmin === true);
 
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-line bg-surface">
@@ -34,27 +48,23 @@ export function AppSidebar({ active }: { active: string }) {
         </span>
       </div>
 
-      {/* workspace switcher */}
+      {/* workspace label — neutral (no mock company/plan) */}
       <div className="px-3 pt-4">
-        <button className="flex w-full items-center gap-3 rounded-lg border border-line bg-canvas px-3 py-2.5 text-left transition-colors hover:bg-muted">
+        <div className="flex w-full items-center gap-3 rounded-lg border border-line bg-canvas px-3 py-2.5">
           <span className="flex size-8 items-center justify-center rounded-md bg-ink text-xs font-semibold text-white">
-            MR
+            N
           </span>
           <span className="min-w-0 flex-1">
             <span className="block truncate text-sm font-semibold text-ink">
-              {currentUser.company}
-            </span>
-            <span className="block truncate text-xs text-faint">
-              Business plan
+              Nucleus workspace
             </span>
           </span>
-          <ChevronsUpDown className="size-4 text-faint" />
-        </button>
+        </div>
       </div>
 
       {/* nav */}
       <nav className="flex-1 space-y-1 px-3 pt-4">
-        {nav.map((item) => {
+        {visibleNav.map((item) => {
           const isActive = item.match === active;
           return (
             <Link
@@ -74,22 +84,9 @@ export function AppSidebar({ active }: { active: string }) {
         })}
       </nav>
 
-      {/* user */}
+      {/* user — real session + sign out */}
       <div className="border-t border-line p-3">
-        <button className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-muted">
-          <span className="flex size-9 items-center justify-center rounded-full bg-accent text-sm font-semibold text-accent-fg">
-            {currentUser.initials}
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-semibold text-ink">
-              {currentUser.name}
-            </span>
-            <span className="block truncate text-xs text-faint">
-              {currentUser.email}
-            </span>
-          </span>
-          <ChevronsUpDown className="size-4 text-faint" />
-        </button>
+        <UserMenu />
       </div>
     </aside>
   );

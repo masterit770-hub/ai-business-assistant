@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 
 export interface SimpleTab {
@@ -11,6 +12,8 @@ export interface SimpleTab {
 
 // A small, dependency-free tab bar — horizontal pills over the active panel.
 // Used on Settings; reliable across Tailwind v4 without generated custom variants.
+// Honors a `?tab=<value>` query param (so sidebar deep-links open the right tab),
+// falling back to defaultValue.
 export function SimpleTabs({
   tabs,
   defaultValue,
@@ -18,7 +21,13 @@ export function SimpleTabs({
   tabs: SimpleTab[];
   defaultValue?: string;
 }) {
-  const [active, setActive] = useState(defaultValue ?? tabs[0]?.value);
+  const searchParams = useSearchParams();
+  const fromUrl = searchParams.get("tab");
+  const initial =
+    (fromUrl && tabs.some((t) => t.value === fromUrl) && fromUrl) ||
+    defaultValue ||
+    tabs[0]?.value;
+  const [active, setActive] = useState(initial);
   const current = tabs.find((t) => t.value === active) ?? tabs[0];
 
   return (

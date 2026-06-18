@@ -176,82 +176,19 @@ export const sampleAnswer: AnsweredQuestion = {
   ],
 };
 
+// Example prompts shown in the Ask panel. These MUST map to the real bundled
+// corpus (contracts / maintenance / the Carter case file) so every suggestion
+// returns a grounded, cited answer — never a "no source" miss. (The previous set
+// named Acme Corp / Northwind / "gross margin", entities that don't exist in the
+// data, which contradicted what the Documents view shows.) Verified live to return
+// [S:contracts#…] / [S:maintenance#…] / [P:family-court#…] citations.
 export const suggestedQuestions: string[] = [
-  "Which contracts renew in the next 30 days?",
-  "Summarize the Acme Corp MSA termination clause",
-  "What was our gross margin last quarter?",
-  "Who owns the Northwind SOW?",
+  "How many vendor contracts are there, and what is their combined annual value?",
+  "What is the total maintenance spend across all invoices?",
+  "Who are the parties in the Carter family court case, and what was decided?",
+  "Which contracts expire in the next 90 days?",
 ];
 
-export interface PricingTier {
-  name: string;
-  price: string;
-  cadence: string;
-  blurb: string;
-  features: string[];
-  cta: string;
-  highlighted?: boolean;
-}
-
-export const pricingTiers: PricingTier[] = [
-  {
-    name: "Starter",
-    price: "$0",
-    cadence: "/ month",
-    blurb: "For individuals organizing their first sources.",
-    features: [
-      "1 workspace",
-      "Up to 200 documents",
-      "2 connected sources",
-      "Ask Nucleus — 100 questions / mo",
-      "Community support",
-    ],
-    cta: "Get started",
-  },
-  {
-    name: "Pro",
-    price: "$49",
-    cadence: "/ user / month",
-    blurb: "For teams that live in their documents and numbers.",
-    features: [
-      "Unlimited documents",
-      "All connectors (QuickBooks, Slack, CRM…)",
-      "Trustworthy numbers with citations",
-      "Unlimited questions",
-      "Priority support",
-    ],
-    cta: "Start free trial",
-    highlighted: true,
-  },
-  {
-    name: "Business",
-    price: "$129",
-    cadence: "/ user / month",
-    blurb: "For companies that need control and audit.",
-    features: [
-      "Everything in Pro",
-      "SSO & SCIM provisioning",
-      "Audit log & data residency",
-      "Role-based source permissions",
-      "Dedicated success manager",
-    ],
-    cta: "Contact sales",
-  },
-];
-
-export interface ConnectedSource {
-  label: string;
-  hint: string;
-}
-
-// The chips that orbit the central "Nucleus" node on the landing page.
-export const connectedSources: ConnectedSource[] = [
-  { label: "PDFs", hint: "Contracts & reports" },
-  { label: "Excel", hint: "Models & ledgers" },
-  { label: "QuickBooks", hint: "Live financials" },
-  { label: "Slack", hint: "Team knowledge" },
-  { label: "CRM", hint: "Deals & contacts" },
-];
 
 export const currentUser = {
   name: "Dana Whitfield",
@@ -260,3 +197,94 @@ export const currentUser = {
   role: "Operations Lead",
   company: "Meridian Robotics",
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin seed data — demo-grade. The Users panel and Prompt config below are
+// SHELLS: real, interactive UI over seed data, but NOT auth-enforced (a later
+// phase). Labelled "Demo" in the UI so nobody mistakes them for live RBAC.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type MemberStatus = "active" | "invited" | "deactivated";
+export type MemberRole = "Owner" | "Admin" | "Member" | "Viewer";
+
+export interface TeamMember {
+  id: string;
+  name: string;
+  email: string;
+  initials: string;
+  role: MemberRole;
+  status: MemberStatus;
+  lastActive: string;
+}
+
+export const teamMembers: TeamMember[] = [
+  {
+    id: "u-01",
+    name: "Dana Whitfield",
+    email: "dana@meridian.co",
+    initials: "DW",
+    role: "Owner",
+    status: "active",
+    lastActive: "Active now",
+  },
+  {
+    id: "u-02",
+    name: "Priya Nair",
+    email: "priya@meridian.co",
+    initials: "PN",
+    role: "Admin",
+    status: "active",
+    lastActive: "12 min ago",
+  },
+  {
+    id: "u-03",
+    name: "Marcus Reed",
+    email: "marcus@meridian.co",
+    initials: "MR",
+    role: "Member",
+    status: "active",
+    lastActive: "2 hours ago",
+  },
+  {
+    id: "u-04",
+    name: "Leo Tanaka",
+    email: "leo@meridian.co",
+    initials: "LT",
+    role: "Member",
+    status: "active",
+    lastActive: "Yesterday",
+  },
+  {
+    id: "u-05",
+    name: "Sofia Alvarez",
+    email: "sofia@meridian.co",
+    initials: "SA",
+    role: "Viewer",
+    status: "invited",
+    lastActive: "Invite pending",
+  },
+  {
+    id: "u-06",
+    name: "Tom Becker",
+    email: "tom@contractor.io",
+    initials: "TB",
+    role: "Viewer",
+    status: "deactivated",
+    lastActive: "Deactivated Apr 30",
+  },
+];
+
+// The default prompts the Prompt-config surface edits. The system prompt governs
+// grounded generation; the urgency prompt drives the green/amber/red doc badges.
+export const defaultSystemPrompt = `You answer business questions using ONLY the retrieved evidence.
+- Attach an inline citation token to EVERY factual claim, copied verbatim from the evidence (e.g. [S:contracts#12] for a row, [P:family-court#24] for a page).
+- Use ONLY tokens that appear in the evidence. Never invent a citation.
+- The structured (SQL) and document (PDF) sources are unrelated — never merge or join them.
+- If the evidence does not contain the answer, say so plainly. Do NOT fabricate.
+- Be concise and concrete; state verified aggregates exactly.`;
+
+export const defaultUrgencyPrompt = `Classify each document's urgency for the dashboard badge.
+- HIGH (red): contracts/notices expiring within 30 days, renewals, anything time-critical or financially material this month.
+- MEDIUM (amber): items needing attention this quarter — pending reviews, upcoming renewals 30–90 days out.
+- LOW (green): reference material, completed items, nothing time-sensitive.
+Return exactly one of: high | medium | low.`;

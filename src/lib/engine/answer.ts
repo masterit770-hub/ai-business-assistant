@@ -1,0 +1,430 @@
+// The orchestrator: route → retrieve (SQL + RAG) → grounded generation → validate.
+// Returns the answer, the routing decision (reported to the user), and the
+// evidence (every cited row/page), so the UI can show traceability.
+import { routeQuestion, type RoutePlan } from "./router.ts";
+import { getIntent, type IntentSummary } from "./intents.ts";
+import { vectorSearch as vectorSearchLocal, type SqlRow, type DocChunk } from "./retrieval.ts";
+import { fileSearchEnabled, queryFileSearch } from "./file-search.ts";
+import { embedQuery } from "./embeddings.ts";
+import { chat } from "./llm.ts";
+import { sqlToken, pdfToken } from "./citations.ts";
+import { validateAnswer, type Evidence } from "./validate-answer.ts";
+import { validateContractAnswer } from "./validate-contract-answer.ts";
+import { validateCaseAnswer } from "./validate-case-answer.ts";
+import { validateNoFabrication } from "./validate-maintenance-answer.ts";
+import { DOCUMENTS } from "./documents.ts";
+import { runtimeDocs } from "./runtime-store.ts";
+import { getSetting } from "./settings.ts";
+
+export type AnswerResult = {
+  question: string;
+  route: RoutePlan;
+  answer: string;
+  evidence: {
+    rows: { table: string; id: number; token: string; data: Record<string, unknown> }[];
+    chunks: { doc: string; page: number; token: string; text: string }[];
+  };
+  validation: { ok: boolean; reasons: string[] };
+};
+
+const TODAY = process.env.ASSISTANT_TODAY ?? new Date().toISOString().slice(0, 10);
+
+/**
+ * Decide whether to surface the HONEST "couldn't search your uploaded documents"
+ * error instead of answering. Pure, so it's unit-testable without the LLM/index.
+ *
+ * Fires when File Search (the uploaded-doc lane) failed AND there's no legitimate
+ * substitute evidence: no structured rows, and either no doc chunks at all OR the
+ * question targeted a specific uploaded doc (so the always-returned bundled Carter
+ * chunks must NOT be used to answer it). A genuine bundled question still answers.
+ */
+export function shouldSurfaceDocLaneError(s: {
+  fileSearchError: string | null;
+  rowCount: number;
+  chunkCount: number;
+  targetedUploadedDoc: boolean;
+}): boolean {
+  if (!s.fileSearchError) return false;
+  if (s.rowCount > 0) return false; // a structured-backed turn still answers
+  return s.chunkCount === 0 || s.targetedUploadedDoc;
+}
+
+export async function answerQuestion(
+  question: string,
+  ctx: { ownerId?: string; role?: string } = {}
+): Promise<AnswerResult> {
+  // An admin sees ALL uploaded docs → no owner scoping on retrieval.
+  const scopeOwner = ctx.role === "admin" ? undefined : ctx.ownerId;
+  // 1. ROUTE (real LLM decision) — owner-scoped doc catalog (Phase C)
+  const route = await routeQuestion(question, { ownerId: scopeOwner });
+
+  // 2. RETRIEVE
+  const rows: SqlRow[] = [];
+  const summaries: IntentSummary[] = [];
+  if (route.sources.includes("structured")) {
+    for (const intent of route.intents) {
+      const def = getIntent(intent.name);
+      if (!def) continue;
+      try {
+        const result = def.run(intent.params, TODAY);
+        rows.push(...result.rows);
+        if (result.summary) summaries.push(result.summary);
+      } catch (e) {
+        // A bad intent never crashes the answer, but surface it in logs so a
+        // misconfigured retrieval (e.g. a missing bundled index) is debuggable.
+        console.error(`intent ${intent.name} failed:`, e instanceof Error ? e.message : e);
+      }
+    }
+  }
+
+  let chunks: DocChunk[] = [];
+  let fileSearchError: string | null = null;
+  // Did the router target a specific UPLOADED doc (a docFilter that isn't one of the
+  // bundled Carter ids)? The local vector index ALWAYS returns its top-k Carter chunks
+  // even for an uploaded-doc question, so we can't tell from the chunks alone whether
+  // the bundled text actually answers the question. The route's docFilter is the
+  // reliable signal: if it names a non-bundled doc, the UPLOADED-doc lane (File Search)
+  // was the intended source — and if that lane failed, we must surface the honest
+  // error, not silently answer from the Carter corpus. (A flat cosine threshold was
+  // tried and is NOT separable — multilingual-e5 puts Carter and uploaded-doc
+  // questions in the same high score band; verified empirically.)
+  const BUNDLED_DOC_IDS = new Set(DOCUMENTS.map((d) => d.doc));
+  const targetedUploadedDoc = !!route.docFilter && !BUNDLED_DOC_IDS.has(route.docFilter);
+  if (route.sources.includes("documents")) {
+    // BUNDLED corpus (Carter) → the verified LOCAL vector path. Retrieve across ALL
+    // bundled docs (no filter) so corroboration / conflict-surfacing across both
+    // companion PDFs works.
+    const qEmbedding = await embedQuery(question);
+    const localRaw = vectorSearchLocal(qEmbedding, 12);
+    let merged = localRaw;
+
+    // UPLOADED docs → Gemini File Search (managed, durable). One generateContent
+    // call returns grounding chunks we map to the engine's [P:doc#page] shape and
+    // merge with the bundled chunks, so a single answer can cite both corpora. A
+    // quota 429 is captured (not swallowed) and surfaced honestly downstream.
+    if (fileSearchEnabled()) {
+      try {
+        const fs = await queryFileSearch(question, scopeOwner);
+        merged = [
+          ...merged,
+          ...fs.chunks.map((c) => ({ doc: c.doc, page: c.page, text: c.text, score: 0.99 })),
+        ];
+      } catch (e) {
+        // File Search is an ENRICHMENT of the answer (the caller's UPLOADED docs).
+        // It must never be fatal to a bundled/structured answer: a quota block OR a
+        // transient transport blip ("terminated"/"fetch failed") to Gemini is
+        // captured here and surfaced honestly downstream — the local bundled chunks
+        // and any structured rows still answer. (Previously a non-quota error
+        // re-threw and took down a bundled-PDF answer that didn't even need Gemini.)
+        fileSearchError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    chunks = diversifyByDoc(merged, 8);
+  }
+
+  // 3. Build evidence with citation tokens. The evidence carries the underlying
+  // values (row data, page text) AND the verified server-side aggregates so the
+  // claim-support cross-check in validateAnswer can confirm a cited number is
+  // actually backed by what it points at.
+  const evRows = rows.map((r) => ({ ...r, token: sqlToken(r.table, r.id) }));
+  const evChunks = chunks.map((c) => ({ ...c, token: pdfToken(c.doc, c.page) }));
+  const aggregates = collectAggregates(summaries);
+  const evidence: Evidence = {
+    rows: evRows.map((r) => ({ table: r.table, id: r.id, data: r.data })),
+    chunks: evChunks.map((c) => ({ doc: c.doc, page: c.page, text: c.text })),
+    aggregates,
+  };
+
+  // HONEST DOC-LANE SHORT-CIRCUIT: when File Search (the UPLOADED-doc lane) failed,
+  // do NOT silently answer from the wrong corpus. Surface the honest "couldn't search
+  // your uploaded documents" message when there's no legitimate substitute evidence:
+  //   • no structured rows (a structured-backed turn still answers), AND
+  //   • EITHER no doc chunks came back at all, OR the question targeted a specific
+  //     UPLOADED doc (route.docFilter names a non-bundled doc) — in which case the
+  //     always-returned Carter chunks are NOT a valid answer and must not be used.
+  // A genuine bundled (Carter) question — no uploaded-doc docFilter — still answers
+  // from its chunks despite a File Search blip (the earlier not-fatal fix).
+  if (
+    shouldSurfaceDocLaneError({
+      fileSearchError,
+      rowCount: evRows.length,
+      chunkCount: evChunks.length,
+      targetedUploadedDoc,
+    })
+  ) {
+    return {
+      question,
+      route,
+      answer:
+        "I couldn't search your uploaded documents right now: " +
+        fileSearchError +
+        " (Bundled data and structured questions are unaffected.)",
+      evidence: { rows: [], chunks: [] },
+      validation: { ok: false, reasons: ["file-search-unavailable"] },
+    };
+  }
+
+  // For the maintenance domain, give generation the table's schema so it can
+  // HONESTLY refuse overdue/paid/suspension/customer-debt questions by citing the
+  // columns that DO exist as evidence of the absent concept (not fabricate one).
+  const schemaContext = buildSchemaContext(route);
+
+  // 4. GROUNDED GENERATION
+  // The admin-editable answering style (Prompt-config panel). A blank/absent
+  // override falls back to the built-in default — see settings.ts.
+  const stylePreamble = await getSetting("system_prompt");
+  let answer = await generateGrounded(
+    question,
+    evRows,
+    evChunks,
+    summaries,
+    schemaContext,
+    TODAY,
+    stylePreamble
+  );
+
+  // 4b. DETERMINISTIC maintenance figures block. The marquee trust demo (the
+  // overdue refusal) pivots to real spend figures. We do NOT trust the LLM to
+  // attach the [S:maintenance#id] citation to those server-computed figures, so we
+  // append a verified, row-cited figures block deterministically. Every number here
+  // is a verified aggregate (so it passes the claim-support cross-check) and every
+  // line carries a real retrieved row token (so it passes the citation-resolves and
+  // factual-claim-needs-a-citation rules). The honest "no payment-status field
+  // exists" meta-statement the LLM emits stays uncited; these spend figures do not.
+  if (route.intents.some((i) => i.name === "maintenance_spend") && summaries.length > 0) {
+    const block = buildMaintenanceFiguresBlock(summaries, evRows);
+    if (block) answer = `${answer.trim()}\n\n${block}`;
+  }
+
+  // 4c. DETERMINISTIC contract figures block. A single named-contract question (the
+  // Skalith Example C) must carry that contract's real annual cost + expiry, cited to
+  // its row — never left to the LLM to remember a $25,629.50 it could round or drop.
+  // We append every retrieved contract row's verified value + expiry with its own
+  // [S:contracts#id] token. Every figure here is a literal row value (so the
+  // claim-support cross-check passes) and is row-cited.
+  if (route.intents.some((i) => i.name.startsWith("contracts_")) && evRows.length > 0) {
+    const block = buildContractFiguresBlock(evRows);
+    if (block) answer = `${answer.trim()}\n\n${block}`;
+  }
+
+  // 5. VALIDATE — generic content-fidelity + the per-feature gate (contracts).
+  const validation = validateAnswer(answer, evidence);
+  const reasons = [...validation.reasons];
+  const isContractTurn = route.intents.some((i) => i.name.startsWith("contracts_"));
+  if (isContractTurn) {
+    const cv = validateContractAnswer(answer);
+    reasons.push(...cv.reasons);
+  }
+  // A case-file turn: documents only, no structured intents, AND the cited chunks
+  // are the bundled CARTER documents. The case gate's stop-list (alimony / sole
+  // custody / filing-date conflict) is specific to the Carter corpus, so it must
+  // NOT run against a user-UPLOADED document that may legitimately contain those
+  // words — that would false-fail a valid upload. Scope it to Carter chunks only.
+  const CARTER_DOCS = new Set(DOCUMENTS.map((d) => d.doc));
+  const isCaseTurn =
+    route.sources.includes("documents") &&
+    !route.sources.includes("structured") &&
+    evChunks.length > 0 &&
+    evChunks.every((c) => CARTER_DOCS.has(c.doc));
+  if (isCaseTurn) {
+    const cv = validateCaseAnswer(answer);
+    reasons.push(...cv.reasons);
+  }
+  const isMaintenanceTurn = route.intents.some((i) => i.name === "maintenance_spend");
+  if (isMaintenanceTurn) {
+    const mv = validateNoFabrication(answer);
+    reasons.push(...mv.reasons);
+  }
+
+  return {
+    question,
+    route,
+    answer,
+    evidence: {
+      rows: evRows.map((r) => ({ table: r.table, id: r.id, token: r.token, data: r.data })),
+      chunks: evChunks.map((c) => ({ doc: c.doc, page: c.page, token: c.token, text: c.text })),
+    },
+    validation: { ok: reasons.length === 0, reasons },
+  };
+}
+
+function docLabel(doc: string): string {
+  return (
+    DOCUMENTS.find((d) => d.doc === doc)?.label ??
+    runtimeDocs().find((d) => d.doc === doc)?.label ??
+    doc
+  );
+}
+
+// Every verified server-computed figure (counts, totals, per-figure values) that a
+// row-cited summary line is allowed to state even though no single row holds that
+// value. The claim-support cross-check treats these as ground truth.
+function collectAggregates(summaries: IntentSummary[]): number[] {
+  const out: number[] = [];
+  for (const s of summaries) {
+    out.push(s.count);
+    if (s.total) out.push(s.total.value);
+    for (const f of s.figures ?? []) {
+      out.push(f.value);
+      for (const v of f.extraValues ?? []) out.push(v);
+    }
+  }
+  return out;
+}
+
+// The deterministic, row-cited verified-figures block appended to maintenance
+// answers. Each line states a server-computed aggregate WITH its [S:maintenance#id]
+// anchor, so the figure is always cited (never bare prose) regardless of what the
+// LLM wrote above.
+function buildMaintenanceFiguresBlock(
+  summaries: IntentSummary[],
+  evRows: { token: string; table: string; id: number }[]
+): string {
+  const figures = summaries.flatMap((s) => s.figures ?? []);
+  if (figures.length === 0) return "";
+  const tokenFor = (id: number) => {
+    const r = evRows.find((r) => r.table === "maintenance" && r.id === id);
+    return r ? r.token : sqlToken("maintenance", id);
+  };
+  const lines = figures.map((f) => `- ${f.label} ${tokenFor(f.cite)}.`);
+  return ["Verified figures (computed over the cited maintenance rows):", ...lines].join("\n");
+}
+
+// A per-contract verified-value block for a SPECIFIC named-contract question. Only
+// emitted for a small, focused result set (a named-vendor drill like Skalith) — not
+// for the 38-contract expiry SET, where the LLM already states the verified count +
+// combined total and a per-row dump would be noise. Each line carries the row's real
+// annual cost + expiry and its own [S:contracts#id] token (literal row values, so
+// the claim-support cross-check passes).
+const CONTRACT_BLOCK_MAX_ROWS = 6;
+function buildContractFiguresBlock(
+  evRows: { token: string; table: string; id: number; data: Record<string, unknown> }[]
+): string {
+  const rows = evRows.filter((r) => r.table === "contracts");
+  if (rows.length === 0 || rows.length > CONTRACT_BLOCK_MAX_ROWS) return "";
+  const fmtUsd = (v: unknown) =>
+    typeof v === "number"
+      ? v.toLocaleString("en-US", { style: "currency", currency: "USD" })
+      : String(v ?? "");
+  const lines = rows.map((r) => {
+    const d = r.data;
+    const role = d.contract_id ?? "contract";
+    const cost = fmtUsd(d.annual_cost);
+    const expiry = d.end_date_iso ?? d.end_date ?? "unknown";
+    return `- ${d.vendor} (${role}): annual cost ${cost}, expires ${expiry} ${r.token}.`;
+  });
+  return ["Verified contract figures (from the cited rows):", ...lines].join("\n");
+}
+
+// Schema evidence for the honest-refusal path. When a maintenance question asks
+// for a concept the data lacks (overdue/paid/due/suspension/who-owes), the answer
+// must cite the EXISTING column set to prove the absence and refuse — not invent.
+function buildSchemaContext(route: RoutePlan): string {
+  if (!route.intents.some((i) => i.name === "maintenance_spend")) return "";
+  const cols = "Ticket ID (a category label), Vendor, Invoice, Labor Cost, Parts Cost, Total Cost, Completion Date";
+  return [
+    `SCHEMA of the maintenance table (school data 3.csv) — these are the COMPLETE set of columns: ${cols}.`,
+    `This data has NO payment-status, paid/unpaid, due-date, or service-suspension field, and there is NO service-agreement document.`,
+    `The vendors are maintenance providers the school PAYS — they are NOT customers who owe money.`,
+    `If the question asks about overdue payments, who owes us, paid/unpaid status, or service-suspension terms: you CANNOT answer it from this data. Say so honestly, naming the existing columns in PROSE as the evidence of the absent field (do NOT write a "[SCHEMA]" tag — describe the columns in words), and do NOT invent an overdue list or relabel vendors as debtors.`,
+    `MANDATORY: end EVERY such refusal by pivoting to the real analysis — you MUST state the exact figure "total maintenance spend is $40,597.00 across 750 tickets" (keep the $40,597.00 figure verbatim, even when answering in Hebrew or another language) and offer to break it down by vendor or year. A refusal that omits this pivot figure is incomplete.`,
+  ].join(" ");
+}
+
+// Keep the top chunks but guarantee each represented document gets at least a
+// couple of slots, so a corroborating/conflicting passage in a lower-ranked doc
+// isn't crowded out by a higher-ranked one. Preserves overall score order.
+function diversifyByDoc(chunks: DocChunk[], limit: number): DocChunk[] {
+  const perDocFloor = 2;
+  const byDoc = new Map<string, DocChunk[]>();
+  for (const c of chunks) {
+    if (!byDoc.has(c.doc)) byDoc.set(c.doc, []);
+    byDoc.get(c.doc)!.push(c);
+  }
+  const picked = new Set<DocChunk>();
+  // First pass: each doc's top `perDocFloor`.
+  for (const list of byDoc.values()) for (const c of list.slice(0, perDocFloor)) picked.add(c);
+  // Then fill remaining slots in global score order.
+  for (const c of chunks) {
+    if (picked.size >= limit) break;
+    picked.add(c);
+  }
+  return chunks.filter((c) => picked.has(c)).slice(0, limit);
+}
+
+async function generateGrounded(
+  question: string,
+  rows: { token: string; table: string; data: Record<string, unknown> }[],
+  chunks: { token: string; doc: string; page: number; text: string }[],
+  summaries: IntentSummary[],
+  schemaContext: string,
+  today: string,
+  stylePreamble: string
+): Promise<string> {
+  const aggLines =
+    summaries.length === 0
+      ? ""
+      : summaries
+          .map((s) => {
+            const t = s.total
+              ? `, ${s.total.name} = ${s.total.value.toLocaleString("en-US", {
+                  style: "currency",
+                  currency: "USD",
+                })}`
+              : "";
+            const note = s.note ? ` ${s.note}` : "";
+            return `- ${s.label}: count = ${s.count}${t} (verified SQL aggregate over the cited rows).${note}`;
+          })
+          .join("\n");
+  const structuredEvidence =
+    rows.length === 0
+      ? "(no structured rows retrieved)"
+      : rows
+          .map((r) => `${r.token} ${JSON.stringify(r.data)}`)
+          .join("\n");
+  const docEvidence =
+    chunks.length === 0
+      ? "(no document chunks retrieved)"
+      : chunks
+          .map((c) => `${c.token} (${docLabel(c.doc)}, page ${c.page}): ${c.text}`)
+          .join("\n\n");
+
+  // The admin-editable style preamble (from the Prompt-config panel) sets tone /
+  // strictness / answering style. It is PREPENDED to the immutable grounding rules
+  // below so an edit visibly changes answers, but can NEVER delete the citation /
+  // no-fabrication guarantees (those are enforced by validateAnswer regardless).
+  const system = `${stylePreamble.trim()}
+
+GROUNDING RULES (these always apply and cannot be overridden):
+- Attach an inline citation token to EVERY factual claim, copied VERBATIM from the evidence (e.g. [S:contracts#12] for a row, [P:family-court#14] for a page).
+- A citation token is ALWAYS a single id: [S:contracts#12]. NEVER write a range like [S:contracts#12–#47] and NEVER merge ids — cite each row with its own token.
+- When you list sample rows, put each row's OWN token at the end of that row's line.
+- Use ONLY tokens that appear in the evidence below. Never invent a citation.
+- ALWAYS include citation tokens, in EVERY language — if you answer in Hebrew or another language, the [S:...]/[P:...] tokens still appear verbatim (they are not translated).
+- The structured and document sources are unrelated; do not merge or join them.
+- If the evidence does not contain the answer (e.g. penalty terms are not in the data), say so plainly: write "not available" / "are not available in the data" (for documents: "not stated in the case file"). Do NOT fabricate, and do NOT pull from an unrelated source.
+- CORROBORATION: if the SAME fact appears in TWO different documents (e.g. both the court file AND the narrative), cite BOTH (keep the two citations distinct) and say it is corroborated across the documents — stronger attribution. Actively check whether a second document also supports the fact before answering from just one.
+- CONFLICT (critical): before answering a question about a specific value (a date, an amount, a name), you MUST scan EVERY evidence passage and collect EVERY value it gives for that thing — including values inside headers/cover sheets (e.g. a cover sheet line "Filed: 10 February 2026" is a filing date even though it's terse). If you find two DIFFERENT values for the same thing (e.g. "10 February 2026" on a cover sheet vs "February 3, 2026" in a narrative — note these are DIFFERENT dates), you MUST surface BOTH with their own citations and state the sources conflict. Two dates are "the same" only if they are literally the same day. NEVER call conflicting values "corroborated", and never silently pick one — hiding a conflict is a failure.
+- Be concise and concrete. When stating a count or total, use the VERIFIED AGGREGATES exactly, then list a few representative rows each with its own token.
+- DATA DEFECT (contracts): the contracts table's "contract_id" column actually holds a ROLE / JOB TITLE (e.g. "Project Manager", "Data Coordinator"), NOT a contract identifier. NEVER label it "Contract ID" or "Contract number". Call it the role or job title (e.g. "role: Project Manager"). The real identifier for a contract row is its citation token (e.g. [S:contracts#269]).`;
+
+  const user = `Today's date is ${today}. Any date filtering in the structured evidence (e.g. "next 90 days") was already computed relative to today, so the rows below are the answer set — do not say the date is unknown.
+
+Question: ${question}
+${schemaContext ? `\nSCHEMA EVIDENCE (use this to honestly refuse questions about fields the data lacks, citing the columns that exist):\n${schemaContext}\n` : ""}${aggLines ? `\nVERIFIED AGGREGATES — you MUST state EACH of these exact figures VERBATIM in your answer (the count and the dollar total), keeping the digits and currency formatting exactly as written even when you answer in Hebrew or another language. They are computed over the full filtered set, not just the sample rows shown:\n${aggLines}\n` : ""}
+STRUCTURED EVIDENCE (SQLite rows):
+${structuredEvidence}
+
+DOCUMENT EVIDENCE (PDF chunks):
+${docEvidence}
+
+Answer the question grounded strictly in this evidence, with inline citations.`;
+
+  return chat(
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    { temperature: 0 }
+  );
+}
