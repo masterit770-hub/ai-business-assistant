@@ -1,0 +1,105 @@
+@import "tailwindcss";
+
+/* ── Custom variants the shadcn (radix) components rely on. Normally written by
+   `shadcn init`; re-added here because the init's CSS step was interrupted. ── */
+@custom-variant data-active (&[data-state="active"], &[data-active]);
+@custom-variant data-horizontal (&[data-orientation="horizontal"], &[data-horizontal]);
+@custom-variant data-vertical (&[data-orientation="vertical"], &[data-vertical]);
+
+@theme {
+  /* ── Surfaces & ink ── */
+  --color-canvas: #fafaf9;
+  --color-surface: #ffffff;
+  --color-ink: #0a0a0b;
+  --color-subtle: #44403c;   /* secondary text */
+  --color-faint: #78716c;    /* tertiary / captions */
+  --color-line: #e7e5e4;
+  --color-line-strong: #d6d3d1;
+
+  /* ── Accent — one confident teal ── */
+  --color-accent: #0d9488;
+  --color-accent-fg: #ffffff;
+  --color-accent-soft: #f0fdfa;
+  --color-accent-ring: #99f6e4;
+
+  /* ── Urgency ── */
+  --color-high: #e11d48;
+  --color-high-soft: #fff1f2;
+  --color-medium: #d97706;
+  --color-medium-soft: #fffbeb;
+  --color-low: #64748b;
+  --color-low-soft: #f1f5f9;
+
+  /* ── Fonts ── */
+  --font-display: var(--font-display), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-mono), ui-monospace, monospace;
+
+  /* ── Radii ── */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+  --radius-2xl: 1.125rem;
+  --radius-4xl: 2rem;
+
+  /* ── Soft shadows ── */
+  --shadow-soft: 0 1px 2px 0 rgb(10 10 11 / 0.04), 0 1px 3px 0 rgb(10 10 11 / 0.06);
+  --shadow-card: 0 1px 2px 0 rgb(10 10 11 / 0.04), 0 8px 24px -12px rgb(10 10 11 / 0.12);
+  --shadow-lift: 0 2px 4px 0 rgb(10 10 11 / 0.04), 0 18px 40px -16px rgb(10 10 11 / 0.18);
+
+  /* ── shadcn/ui semantic tokens, mapped onto the Nucleus palette ── */
+  --color-background: var(--color-surface);
+  --color-foreground: var(--color-ink);
+  --color-card: var(--color-surface);
+  --color-card-foreground: var(--color-ink);
+  --color-popover: var(--color-surface);
+  --color-popover-foreground: var(--color-ink);
+  --color-primary: var(--color-accent);
+  --color-primary-foreground: var(--color-accent-fg);
+  --color-secondary: #f5f5f4;
+  --color-secondary-foreground: var(--color-ink);
+  --color-muted: #f5f5f4;                 /* surface tint (bg-muted, hover) */
+  --color-muted-foreground: var(--color-faint);
+  --color-accent-foreground: var(--color-ink);
+  --color-destructive: var(--color-high);
+  --color-destructive-foreground: #ffffff;
+  --color-border: var(--color-line);
+  --color-input: var(--color-line);
+  --color-ring: var(--color-accent);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Headings default to the display face */
+h1, h2, h3, h4 {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}
+
+/* Utility: data/numbers in mono with tabular figures */
+.tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Subtle dotted grid used on hero / auth backdrops */
+.bg-dotgrid {
+  background-image: radial-gradient(circle, #e7e5e4 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+::selection {
+  background: var(--color-accent-ring);
+  color: var(--color-ink);
+}
