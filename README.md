@@ -1,36 +1,19 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Nucleus — AI Business Assistant
 
-## Getting Started
+An AI assistant that answers questions about your documents and business data — with a **citation on every fact**, so you can always check where an answer came from.
 
-First, run the development server:
+- **Cited Q&A** across your documents *and* structured data (contracts, maintenance, case files…) in one answer
+- **English & Hebrew**
+- **Upload** PDFs, scanned documents, Excel/CSV → ask about them immediately
+- **Access control** — admins create accounts and can remove anyone instantly; each user sees only their **own** uploaded documents
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+It is a **single Next.js application** (the UI and the retrieval/answer engine run together), deployed once.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Live demo
+**https://nucleus-woad.vercel.app/sign-in** — sample data is preloaded so you can try it right away. (Demo logins are provided separately.)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Run it on your own accounts
+See **[docs/HANDOFF.md](docs/HANDOFF.md)** — a step-by-step setup guide written so a non-technical owner (or an AI assistant) can follow it: which accounts to open (GitHub, Vercel, Supabase, Google Gemini), how to deploy, and how to make yourself the first admin. Copy `.env.example` to `.env.local` and fill in your own keys.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Tech
+Next.js (App Router) on Vercel · Supabase (auth + users) · Google Gemini File Search (document search) · a configurable answer model (DeepSeek / Gemini / Azure / Vertex — a one-line swap).
