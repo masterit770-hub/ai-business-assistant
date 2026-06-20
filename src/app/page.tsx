@@ -93,10 +93,41 @@ export default function LandingPage() {
               </p>
             </div>
 
-            {/* the live, animated product mock */}
+            {/* the rendered promo film — its scenes already contain browser
+                mockups, so no extra frame; just a clean rounded container */}
             <div className="lg:pl-4">
-              <AskDemo />
+              <div className="overflow-hidden rounded-2xl border border-line bg-surface shadow-lift">
+                <video
+                  className="aspect-video w-full"
+                  autoPlay
+                  muted
+                  loop
+                  playsInline
+                  preload="metadata"
+                  poster="/nucleus-promo-poster.jpg"
+                >
+                  <source src="/nucleus-promo.mp4" type="video/mp4" />
+                </video>
+              </div>
             </div>
+          </div>
+        </section>
+
+        {/* ── Live Ask demo ── */}
+        <section className="border-t border-line bg-canvas">
+          <div className="mx-auto max-w-3xl px-6 py-20">
+            <Reveal className="mb-10 text-center">
+              <h2 className="font-display text-3xl font-bold tracking-tight text-ink sm:text-4xl">
+                See it answer, live
+              </h2>
+              <p className="mx-auto mt-4 max-w-xl text-lg text-subtle">
+                A real golden question, the grounded answer, and the citation
+                chips that back it — rendered live, looping.
+              </p>
+            </Reveal>
+            <Reveal delay={120} className="mx-auto max-w-xl">
+              <AskDemo />
+            </Reveal>
           </div>
         </section>
 
