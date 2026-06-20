@@ -376,6 +376,33 @@ async function runAnswerPipeline(
     reasons.push(...mv.reasons);
   }
 
+  const validationOk = reasons.length === 0;
+
+  // ── GROUNDED → GENERAL FALLBACK (the broadened fix) ───────────────────────
+  // The grounded answer above is a refusal/non-answer EVEN IF it cited docs (the
+  // alimony "I cannot answer … not stated in the case file [P:carter#…]" case), OR a
+  // per-feature gate (e.g. validateCaseAnswer's alimony stop-list) REJECTED it. In
+  // either case surfacing it shows the user a refusal/red error. Instead, re-answer
+  // via the general-knowledge path (grounded=false, "not from your uploaded documents"
+  // label). The HARD EXCEPTION inside shouldFallbackToGeneral keeps every real
+  // grounded reply — including the DESIGNED maintenance honest-refusal, which PASSES
+  // validation and carries its verified $40,597 figure + [S:maintenance#…] tokens —
+  // grounded and untouched.
+  const hasVerifiedAggregate = aggregates.length > 0;
+  if (shouldFallbackToGeneral({ answer, validationOk, hasVerifiedAggregate })) {
+    // `stylePreamble` (the persona) is already fetched above — reuse it.
+    const generalAnswer = await generateGeneral(question, stylePreamble, TODAY);
+    return {
+      question,
+      route,
+      answer: generalAnswer,
+      mode: "general",
+      grounded: false,
+      evidence: { rows: [], chunks: [] },
+      validation: { ok: true, reasons: [] },
+    };
+  }
+
   return {
     question,
     route,
@@ -386,7 +413,7 @@ async function runAnswerPipeline(
       rows: evRows.map((r) => ({ table: r.table, id: r.id, token: r.token, data: r.data })),
       chunks: evChunks.map((c) => ({ doc: c.doc, page: c.page, token: c.token, text: c.text })),
     },
-    validation: { ok: reasons.length === 0, reasons },
+    validation: { ok: validationOk, reasons },
   };
 }
 
@@ -403,6 +430,79 @@ const REFUSAL_RE =
 function isUncitedRefusal(answer: string): boolean {
   if (extractCitationTokens(answer).length > 0) return false; // any citation → real grounded answer
   return REFUSAL_RE.test(answer);
+}
+
+// A BROADER refusal/non-answer detector than REFUSAL_RE above — it ALSO matches the
+// phrasing the grounded model uses when it declines a question whose answer the
+// retrieved evidence doesn't hold even though it pinned a citation while declining
+// (e.g. "I cannot answer this question because the evidence does not contain any
+// information about Arizona divorce law … not stated in the case file [P:carter#…]").
+// This is the gap the original isUncitedRefusal missed: that refusal CITES docs, so
+// the citation guard let it through and the user saw a refusal (often a red error
+// when a per-feature gate rejected the cited-but-refusing answer).
+//
+// Patterns taken from the spec (conservative — these are explicit non-answers, not
+// hedges): "I cannot answer", "evidence does not contain", "does/do not contain",
+// "none of these sources", "not stated in", "not available in (the) data/documents/
+// case file", "no information about/on", "don't/do not have … information".
+const REFUSAL_TEXT_RE =
+  /cannot answer|can'?t answer|evidence does not contain|do(es)? not contain|none of these sources|not stated in|not available in (the )?(data|documents?|case file)|no information (about|on)|do(n'?t| not) have .{0,40}information/i;
+
+// Does this grounded answer provide REAL grounded content, or is it effectively just
+// a refusal? "Real grounded content" = a sentence that asserts a fact (a number, a
+// currency figure, a quantified claim) that is NOT itself a not-found disclaimer. The
+// designed maintenance honest-refusal qualifies as real content: it states the
+// verified pivot figure ("total maintenance spend is $40,597.00 …") and carries its
+// [S:maintenance#…] tokens — so this returns true for it and it is NOT treated as an
+// empty refusal. A pure "I cannot answer … not in the case file" has no such
+// substantive figure-bearing sentence → returns false.
+const GROUNDED_FIGURE_RE = /\$[\d,]+(?:\.\d+)?|\b\d{2,}\b/;
+function hasUsefulGroundedContent(answer: string): boolean {
+  const sentences = answer.split(/(?<=[.!?])\s+/);
+  for (const s of sentences) {
+    if (REFUSAL_TEXT_RE.test(s) || REFUSAL_RE.test(s)) continue; // a disclaimer sentence is not "content"
+    if (GROUNDED_FIGURE_RE.test(s)) return true; // a substantive figure-bearing sentence
+  }
+  return false;
+}
+
+// THE BROADENED grounded→general fallback decision (the fix). Re-answer from general
+// knowledge instead of surfacing a refusal/rejected grounded answer when EITHER:
+//   • validateAnswer (incl. the per-feature gates) REJECTED the grounded answer, OR
+//   • the answer reads as a genuine refusal/non-answer AND carries no real grounded
+//     content — even if it pinned a citation while refusing.
+// HARD EXCEPTION (protect the designed maintenance honest-refusal and every real
+// grounded reply): if validation PASSED and the answer carries citation tokens OR a
+// verified aggregate figure, it is a VALID grounded answer → keep it grounded. So we
+// key primarily off validation REJECTION (+ genuine refusal text with no useful
+// grounded content), never off refusal wording alone.
+//
+// Pure + exported so the branching is unit-tested deterministically without an LLM:
+// pass the crafted answer string, the validation outcome, and the verified-aggregate
+// presence flag.
+export function shouldFallbackToGeneral(s: {
+  answer: string;
+  validationOk: boolean;
+  hasVerifiedAggregate: boolean;
+}): boolean {
+  const cited = extractCitationTokens(s.answer).length > 0;
+  // HARD EXCEPTION: a validation-PASSING answer that carries citations or a verified
+  // aggregate figure is a real grounded answer (this is the designed maintenance
+  // honest-refusal, the contracts answer, the case-file answer) — never fall back.
+  if (s.validationOk && (cited || s.hasVerifiedAggregate)) return false;
+
+  // Signal A — validation rejected the grounded answer (the alimony cited-refusal that
+  // tripped validateCaseAnswer's alimony stop-list lands here, red error and all).
+  if (!s.validationOk) return true;
+
+  // Signal B — validation passed but the answer is a genuine refusal/non-answer with
+  // no real grounded content (a refusal that pinned a citation but said nothing
+  // substantive). Conservative: requires refusal TEXT *and* the absence of any
+  // useful figure-bearing sentence.
+  const reads_as_refusal = REFUSAL_TEXT_RE.test(s.answer) || REFUSAL_RE.test(s.answer);
+  if (reads_as_refusal && !hasUsefulGroundedContent(s.answer)) return true;
+
+  return false;
 }
 
 // GENERAL-KNOWLEDGE generation — used ONLY when retrieval found no evidence for the
