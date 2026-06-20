@@ -7,7 +7,7 @@ import { vectorSearch as vectorSearchLocal, type SqlRow, type DocChunk } from ".
 import { fileSearchEnabled, queryFileSearch } from "./file-search.ts";
 import { embedQuery } from "./embeddings.ts";
 import { chat } from "./llm.ts";
-import { sqlToken, pdfToken } from "./citations.ts";
+import { sqlToken, pdfToken, extractCitationTokens } from "./citations.ts";
 import { validateAnswer, type Evidence } from "./validate-answer.ts";
 import { validateContractAnswer } from "./validate-contract-answer.ts";
 import { validateCaseAnswer } from "./validate-case-answer.ts";
@@ -20,6 +20,20 @@ export type AnswerResult = {
   question: string;
   route: RoutePlan;
   answer: string;
+  // The answering mode for this turn:
+  //  • "grounded" — the user's documents/data contained the answer. The reply is
+  //    grounded strictly in retrieved evidence, every fact is cited, and the
+  //    citation/no-fabrication gates (validateAnswer + the per-feature gates) ran.
+  //  • "general"  — the user has NO relevant documents/data for this question (the
+  //    router matched no source, or retrieval came back empty). The reply is the
+  //    model's general knowledge, has NO citations/evidence, and is intentionally
+  //    NOT run through the grounding validators (a general answer legitimately
+  //    carries no citation tokens — validating it would wrongly reject it).
+  mode: "grounded" | "general";
+  // Convenience flag mirroring `mode === "grounded"` for callers/UI that want a
+  // single boolean (the Ask panel uses this to show the muted "general knowledge"
+  // line vs. the grounded citations).
+  grounded: boolean;
   evidence: {
     rows: { table: string; id: number; token: string; data: Record<string, unknown> }[];
     chunks: { doc: string; page: number; token: string; text: string }[];
@@ -159,8 +173,38 @@ export async function answerQuestion(
         "I couldn't search your uploaded documents right now: " +
         fileSearchError +
         " (Bundled data and structured questions are unaffected.)",
+      mode: "grounded",
+      grounded: true,
       evidence: { rows: [], chunks: [] },
       validation: { ok: false, reasons: ["file-search-unavailable"] },
+    };
+  }
+
+  // ── GENERAL-KNOWLEDGE FALLBACK ────────────────────────────────────────────
+  // Did retrieval actually find anything the user can be answered FROM? Evidence
+  // exists when we got structured rows OR document chunks. (The router matching no
+  // source at all also lands here — it produces neither rows nor chunks.)
+  //
+  // When there is NO evidence, the OLD behavior was to still run grounded
+  // generation, whose immutable rules forced an "are not available in the data"
+  // refusal for a general question like "What is Arizona divorce law?". The client
+  // asked us to SOFTEN that: with no evidence, answer helpfully from the model's
+  // general knowledge instead of refusing — while the grounded, cited path below is
+  // untouched whenever the user's documents/data DO contain the answer.
+  const hasEvidence = evRows.length > 0 || evChunks.length > 0;
+  if (!hasEvidence) {
+    const persona = await getSetting("system_prompt");
+    const answer = await generateGeneral(question, persona, TODAY);
+    // No citation/grounding validation on this path: a general answer legitimately
+    // has no [S:...]/[P:...] tokens, so validateAnswer would wrongly reject it.
+    return {
+      question,
+      route,
+      answer,
+      mode: "general",
+      grounded: false,
+      evidence: { rows: [], chunks: [] },
+      validation: { ok: true, reasons: [] },
     };
   }
 
@@ -182,6 +226,31 @@ export async function answerQuestion(
     TODAY,
     stylePreamble
   );
+
+  // 4a. GENERAL-KNOWLEDGE FALLBACK (the bundled-corpus edge). The LOCAL vector index
+  // ALWAYS returns its top-k bundled (Carter) chunks, even for a question those docs
+  // have nothing to do with (e.g. "What is the capital of Australia?"). So
+  // `hasEvidence` above can be true on chunk count alone while the retrieved chunks
+  // do NOT actually answer the question — and grounded generation then emits the
+  // "are not available in the provided documents" refusal the client asked us to
+  // stop. We detect that precisely: a grounded answer that cites NOTHING and reads as
+  // a not-available refusal means the retrieved evidence did not in fact answer the
+  // question → answer from general knowledge instead. This is tightly scoped and
+  // CANNOT weaken a real grounded answer: every legitimate grounded reply (the Carter
+  // case file, contracts, the maintenance schema-refusal with its row-cited figures
+  // block) carries at least one citation token, so it never enters this branch.
+  if (isUncitedRefusal(answer)) {
+    const generalAnswer = await generateGeneral(question, stylePreamble, TODAY);
+    return {
+      question,
+      route,
+      answer: generalAnswer,
+      mode: "general",
+      grounded: false,
+      evidence: { rows: [], chunks: [] },
+      validation: { ok: true, reasons: [] },
+    };
+  }
 
   // 4b. DETERMINISTIC maintenance figures block. The marquee trust demo (the
   // overdue refusal) pivots to real spend figures. We do NOT trust the LLM to
@@ -240,12 +309,57 @@ export async function answerQuestion(
     question,
     route,
     answer,
+    mode: "grounded",
+    grounded: true,
     evidence: {
       rows: evRows.map((r) => ({ table: r.table, id: r.id, token: r.token, data: r.data })),
       chunks: evChunks.map((c) => ({ doc: c.doc, page: c.page, token: c.token, text: c.text })),
     },
     validation: { ok: reasons.length === 0, reasons },
   };
+}
+
+// A grounded answer that (a) carries NO citation token at all and (b) reads as a
+// "the evidence doesn't contain this" refusal. This is the signal that the
+// always-returned bundled chunks did not actually answer the question, so we should
+// answer from general knowledge instead of surfacing the refusal. The citation-token
+// guard is the safety: any real grounded answer cites something and is left alone.
+// (The maintenance schema-refusal is a structured turn that gets a row-cited figures
+// block appended, so it carries [S:maintenance#…] tokens and never matches here.)
+const REFUSAL_RE =
+  /\b(not (present|available|found|stated|provided|included|specified|mentioned|contained)|are not available|is not available|isn't available|aren't available|do(es)? not (contain|include|provide|state|mention)|don't (contain|include|provide)|no (matching|relevant|such) (data|records?|information|documents?|evidence)|cannot (find|answer)|can't (find|answer)|could not find|couldn't find|unable to (find|answer))\b/i;
+
+function isUncitedRefusal(answer: string): boolean {
+  if (extractCitationTokens(answer).length > 0) return false; // any citation → real grounded answer
+  return REFUSAL_RE.test(answer);
+}
+
+// GENERAL-KNOWLEDGE generation — used ONLY when retrieval found no evidence for the
+// question (no structured rows, no document chunks). The admin-editable persona
+// (system_prompt setting) still drives tone/voice, so an admin who sets "You are an
+// expert lawyer, explain clearly for a layperson" visibly changes these answers too.
+// Crucially there are NO grounding/citation rules here: with no evidence, demanding
+// citations would force the very "not available in the data" refusal the client asked
+// us to stop. We instead instruct the model to answer from general knowledge WITHOUT
+// inventing citations, and to nudge the user to a professional for high-stakes domains.
+async function generateGeneral(
+  question: string,
+  persona: string,
+  today: string
+): Promise<string> {
+  const system = `${persona.trim()}
+
+You do NOT have any relevant documents or data for this specific question, so answer it helpfully and accurately from your general knowledge. Do not cite sources and do not invent citation tokens like [S:...] or [P:...]. If the question involves legal, medical, tax, or financial decisions, briefly remind the user to verify with a qualified professional for their specific situation. Be clear and concise.`;
+  const user = `Today's date is ${today}.
+
+Question: ${question}`;
+  return chat(
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    { temperature: 0.2 }
+  );
 }
 
 function docLabel(doc: string): string {

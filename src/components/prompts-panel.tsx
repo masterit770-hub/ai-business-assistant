@@ -107,10 +107,10 @@ export function PromptsPanel() {
           <div className="space-y-2">
             <div className="flex items-baseline justify-between">
               <label className="text-sm font-semibold text-ink">
-                System prompt
+                Assistant persona / system prompt
               </label>
               <span className="text-xs text-faint">
-                Governs grounded generation &amp; citations
+                Sets the assistant&apos;s voice on every answer
               </span>
             </div>
             <textarea
@@ -191,9 +191,12 @@ export function PromptsPanel() {
       </div>
 
       <p className="px-1 text-xs text-faint">
-        Live · these prompts are read from and saved to the engine. The system prompt sets
-        answering style (the grounding &amp; citation rules always apply); the urgency prompt
-        drives the document badges. Leave a field blank to use the engine default.
+        Live · these prompts are read from and saved to the engine. The assistant persona sets
+        the voice on every answer — e.g. &ldquo;You are an expert lawyer, explain clearly for a
+        layperson.&rdquo; When your documents or data contain the answer, Nucleus grounds and cites
+        it (the citation rules always apply); otherwise it answers from general knowledge in this
+        persona. The urgency prompt drives the document badges. Leave a field blank to use the
+        engine default.
       </p>
     </div>
   );

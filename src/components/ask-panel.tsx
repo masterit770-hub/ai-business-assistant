@@ -22,6 +22,10 @@ type EngineResult = {
     rationale: string;
   };
   answer: string;
+  // "grounded" → answered from the user's documents/data, with citations.
+  // "general"  → no relevant documents/data; answered from general knowledge.
+  mode?: "grounded" | "general";
+  grounded?: boolean;
   evidence: {
     rows: { table: string; id: number; token: string; data: Record<string, unknown> }[];
     chunks: { doc: string; page: number; token: string; text: string }[];
@@ -98,6 +102,9 @@ export function AskPanel() {
   const rows = result?.evidence.rows ?? [];
   const chunks = result?.evidence.chunks ?? [];
   const answerRtl = result ? isHebrew(result.answer) : false;
+  // A general-knowledge turn (no relevant documents/data): the engine answered from
+  // the model's general knowledge, so there are no citations to validate or show.
+  const isGeneral = result ? result.grounded === false || result.mode === "general" : false;
 
   return (
     <div className="flex h-full flex-col rounded-2xl border border-line bg-surface shadow-soft">
@@ -188,31 +195,47 @@ export function AskPanel() {
               {renderAnswer(result.answer)}
             </div>
 
-            {/* validation pill — the grounding guarantee */}
-            <div
-              data-testid="validation"
-              className={
-                "flex items-center gap-2 rounded-xl border px-4 py-2.5 text-xs " +
-                (result.validation.ok
-                  ? "border-accent-ring bg-accent-soft text-accent"
-                  : "border-red-200 bg-red-50 text-red-700")
-              }
-            >
-              {result.validation.ok ? (
-                <ShieldCheck className="size-4" />
-              ) : (
-                <ShieldAlert className="size-4" />
-              )}
-              <span>
-                {result.validation.ok
-                  ? "Grounded — every cited fact resolves to retrieved evidence (validateAnswer passed)."
-                  : "Rejected by validateAnswer(): " +
-                    result.validation.reasons.join("; ")}
-              </span>
-            </div>
+            {/* general-knowledge note — understated, not a warning. Shown when the
+                user has no relevant documents/data, so the answer is the model's
+                general knowledge with no citations. */}
+            {isGeneral && (
+              <div
+                data-testid="general-note"
+                className="flex items-center gap-1.5 px-1 text-xs text-faint"
+              >
+                <Sparkles className="size-3.5" />
+                <span>General knowledge — not from your uploaded documents.</span>
+              </div>
+            )}
+
+            {/* validation pill — the grounding guarantee. Only on the grounded path;
+                a general answer legitimately has no citations to validate. */}
+            {!isGeneral && (
+              <div
+                data-testid="validation"
+                className={
+                  "flex items-center gap-2 rounded-xl border px-4 py-2.5 text-xs " +
+                  (result.validation.ok
+                    ? "border-accent-ring bg-accent-soft text-accent"
+                    : "border-red-200 bg-red-50 text-red-700")
+                }
+              >
+                {result.validation.ok ? (
+                  <ShieldCheck className="size-4" />
+                ) : (
+                  <ShieldAlert className="size-4" />
+                )}
+                <span>
+                  {result.validation.ok
+                    ? "Grounded — every cited fact resolves to retrieved evidence (validateAnswer passed)."
+                    : "Rejected by validateAnswer(): " +
+                      result.validation.reasons.join("; ")}
+                </span>
+              </div>
+            )}
 
             {/* source chips — the real retrieved rows / pages */}
-            {(rows.length > 0 || chunks.length > 0) && (
+            {!isGeneral && (rows.length > 0 || chunks.length > 0) && (
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-xs font-medium text-faint">
                   Sources · {rows.length} row{rows.length === 1 ? "" : "s"} ·{" "}

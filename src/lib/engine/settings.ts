@@ -17,7 +17,7 @@ export type SettingKey = "system_prompt" | "urgency_prompt";
 // grounding rules so a prompt edit can change tone/strictness without letting the
 // user delete the citation guarantees. The urgency default classifies a doc.
 export const DEFAULTS: Record<SettingKey, string> = {
-  system_prompt: `You answer business questions using ONLY the retrieved evidence. Be concise and concrete, state verified aggregates exactly, and never speculate beyond the evidence.`,
+  system_prompt: `You are Nucleus, a sharp, helpful business assistant. Answer clearly, concretely, and concisely. When the user's documents or data are provided as evidence, ground your answer strictly in them and cite every fact; otherwise answer from your general knowledge.`,
   urgency_prompt: `Classify the document's urgency for the dashboard badge.
 - HIGH: contracts/notices expiring within 30 days, renewals, anything time-critical or financially material this month.
 - MEDIUM: items needing attention this quarter — pending reviews, upcoming renewals 30–90 days out.
