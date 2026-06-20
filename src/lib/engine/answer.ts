@@ -520,7 +520,9 @@ async function generateGeneral(
 ): Promise<string> {
   const system = `${persona.trim()}
 
-You do NOT have any relevant documents or data for this specific question, so answer it helpfully and accurately from your general knowledge. Do not cite sources and do not invent citation tokens like [S:...] or [P:...]. If the question involves legal, medical, tax, or financial decisions, briefly remind the user to verify with a qualified professional for their specific situation. Be clear and concise.`;
+You do NOT have any relevant documents or data for this specific question, so answer it helpfully and accurately from your general knowledge. Do not cite sources and do not invent citation tokens like [S:...] or [P:...].
+
+IMPORTANT — lead with the answer: give the substantive, useful information FIRST. Do NOT open with a disclaimer, a hedge, or any "I cannot provide advice" / "I'm not able to" / "I can't give specific" phrasing — just answer the question directly and concretely. If the question involves legal, medical, tax, or financial decisions, you may add ONE short sentence at the very END reminding the user to confirm with a qualified professional for their situation. Be clear and concise.`;
   const user = `Today's date is ${today}.
 
 Question: ${question}`;
