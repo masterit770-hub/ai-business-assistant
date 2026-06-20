@@ -6,7 +6,7 @@ import { getIntent, type IntentSummary } from "./intents.ts";
 import { vectorSearch as vectorSearchLocal, type SqlRow, type DocChunk } from "./retrieval.ts";
 import { fileSearchEnabled, queryFileSearch } from "./file-search.ts";
 import { embedQuery } from "./embeddings.ts";
-import { chat } from "./llm.ts";
+import { chat, isLocalNotConfigured, isLocalUnreachable } from "./llm.ts";
 import { sqlToken, pdfToken, extractCitationTokens } from "./citations.ts";
 import { validateAnswer, type Evidence } from "./validate-answer.ts";
 import { validateContractAnswer } from "./validate-contract-answer.ts";
@@ -34,6 +34,11 @@ export type AnswerResult = {
   // single boolean (the Ask panel uses this to show the muted "general knowledge"
   // line vs. the grounded citations).
   grounded: boolean;
+  // Set ONLY when Local mode is on but the local model couldn't answer (not
+  // configured / unreachable). The answer text is friendly setup guidance; the UI
+  // can use this to show a calm "Local setup" note instead of the "general
+  // knowledge" line. Absent on every normal turn.
+  localGuidance?: "not-configured" | "unreachable";
   evidence: {
     rows: { table: string; id: number; token: string; data: Record<string, unknown> }[];
     chunks: { doc: string; page: number; token: string; text: string }[];
@@ -63,7 +68,73 @@ export function shouldSurfaceDocLaneError(s: {
   return s.chunkCount === 0 || s.targetedUploadedDoc;
 }
 
+// ── LOCAL-MODE FRIENDLY GUIDANCE ───────────────────────────────────────────────
+// When the workspace is in Local mode but the local model can't actually answer —
+// either no endpoint is configured, or the configured endpoint is unreachable —
+// we do NOT 500. We return a NORMAL answer payload whose `answer` text is plain,
+// guiding language, so the Ask UI just renders it like any other answer (no scary
+// red error, no citations to validate). `mode: "general"` marks it as
+// non-grounded so the UI hides the citation/validation chrome.
+//
+// Pure + exported so the exact wording is unit-tested without a live LLM/endpoint.
+export type LocalGuidanceKind = "not-configured" | "unreachable";
+
+export function localGuidanceText(kind: LocalGuidanceKind, endpoint?: string): string {
+  if (kind === "not-configured") {
+    return "Local mode is on, but no local model is set up yet. To use Local: run Nucleus on your own machine, install Ollama and pull a model, then enter your endpoint (e.g. http://localhost:11434/v1) and model name in Settings → Model. (The hosted demo can't reach a local model — Local works when you self-host.)";
+  }
+  const where = endpoint ? `at ${endpoint}` : "at your configured endpoint";
+  return `Local mode is on, but I couldn't reach your local model ${where}. Make sure Nucleus is running on the same machine/network as your model (Ollama running, the model pulled), and that the endpoint in Settings → Model is correct.`;
+}
+
+function localGuidanceResult(
+  question: string,
+  kind: LocalGuidanceKind,
+  endpoint?: string
+): AnswerResult {
+  return {
+    question,
+    // A minimal, honest routing record: we never reached the real router.
+    route: {
+      sources: [],
+      intents: [],
+      docFilter: null,
+      rationale: "Local mode — the local model wasn't available, so this is setup guidance.",
+    },
+    answer: localGuidanceText(kind, endpoint),
+    // "general" → no citations/validation chrome; the UI shows it as plain text.
+    mode: "general",
+    grounded: false,
+    // Flag so the UI can show this as guidance (not a normal general answer) if it
+    // wants to; harmless for callers that ignore it.
+    localGuidance: kind,
+    evidence: { rows: [], chunks: [] },
+    validation: { ok: true, reasons: [] },
+  };
+}
+
+// PUBLIC entry. Runs the real pipeline, but if the active backend is LOCAL and it
+// can't answer (not configured / unreachable), returns the friendly guidance as a
+// normal 200 payload instead of letting the typed error become a 500.
 export async function answerQuestion(
+  question: string,
+  ctx: { ownerId?: string; role?: string } = {}
+): Promise<AnswerResult> {
+  try {
+    return await runAnswerPipeline(question, ctx);
+  } catch (e) {
+    if (isLocalNotConfigured(e)) {
+      return localGuidanceResult(question, "not-configured");
+    }
+    if (isLocalUnreachable(e)) {
+      const endpoint = (e as { endpoint?: string }).endpoint;
+      return localGuidanceResult(question, "unreachable", endpoint);
+    }
+    throw e; // any other error keeps its existing (cloud) handling.
+  }
+}
+
+async function runAnswerPipeline(
   question: string,
   ctx: { ownerId?: string; role?: string } = {}
 ): Promise<AnswerResult> {

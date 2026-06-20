@@ -9,8 +9,10 @@ import {
   ShieldCheck,
   ShieldAlert,
   Database,
+  Server,
 } from "lucide-react";
 import { suggestedQuestions } from "@/lib/mock";
+import { ModelSwitch } from "@/components/model-switch";
 
 // ── The engine's real response shape (Contract-Retriever-RAG /api/ask) ─────────
 type EngineResult = {
@@ -26,6 +28,9 @@ type EngineResult = {
   // "general"  → no relevant documents/data; answered from general knowledge.
   mode?: "grounded" | "general";
   grounded?: boolean;
+  // Set only when Local mode is on but the local model couldn't answer — the
+  // answer text is friendly setup guidance, shown plainly (no scary error).
+  localGuidance?: "not-configured" | "unreachable";
   evidence: {
     rows: { table: string; id: number; token: string; data: Record<string, unknown> }[];
     chunks: { doc: string; page: number; token: string; text: string }[];
@@ -105,6 +110,10 @@ export function AskPanel() {
   // A general-knowledge turn (no relevant documents/data): the engine answered from
   // the model's general knowledge, so there are no citations to validate or show.
   const isGeneral = result ? result.grounded === false || result.mode === "general" : false;
+  // A Local-setup guidance turn: Local mode is on but the local model wasn't
+  // available, so the "answer" is calm setup guidance — show a Local note, not the
+  // "general knowledge" line.
+  const isLocalGuidance = !!result?.localGuidance;
 
   return (
     <div className="flex h-full flex-col rounded-2xl border border-line bg-surface shadow-soft">
@@ -119,6 +128,13 @@ export function AskPanel() {
         <span className="ml-auto text-[10px] font-medium uppercase tracking-wide text-faint">
           grounded · cited · verified
         </span>
+      </div>
+
+      {/* THE BIG SWITCH — admin-only Cloud ⇄ Local. Renders nothing for members.
+          Placed prominently right under the header so the active model is obvious
+          during use. */}
+      <div className="border-b border-line px-5 py-3" data-testid="ask-model-switch">
+        <ModelSwitch variant="panel" />
       </div>
 
       {/* conversation / result area */}
@@ -195,10 +211,24 @@ export function AskPanel() {
               {renderAnswer(result.answer)}
             </div>
 
+            {/* Local-setup note — calm, guiding (not an error). Shown when Local mode
+                is on but the local model wasn't available; the answer above is the
+                step-by-step setup guidance. */}
+            {isLocalGuidance && (
+              <div
+                data-testid="local-guidance-note"
+                className="flex items-center gap-1.5 px-1 text-xs text-faint"
+              >
+                <Server className="size-3.5" />
+                <span>Local mode — setup guidance (no answer was generated locally).</span>
+              </div>
+            )}
+
             {/* general-knowledge note — understated, not a warning. Shown when the
                 user has no relevant documents/data, so the answer is the model's
-                general knowledge with no citations. */}
-            {isGeneral && (
+                general knowledge with no citations. (Suppressed for the Local-setup
+                guidance turn, which has its own note above.) */}
+            {isGeneral && !isLocalGuidance && (
               <div
                 data-testid="general-note"
                 className="flex items-center gap-1.5 px-1 text-xs text-faint"

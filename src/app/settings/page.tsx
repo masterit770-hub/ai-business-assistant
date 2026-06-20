@@ -38,7 +38,7 @@ export default async function SettingsPage() {
                   defaultValue="users"
                   tabs={[
                     { value: "users", label: "Users", content: <UsersPanel /> },
-                    { value: "prompts", label: "Prompts", content: <PromptsPanel /> },
+                    { value: "prompts", label: "Model & Prompts", content: <PromptsPanel /> },
                   ]}
                 />
               </Suspense>

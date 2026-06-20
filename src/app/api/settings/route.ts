@@ -8,7 +8,16 @@ import { getSettings, setSetting, type SettingKey } from "@/lib/engine/settings"
 // user's answers, so only an admin may read/write them.
 export const runtime = "nodejs";
 
-const KEYS: SettingKey[] = ["system_prompt", "urgency_prompt"];
+// Every admin-editable setting the PUT will persist when present in the body. The
+// MODEL keys (the Cloud⇄Local switch + the owner's local endpoint/model) live here
+// alongside the prompts; all are admin-only to write.
+const KEYS: SettingKey[] = [
+  "system_prompt",
+  "urgency_prompt",
+  "model_mode",
+  "local_endpoint",
+  "local_model",
+];
 
 export async function GET() {
   const user = await getCurrentUser();
@@ -41,6 +50,18 @@ export async function PUT(req: Request) {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
+  }
+  // model_mode is constrained to the two valid backends; anything else is a 400 so
+  // a typo can't silently leave the workspace in an undefined state.
+  if (typeof body.model_mode === "string") {
+    const m = body.model_mode.trim().toLowerCase();
+    if (m !== "cloud" && m !== "local") {
+      return NextResponse.json(
+        { error: 'model_mode must be "cloud" or "local"' },
+        { status: 400 }
+      );
+    }
+    body.model_mode = m;
   }
   try {
     for (const key of KEYS) {

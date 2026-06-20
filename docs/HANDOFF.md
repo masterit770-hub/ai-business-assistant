@@ -121,6 +121,13 @@ Sign in → ask about your built-in data (you'll get cited answers) → **Upload
 | **Demo / trying it out** | The **free** Gemini tier is fine. Note: it has a **daily limit** — under heavy use, *uploaded-document* questions may say "try again." That's the free rate limit, not a bug (it costs nothing). Questions about your existing data stay instant. |
 | **Real, regular use** | Turn on **billing** for your Gemini key (pennies per question) so it never throttles, and point the **answer model** at Gemini too. |
 | **Real hospital/legal data (PHI)** | Use **Google Vertex AI** or **Azure OpenAI** with a signed **HIPAA BAA**, your own keys. Switching the answer model is a config change (`LLM_*`), no rebuild. Never run real patient/legal data through a free developer key. |
+| **Run the AI on your OWN hardware** | Flip the big **Cloud ⇄ Local** switch to **Local** and point it at your own model (e.g. Ollama). Only works when you **self-host** Nucleus on the same machine/network. **→ see [LOCAL-MODEL.md](LOCAL-MODEL.md).** |
+
+---
+
+## Cloud ⇄ Local — run the AI on your own machine
+
+Nucleus has a prominent **Cloud ⇄ Local** switch (top of the Ask panel, and in **Settings → Model**). **Cloud** (the default) uses a hosted model; **Local** runs the AI on **your own hardware** (e.g. an Ollama model on your server). The hosted demo can only use **Cloud** — Local works when you **self-host** the app on the same machine/network as your model. Full step-by-step (run the repo on your box → install Ollama → enter your endpoint → flip the switch), the "serve my own clients from my own box" topology, and the honest "local model ≠ fully offline" caveat are in **→ [LOCAL-MODEL.md](LOCAL-MODEL.md)**.
 
 ---
 
@@ -133,6 +140,7 @@ Sign in → ask about your built-in data (you'll get cited answers) → **Upload
 | Add / remove a user | Admin panel → create account / kick out |
 | Add a document | **Upload** on the dashboard |
 | Run the answers on Gemini (not DeepSeek) | Set the `LLM_PROVIDER=gemini` block (billing-enabled key) |
+| Run the AI on my own machine (Local) | Self-host + flip the **Cloud ⇄ Local** switch → [LOCAL-MODEL.md](LOCAL-MODEL.md) |
 | Stop document questions throttling | Turn on billing for your Gemini key |
 | Go live with real PHI | Vertex/Azure + signed BAA + your own keys |
 
