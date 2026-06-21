@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
 import { answerQuestion } from "@/lib/engine/answer";
 import { backendConfigured } from "@/lib/engine/llm";
+import { logAsk } from "@/lib/engine/ask-history";
 
 // Consolidated single app: the retrieval/answer engine runs IN-PROCESS here (no
 // separate engine service, no ENGINE_URL proxy hop). The polished Nucleus UI calls
@@ -44,6 +45,12 @@ export async function POST(req: Request) {
 
   try {
     const result = await answerQuestion(question, { ownerId: user.id, role: user.role });
+    // Persist this ask to the user's history (session/query/source history). BEST-
+    // EFFORT: logAsk catches every error internally, so a logging failure NEVER
+    // breaks the answer or changes the response below. We await it (rather than
+    // fire-and-forget) so the write actually completes before this serverless
+    // function returns and is potentially frozen.
+    await logAsk(user.id, result);
     return NextResponse.json(result);
   } catch (e) {
     return NextResponse.json(

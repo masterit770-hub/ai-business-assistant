@@ -5,7 +5,7 @@ import { NextResponse, type NextRequest } from "next/server";
 // protects the app routes: no session → bounced to /sign-in. This is what makes
 // the dashboard genuinely gated (not just a client-side redirect that a URL can
 // skip).
-const PROTECTED = ["/dashboard", "/settings"];
+const PROTECTED = ["/dashboard", "/settings", "/history"];
 
 export async function middleware(request: NextRequest) {
   let response = NextResponse.next({ request });

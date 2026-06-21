@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { FileText, Users, Settings } from "lucide-react";
+import { FileText, Clock, Settings } from "lucide-react";
 import { AssistantMark } from "@/components/brand";
 import { UserMenu } from "@/components/user-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -16,7 +16,8 @@ import { cn } from "@/lib/utils";
 // just avoids dead-end links into a forbidden page).
 const nav = [
   { label: "Documents", href: "/dashboard", icon: FileText, match: "documents" },
-  { label: "Admin", href: "/settings", icon: Users, match: "admin", adminOnly: true },
+  { label: "History", href: "/history", icon: Clock, match: "history" },
+  { label: "Settings", href: "/settings", icon: Settings, match: "settings", adminOnly: true },
 ];
 
 export function AppSidebar({ active }: { active: string }) {
