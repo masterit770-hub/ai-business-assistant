@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
 import { answerQuestion } from "@/lib/engine/answer";
-import { llmConfigured } from "@/lib/engine/llm";
+import { backendConfigured } from "@/lib/engine/llm";
 
 // Consolidated single app: the retrieval/answer engine runs IN-PROCESS here (no
 // separate engine service, no ENGINE_URL proxy hop). The polished Nucleus UI calls
@@ -21,9 +21,12 @@ export async function POST(req: Request) {
   if (!user || user.disabled) {
     return NextResponse.json({ error: "not authenticated" }, { status: 401 });
   }
-  if (!llmConfigured()) {
+  if (!(await backendConfigured())) {
     return NextResponse.json(
-      { error: "LLM_API_KEY is not configured on the server." },
+      {
+        error:
+          "No model backend is configured. Set LLM_API_KEY on the server, or paste a cloud provider key in Settings → Model.",
+      },
       { status: 503 }
     );
   }

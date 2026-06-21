@@ -1,6 +1,6 @@
 // Model-abstraction layer (OpenAI-compatible chat completions). Provider-neutral:
-// the generation model is selected entirely by env, so swapping providers is a
-// config change, never a code change. Key is env-only (never committed).
+// the cloud generation model is selected by env BY DEFAULT, so swapping providers is
+// a config change, never a code change. Key is env-only (never committed).
 //
 //   LLM_PROVIDER  a label for messages/observability (e.g. "deepseek", "gemini",
 //                 "azure-openai"). Cosmetic only — the wire format is OpenAI-compat.
@@ -12,7 +12,15 @@
 //   DeepSeek      BASE=https://api.deepseek.com                                  MODEL=deepseek-chat
 //   Gemini (GCP)  BASE=https://generativelanguage.googleapis.com/v1beta/openai  MODEL=gemini-2.5-flash
 //   Azure OpenAI  BASE=https://<resource>.openai.azure.com/openai/deployments/<dep>  (PROD default, client-supplied)
-import { getModelConfig } from "./settings.ts";
+//
+// RUNTIME OVERRIDE (no redeploy): an admin can ALSO paste a provider key in Settings
+// → that swaps the cloud backend at request time via getCloudConfig() (OpenAI / Azure
+// OpenAI / Google Gemini / DeepSeek). When no override is set, the env behavior above
+// is used unchanged. See resolveCloudTarget() below for the per-provider request
+// shape. NOTE: GCP *Vertex/HIPAA-BAA* uses Google service-account auth (not a static
+// key) and is OUT OF SCOPE here — the consumer Gemini API key covers the simple GCP
+// swap; a follow-up can add Vertex.
+import { getModelConfig, getCloudConfig, type CloudConfig } from "./settings.ts";
 
 const PROVIDER = process.env.LLM_PROVIDER ?? "deepseek";
 const BASE = process.env.LLM_BASE_URL ?? "https://api.deepseek.com";
@@ -123,6 +131,20 @@ export function llmConfigured(): boolean {
   return Boolean(process.env.LLM_API_KEY);
 }
 
+// Request-time "is a backend reachable?" gate for the Ask route. True when ANY of:
+//   • the env cloud key is present (the unchanged default), OR
+//   • an admin set a runtime cloud override (a provider + pasted key) in Settings, OR
+//   • the workspace is in Local mode (the route handles Local readiness gracefully,
+//     turning a missing/unreachable endpoint into friendly guidance, not a 503).
+// This is what lets a "paste your key" swap work on a server with no env key set.
+export async function backendConfigured(): Promise<boolean> {
+  if (process.env.LLM_API_KEY) return true;
+  const model = await getModelConfig();
+  if (model.mode === "local") return true;
+  const cloud = await getCloudConfig();
+  return cloud.provider !== "" && cloud.apiKey !== "";
+}
+
 // Transient statuses worth a retry: 429 (rate limit) and 5xx (the free tier
 // returns 503 "model experiencing high demand" under load). A 4xx like 401/400
 // is a real config error — never retried.
@@ -154,15 +176,79 @@ export async function chatWithUsage(
   return chatCloud(messages, opts);
 }
 
-// CLOUD — env-configured provider. Now returns the provider's real `usage` block.
+// The resolved cloud HTTP target for one request: where to POST, what auth header to
+// send, and the provider/model labels for usage + error messages. All providers use
+// the SAME OpenAI chat-completions BODY — they differ only in URL + auth header.
+type CloudTarget = { url: string; headers: Record<string, string>; provider: string; model: string };
+
+// Default OpenAI-compatible base when a provider override gives no explicit base_url.
+const PROVIDER_DEFAULT_BASE: Record<string, string> = {
+  openai: "https://api.openai.com/v1",
+  deepseek: "https://api.deepseek.com",
+  gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
+};
+
+/**
+ * Decide the cloud target for THIS request. If the admin has set a runtime override
+ * in Settings (a provider + a key), build the request per provider. Otherwise fall
+ * back to the env-configured backend EXACTLY as before — so the demo default is
+ * unchanged. A provider chosen WITHOUT a key is ignored (falls back to env), so a
+ * half-filled form can't break the working cloud default.
+ */
+export function resolveCloudTarget(cfg: CloudConfig): CloudTarget {
+  const override = cfg.provider !== "" && cfg.apiKey !== "";
+  if (!override) {
+    // ── ENV DEFAULT (unchanged behavior) ──
+    const key = process.env.LLM_API_KEY;
+    if (!key) throw new Error("LLM_API_KEY not set");
+    return {
+      url: `${BASE}/chat/completions`,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      provider: PROVIDER,
+      model: MODEL,
+    };
+  }
+
+  if (cfg.provider === "azure") {
+    // Azure OpenAI: deployment-scoped URL + an `api-key` header (NOT Bearer).
+    const endpoint = cfg.azureEndpoint.replace(/\/+$/, "");
+    if (!endpoint) throw new Error("Azure OpenAI selected but azure_endpoint is not set");
+    if (!cfg.model) throw new Error("Azure OpenAI selected but cloud_model (deployment name) is not set");
+    const apiVersion = cfg.azureApiVersion || "2024-10-21";
+    return {
+      url: `${endpoint}/openai/deployments/${encodeURIComponent(cfg.model)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`,
+      headers: { "Content-Type": "application/json", "api-key": cfg.apiKey },
+      provider: "azure",
+      model: cfg.model,
+    };
+  }
+
+  // openai / gemini / deepseek / custom — all OpenAI-compatible: Bearer + base/chat.
+  // An explicit cloud_base_url wins (custom/self-hosted gateways); otherwise the
+  // provider's known default base.
+  const base = (cfg.baseUrl || PROVIDER_DEFAULT_BASE[cfg.provider] || "").replace(/\/+$/, "");
+  if (!base) throw new Error(`${cfg.provider} selected but no base URL is known/set`);
+  const model = cfg.model || (cfg.provider === "gemini" ? "gemini-2.5-flash" : cfg.provider === "deepseek" ? "deepseek-chat" : "");
+  if (!model) throw new Error(`${cfg.provider} selected but cloud_model is not set`);
+  return {
+    url: `${base}/chat/completions`,
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
+    provider: cfg.provider,
+    model,
+  };
+}
+
+// CLOUD — env-configured provider, OR the admin's runtime provider override (read at
+// REQUEST time so a pasted key takes effect on the very next question, no redeploy).
+// Returns the provider's real `usage` block for honest token accounting.
 async function chatCloud(
   messages: ChatMessage[],
   opts: { json?: boolean; temperature?: number }
 ): Promise<ChatResult> {
-  const key = process.env.LLM_API_KEY;
-  if (!key) throw new Error("LLM_API_KEY not set");
+  const cfg = await getCloudConfig();
+  const target = resolveCloudTarget(cfg);
   const payload = JSON.stringify({
-    model: MODEL,
+    model: target.model,
     messages,
     temperature: opts.temperature ?? 0,
     ...(opts.json ? { response_format: { type: "json_object" } } : {}),
@@ -170,21 +256,21 @@ async function chatCloud(
 
   let lastErr = "";
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const res = await fetch(`${BASE}/chat/completions`, {
+    const res = await fetch(target.url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      headers: target.headers,
       body: payload,
     });
     if (res.ok) {
       const data = (await res.json()) as ChatCompletion;
       return {
         content: data.choices?.[0]?.message?.content ?? "",
-        usage: readUsage(data, PROVIDER, MODEL, true),
+        usage: readUsage(data, target.provider, target.model, true),
       };
     }
     const body = await res.text().catch(() => "");
     // Provider-labelled so a billing/auth error names the active backend.
-    lastErr = `${PROVIDER} (${MODEL}) ${res.status}: ${body.slice(0, 300)}`;
+    lastErr = `${target.provider} (${target.model}) ${res.status}: ${body.slice(0, 300)}`;
     // Only retry transient capacity/rate errors; surface real config errors now.
     if (!RETRYABLE.has(res.status) || attempt === MAX_ATTEMPTS) break;
     // Exponential backoff with jitter (the free tier's 503 spikes are brief).

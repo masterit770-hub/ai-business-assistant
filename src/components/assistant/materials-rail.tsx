@@ -6,13 +6,24 @@ import { UploadButton } from "@/components/upload-button";
 import { UrgencyBadge } from "@/components/urgency-badge";
 import type { Urgency } from "@/lib/mock";
 
+type DocLang = "en" | "he" | null;
 type DocMeta = { doc: string; label: string; urgency: Urgency | null };
 type BundledSource = {
   doc: string;
   label: string;
   kind: "document" | "structured";
   detail: string;
+  lang?: DocLang;
 };
+
+// Honest, lightweight language detection for an UPLOADED doc, from the only text we
+// have client-side: its label. Hebrew letters → "he", Latin letters → "en", neither
+// → null (the chip is omitted — we never fabricate a language we can't see).
+function labelLang(label: string): DocLang {
+  if (/[֐-׿]/.test(label)) return "he";
+  if (/[A-Za-z]/.test(label)) return "en";
+  return null;
+}
 
 // The "Your materials" rail — the real sources the assistant can answer from, with
 // the upload control. Each item carries a [P] (document) or [S] (structured) chip so
@@ -122,6 +133,7 @@ export function MaterialsRail() {
               >
                 <SourceChip kind="document" />
                 <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{d.label}</span>
+                <LangChip lang={labelLang(d.label)} />
                 {d.urgency && (
                   <span data-testid={`doc-urgency-${d.doc}`}>
                     <UrgencyBadge urgency={d.urgency} />
@@ -164,6 +176,8 @@ export function MaterialsRail() {
               >
                 <SourceChip kind={s.kind} />
                 <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{s.label}</span>
+                {/* Documents carry an honest EN/HE chip from their indexed text; structured tables don't. */}
+                {s.kind === "document" && <LangChip lang={s.lang ?? null} />}
                 <span className="shrink-0 text-[11px] text-faint">{s.detail}</span>
               </li>
             ))}
@@ -171,6 +185,24 @@ export function MaterialsRail() {
         </div>
       )}
     </div>
+  );
+}
+
+// A small per-document language chip ("EN"/"HE"). Rendered ONLY when the language is
+// known (English/Hebrew); omitted otherwise so we never fabricate a tag. The engine
+// answers in either language, so this honestly reflects each source's content.
+function LangChip({ lang }: { lang: DocLang }) {
+  if (lang !== "en" && lang !== "he") return null;
+  const label = lang === "he" ? "HE" : "EN";
+  const title = lang === "he" ? "Hebrew document" : "English document";
+  return (
+    <span
+      data-testid={`doc-lang-${lang}`}
+      title={title}
+      className="inline-flex shrink-0 items-center rounded-md border border-line bg-surface-2 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-subtle"
+    >
+      {label}
+    </span>
   );
 }
 

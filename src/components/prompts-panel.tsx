@@ -1,11 +1,25 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Wand2, RotateCcw, Check, Loader2, AlertCircle, Cloud, Server } from "lucide-react";
+import { Wand2, RotateCcw, Check, Loader2, AlertCircle, Cloud, Server, KeyRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 type ModelMode = "cloud" | "local";
+type CloudProvider = "" | "openai" | "azure" | "gemini" | "deepseek";
+
+// Per-provider helper copy + sensible model placeholder shown under the Cloud model
+// fields. Keeps the "paste your key" experience self-explanatory for a non-technical
+// admin (no docs trip needed to swap to Azure or Gemini).
+const PROVIDER_HELP: Record<Exclude<CloudProvider, "">, { hint: string; modelPlaceholder: string }> = {
+  openai: { hint: "OpenAI: paste your platform.openai.com API key.", modelPlaceholder: "gpt-4o" },
+  azure: {
+    hint: "Azure OpenAI: your resource endpoint + deployment name + key.",
+    modelPlaceholder: "your-deployment-name",
+  },
+  gemini: { hint: "Gemini: paste your Google AI Studio key.", modelPlaceholder: "gemini-2.5-flash" },
+  deepseek: { hint: "DeepSeek: paste your platform.deepseek.com key.", modelPlaceholder: "deepseek-chat" },
+};
 
 // The Prompt-config surface — REAL. It loads the engine's current prompts on
 // mount and Save PUTs them back to the engine, which then uses them for live
@@ -20,16 +34,64 @@ export function PromptsPanel() {
   const [modelMode, setModelMode] = useState<ModelMode>("cloud");
   const [localEndpoint, setLocalEndpoint] = useState("");
   const [localModel, setLocalModel] = useState("");
+  // Cloud provider override (the paste-a-key model swap).
+  const [cloudProvider, setCloudProvider] = useState<CloudProvider>("");
+  const [cloudApiKey, setCloudApiKey] = useState(""); // entered value (never loaded from server)
+  const [cloudKeySet, setCloudKeySet] = useState(false); // whether a key is already stored
+  const [cloudModel, setCloudModel] = useState("");
+  const [cloudBaseUrl, setCloudBaseUrl] = useState("");
+  const [azureEndpoint, setAzureEndpoint] = useState("");
+  const [azureApiVersion, setAzureApiVersion] = useState("");
   const [loaded, setLoaded] = useState<{
     system: string;
     urgency: string;
     mode: ModelMode;
     endpoint: string;
     model: string;
+    cloudProvider: CloudProvider;
+    cloudKeySet: boolean;
+    cloudModel: string;
+    cloudBaseUrl: string;
+    azureEndpoint: string;
+    azureApiVersion: string;
   } | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Apply a settings payload (from GET or the PUT echo) to local state. The api key
+  // is WRITE-ONLY — the server returns only `cloud_api_key_set` (a boolean), never the
+  // secret — so we reflect "key stored" without ever holding the value in the client.
+  function applyServer(d: Record<string, unknown>) {
+    const mode: ModelMode = d.model_mode === "local" ? "local" : "cloud";
+    const provider = ((d.cloud_provider as string) ?? "") as CloudProvider;
+    const keySet = Boolean(d.cloud_api_key_set);
+    setSystemPrompt((d.system_prompt as string) ?? "");
+    setUrgencyPrompt((d.urgency_prompt as string) ?? "");
+    setModelMode(mode);
+    setLocalEndpoint((d.local_endpoint as string) ?? "");
+    setLocalModel((d.local_model as string) ?? "");
+    setCloudProvider(provider);
+    setCloudKeySet(keySet);
+    setCloudApiKey(""); // never prefill the secret field
+    setCloudModel((d.cloud_model as string) ?? "");
+    setCloudBaseUrl((d.cloud_base_url as string) ?? "");
+    setAzureEndpoint((d.azure_endpoint as string) ?? "");
+    setAzureApiVersion((d.azure_api_version as string) ?? "");
+    setLoaded({
+      system: (d.system_prompt as string) ?? "",
+      urgency: (d.urgency_prompt as string) ?? "",
+      mode,
+      endpoint: (d.local_endpoint as string) ?? "",
+      model: (d.local_model as string) ?? "",
+      cloudProvider: provider,
+      cloudKeySet: keySet,
+      cloudModel: (d.cloud_model as string) ?? "",
+      cloudBaseUrl: (d.cloud_base_url as string) ?? "",
+      azureEndpoint: (d.azure_endpoint as string) ?? "",
+      azureApiVersion: (d.azure_api_version as string) ?? "",
+    });
+  }
 
   // Load the live prompts + model config from the engine on mount.
   useEffect(() => {
@@ -37,21 +99,11 @@ export function PromptsPanel() {
       .then((r) => r.json())
       .then((d) => {
         if (d.error) throw new Error(d.error);
-        const mode: ModelMode = d.model_mode === "local" ? "local" : "cloud";
-        setSystemPrompt(d.system_prompt ?? "");
-        setUrgencyPrompt(d.urgency_prompt ?? "");
-        setModelMode(mode);
-        setLocalEndpoint(d.local_endpoint ?? "");
-        setLocalModel(d.local_model ?? "");
-        setLoaded({
-          system: d.system_prompt ?? "",
-          urgency: d.urgency_prompt ?? "",
-          mode,
-          endpoint: d.local_endpoint ?? "",
-          model: d.local_model ?? "",
-        });
+        applyServer(d);
       })
       .catch((e) => setError(e instanceof Error ? e.message : "failed to load prompts"));
+    // applyServer is stable for our purposes (only setters); run once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Prompt fields changed → enables "Reset to defaults" (which only touches prompts).
@@ -63,41 +115,45 @@ export function PromptsPanel() {
     (!!loaded &&
       (modelMode !== loaded.mode ||
         localEndpoint !== loaded.endpoint ||
-        localModel !== loaded.model));
+        localModel !== loaded.model ||
+        cloudProvider !== loaded.cloudProvider ||
+        cloudApiKey.trim() !== "" || // a newly typed key is always "dirty"
+        cloudModel !== loaded.cloudModel ||
+        cloudBaseUrl !== loaded.cloudBaseUrl ||
+        azureEndpoint !== loaded.azureEndpoint ||
+        azureApiVersion !== loaded.azureApiVersion));
 
   async function save() {
     setSaving(true);
     setError(null);
     setSaved(false);
     try {
+      // The api key is WRITE-ONLY: only send it when the admin typed a new value
+      // (a blank field leaves any stored key untouched on the server).
+      const body: Record<string, string> = {
+        system_prompt: systemPrompt,
+        urgency_prompt: urgencyPrompt,
+        model_mode: modelMode,
+        local_endpoint: localEndpoint,
+        local_model: localModel,
+        cloud_provider: cloudProvider,
+        cloud_model: cloudModel,
+        cloud_base_url: cloudBaseUrl,
+        azure_endpoint: azureEndpoint,
+        azure_api_version: azureApiVersion,
+      };
+      if (cloudApiKey.trim()) body.cloud_api_key = cloudApiKey.trim();
       const res = await fetch("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system_prompt: systemPrompt,
-          urgency_prompt: urgencyPrompt,
-          model_mode: modelMode,
-          local_endpoint: localEndpoint,
-          local_model: localModel,
-        }),
+        body: JSON.stringify(body),
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "save failed");
       // The engine echoes the effective settings (a blank field falls back to its
-      // built-in default), so reflect exactly what is now live.
-      const mode: ModelMode = d.model_mode === "local" ? "local" : "cloud";
-      setSystemPrompt(d.system_prompt ?? "");
-      setUrgencyPrompt(d.urgency_prompt ?? "");
-      setModelMode(mode);
-      setLocalEndpoint(d.local_endpoint ?? "");
-      setLocalModel(d.local_model ?? "");
-      setLoaded({
-        system: d.system_prompt ?? "",
-        urgency: d.urgency_prompt ?? "",
-        mode,
-        endpoint: d.local_endpoint ?? "",
-        model: d.local_model ?? "",
-      });
+      // built-in default; the api key is returned only as a boolean), so reflect
+      // exactly what is now live.
+      applyServer(d);
       setSaved(true);
       setTimeout(() => setSaved(false), 2600);
     } catch (e) {
@@ -124,20 +180,9 @@ export function PromptsPanel() {
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "reset failed");
-      const mode: ModelMode = d.model_mode === "local" ? "local" : "cloud";
-      setSystemPrompt(d.system_prompt ?? "");
-      setUrgencyPrompt(d.urgency_prompt ?? "");
-      // Keep model fields in sync with the echoed truth (unchanged by this PUT).
-      setModelMode(mode);
-      setLocalEndpoint(d.local_endpoint ?? "");
-      setLocalModel(d.local_model ?? "");
-      setLoaded({
-        system: d.system_prompt ?? "",
-        urgency: d.urgency_prompt ?? "",
-        mode,
-        endpoint: d.local_endpoint ?? "",
-        model: d.local_model ?? "",
-      });
+      // Reflect the echoed truth — the model + cloud sections are unchanged by this
+      // prompts-only PUT, so they stay exactly as configured.
+      applyServer(d);
     } catch (e) {
       setError(e instanceof Error ? e.message : "reset failed");
     } finally {
@@ -267,6 +312,154 @@ export function PromptsPanel() {
               </span>
             </div>
           )}
+
+          {/* ── CLOUD MODEL — the paste-a-key provider swap (OpenAI / Azure / Gemini) ── */}
+          <div
+            data-testid="cloud-model-section"
+            className={cn(
+              "space-y-4 rounded-xl border border-line bg-canvas/60 p-5",
+              modelMode === "local" && "opacity-60"
+            )}
+          >
+            <div className="flex items-center gap-2">
+              <KeyRound className="size-4 text-accent" />
+              <h3 className="text-sm font-semibold text-ink">Cloud model</h3>
+            </div>
+            <p className="text-sm text-faint">
+              Swap the cloud AI provider here — pick one and paste your key. The next question
+              uses it (no redeploy). Leave on <span className="font-medium text-subtle">Default
+              (server)</span> to keep the built-in demo model.
+            </p>
+
+            {/* provider dropdown */}
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-ink" htmlFor="cloud-provider">
+                  Provider
+                </label>
+                <select
+                  id="cloud-provider"
+                  value={cloudProvider}
+                  onChange={(e) => setCloudProvider(e.target.value as CloudProvider)}
+                  data-testid="cloud-provider-select"
+                  className="w-full rounded-xl border border-line bg-canvas px-4 py-2.5 text-[13px] text-ink focus:border-accent-ring focus:outline-none focus:ring-2 focus:ring-accent/10"
+                >
+                  <option value="">Default (server)</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="azure">Azure OpenAI</option>
+                  <option value="gemini">Google Gemini</option>
+                  <option value="deepseek">DeepSeek</option>
+                </select>
+              </div>
+
+              {/* model id / azure deployment name */}
+              <div className={cn("space-y-2", cloudProvider === "" && "opacity-50")}>
+                <label className="text-sm font-semibold text-ink" htmlFor="cloud-model">
+                  {cloudProvider === "azure" ? "Deployment name" : "Model"}
+                </label>
+                <input
+                  id="cloud-model"
+                  value={cloudModel}
+                  onChange={(e) => setCloudModel(e.target.value)}
+                  disabled={cloudProvider === ""}
+                  placeholder={cloudProvider ? PROVIDER_HELP[cloudProvider].modelPlaceholder : "gpt-4o"}
+                  spellCheck={false}
+                  data-testid="cloud-model-input"
+                  className="w-full rounded-xl border border-line bg-canvas px-4 py-2.5 font-mono text-[13px] text-ink focus:border-accent-ring focus:outline-none focus:ring-2 focus:ring-accent/10 disabled:cursor-not-allowed"
+                />
+              </div>
+            </div>
+
+            {/* api key (write-only) */}
+            {cloudProvider !== "" && (
+              <div className="space-y-2">
+                <label className="flex items-center justify-between text-sm font-semibold text-ink" htmlFor="cloud-api-key">
+                  API key
+                  {cloudKeySet && (
+                    <span
+                      data-testid="cloud-key-set"
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-accent"
+                    >
+                      <Check className="size-3" strokeWidth={3} /> •••• key saved
+                    </span>
+                  )}
+                </label>
+                <input
+                  id="cloud-api-key"
+                  type="password"
+                  value={cloudApiKey}
+                  onChange={(e) => setCloudApiKey(e.target.value)}
+                  placeholder={cloudKeySet ? "Saved — type to replace" : "Paste your provider key"}
+                  spellCheck={false}
+                  autoComplete="off"
+                  data-testid="cloud-api-key-input"
+                  className="w-full rounded-xl border border-line bg-canvas px-4 py-2.5 font-mono text-[13px] text-ink focus:border-accent-ring focus:outline-none focus:ring-2 focus:ring-accent/10"
+                />
+                <p className="text-xs text-faint">
+                  {PROVIDER_HELP[cloudProvider].hint} Stored securely server-side and{" "}
+                  <span className="font-medium text-subtle">never shown again</span> (write-only).
+                </p>
+              </div>
+            )}
+
+            {/* Azure-only: resource endpoint + api-version */}
+            {cloudProvider === "azure" && (
+              <div className="grid gap-4 sm:grid-cols-2" data-testid="azure-fields">
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-ink" htmlFor="azure-endpoint">
+                    Azure resource endpoint
+                  </label>
+                  <input
+                    id="azure-endpoint"
+                    value={azureEndpoint}
+                    onChange={(e) => setAzureEndpoint(e.target.value)}
+                    placeholder="https://my-resource.openai.azure.com"
+                    spellCheck={false}
+                    data-testid="azure-endpoint-input"
+                    className="w-full rounded-xl border border-line bg-canvas px-4 py-2.5 font-mono text-[13px] text-ink focus:border-accent-ring focus:outline-none focus:ring-2 focus:ring-accent/10"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-ink" htmlFor="azure-api-version">
+                    API version
+                  </label>
+                  <input
+                    id="azure-api-version"
+                    value={azureApiVersion}
+                    onChange={(e) => setAzureApiVersion(e.target.value)}
+                    placeholder="2024-10-21"
+                    spellCheck={false}
+                    data-testid="azure-api-version-input"
+                    className="w-full rounded-xl border border-line bg-canvas px-4 py-2.5 font-mono text-[13px] text-ink focus:border-accent-ring focus:outline-none focus:ring-2 focus:ring-accent/10"
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* optional custom base URL for openai-compatible gateways */}
+            {(cloudProvider === "openai" || cloudProvider === "deepseek" || cloudProvider === "gemini") && (
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-ink" htmlFor="cloud-base-url">
+                  Custom base URL <span className="font-normal text-faint">(optional)</span>
+                </label>
+                <input
+                  id="cloud-base-url"
+                  value={cloudBaseUrl}
+                  onChange={(e) => setCloudBaseUrl(e.target.value)}
+                  placeholder="Leave blank to use the provider default"
+                  spellCheck={false}
+                  data-testid="cloud-base-url-input"
+                  className="w-full rounded-xl border border-line bg-canvas px-4 py-2.5 font-mono text-[13px] text-ink focus:border-accent-ring focus:outline-none focus:ring-2 focus:ring-accent/10"
+                />
+              </div>
+            )}
+
+            <p className="text-xs text-faint">
+              For stricter setups, the cloud key can also be set via a server env var
+              (<code className="rounded bg-canvas px-1 py-0.5">LLM_API_KEY</code>) instead of pasting
+              it here — this Settings override simply takes precedence when present.
+            </p>
+          </div>
         </div>
       </div>
 
