@@ -19,6 +19,7 @@ import { validateAnswer, type Evidence } from "./validate-answer.ts";
 import { DOCUMENTS } from "./documents.ts";
 import { runtimeDocs } from "./runtime-store.ts";
 import { getSetting } from "./settings.ts";
+import { buildConversationContext, type Turn } from "./conversation.ts";
 
 export type AnswerResult = {
   question: string;
@@ -210,7 +211,13 @@ function cloudProviderGuidanceResult(question: string, provider: string): Answer
 // normal 200 payload instead of letting the typed error become a 500.
 export async function answerQuestion(
   question: string,
-  ctx: { ownerId?: string; role?: string } = {}
+  // `history` (OPTIONAL) carries the recent prior turns of a multi-turn chat. When
+  // absent, behavior is byte-for-byte identical to the single-shot path — the
+  // conversation block built from it is "" and nothing changes. When present, the
+  // recent turns are threaded BEFORE the question into BOTH the router and the
+  // generation prompts so a follow-up ("what about Q2?", "summarize that") resolves
+  // against the conversation. Retrieval still runs on the current question.
+  ctx: { ownerId?: string; role?: string; history?: Turn[] } = {}
 ): Promise<AnswerResult> {
   try {
     return await runAnswerPipeline(question, ctx);
@@ -234,11 +241,15 @@ export async function answerQuestion(
 
 async function runAnswerPipeline(
   question: string,
-  ctx: { ownerId?: string; role?: string } = {}
+  ctx: { ownerId?: string; role?: string; history?: Turn[] } = {}
 ): Promise<AnswerResult> {
   // Telemetry accumulator — real timings + real per-call token usage are gathered
   // as the pipeline runs and assembled into the InspectorTrace at each return point.
   const tel = newTelemetry();
+  // MULTI-TURN: the recent-conversation block, built ONCE and threaded into every
+  // generation call below. Empty string when there's no history (→ single-shot
+  // behavior unchanged). The router gets the raw turns (it builds its own block).
+  const convo = buildConversationContext(ctx.history);
   // Whether the Gemini File Search lane actually contributed chunks this turn (for
   // the honest retrieval-method label + the trace).
   let usedFileSearch = false;
@@ -248,9 +259,11 @@ async function runAnswerPipeline(
 
   // An admin sees ALL uploaded docs → no owner scoping on retrieval.
   const scopeOwner = ctx.role === "admin" ? undefined : ctx.ownerId;
-  // 1. ROUTE (real LLM decision) — owner-scoped doc catalog (Phase C)
+  // 1. ROUTE (real LLM decision) — owner-scoped doc catalog (Phase C). The recent
+  // history goes to the router too, so a follow-up like "what about Q2?" routes the
+  // resolved intent rather than the bare fragment.
   const routeStart = now();
-  const route = await routeQuestion(question, { ownerId: scopeOwner });
+  const route = await routeQuestion(question, { ownerId: scopeOwner, history: ctx.history });
   tel.routingMs = now() - routeStart;
 
   // 2. RETRIEVE
@@ -422,7 +435,7 @@ async function runAnswerPipeline(
   if (!hasEvidence) {
     const persona = await getSetting("system_prompt");
     const genStart = now();
-    const { text: answer, usage } = await generateGeneral(question, persona, TODAY);
+    const { text: answer, usage } = await generateGeneral(question, persona, TODAY, convo);
     tel.generationMs += now() - genStart;
     tel.usages.push(usage);
     // No citation/grounding validation on this path: a general answer legitimately
@@ -461,7 +474,8 @@ async function runAnswerPipeline(
     evChunks,
     structuredNote,
     TODAY,
-    stylePreamble
+    stylePreamble,
+    convo
   );
   tel.generationMs += now() - genStart;
   tel.usages.push(grounded.usage);
@@ -490,7 +504,7 @@ async function runAnswerPipeline(
     // The MODEL decided the retrieved evidence doesn't actually contain the answer →
     // answer from general knowledge instead of surfacing a forced "not in the docs".
     const g2Start = now();
-    const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY);
+    const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY, convo);
     tel.generationMs += now() - g2Start;
     tel.usages.push(usage);
     return {
@@ -552,7 +566,8 @@ async function runAnswerPipeline(
         evRows,
         evChunks,
         TODAY,
-        stylePreamble
+        stylePreamble,
+        convo
       );
       tel.generationMs += now() - forcedStart;
       tel.usages.push(forced.usage);
@@ -585,7 +600,7 @@ async function runAnswerPipeline(
   ) {
     // `stylePreamble` (the persona) is already fetched above — reuse it.
     const g3Start = now();
-    const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY);
+    const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY, convo);
     tel.generationMs += now() - g3Start;
     tel.usages.push(usage);
     return {
@@ -1037,7 +1052,10 @@ function buildInspector(opts: {
 async function generateGeneral(
   question: string,
   persona: string,
-  today: string
+  today: string,
+  // The prior-conversation block (or "" for a single-shot turn). Threaded BEFORE the
+  // question so a follow-up like "explain that more simply" resolves against the chat.
+  convo = ""
 ): Promise<{ text: string; usage: ChatUsage }> {
   const system = `${persona.trim()}
 
@@ -1045,7 +1063,7 @@ You do NOT have any relevant documents or data for this specific question, so an
 
 IMPORTANT — lead with the answer: give the substantive, useful information FIRST. Do NOT open with a disclaimer, a hedge, or any "I cannot provide advice" / "I'm not able to" / "I can't give specific" phrasing — just answer the question directly and concretely. If the question involves legal, medical, tax, or financial decisions, you may add ONE short sentence at the very END reminding the user to confirm with a qualified professional for their situation. Be clear and concise.`;
   const user = `Today's date is ${today}.
-
+${convo ? `\n${convo}\n` : ""}
 Question: ${question}`;
   const { content, usage } = await chatWithUsage(
     [
@@ -1155,7 +1173,11 @@ async function generateGrounded(
   chunks: { token: string; doc: string; page: number; text: string }[],
   structuredNote: string | undefined,
   today: string,
-  stylePreamble: string
+  stylePreamble: string,
+  // Prior-conversation block (or ""). Threaded BEFORE the question so a follow-up
+  // ("and Q2?", "who is the defendant there?") resolves against the thread while the
+  // answer stays grounded strictly in the evidence below.
+  convo = ""
 ): Promise<{ text: string; usage: ChatUsage }> {
   const structuredEvidence =
     rows.length === 0
@@ -1207,7 +1229,7 @@ GROUNDING RULES (these apply whenever the SOURCE flag is "documents", and cannot
 - Be concise and concrete. When stating a count or total, use the value from the result row exactly, then list a few representative rows each with its own token.`;
 
   const user = `Today's date is ${today}. Any filtering in the structured evidence (e.g. "next 90 days") was already computed relative to today, so the rows below are the answer set — do not say the date is unknown.
-
+${convo ? `\n${convo}\n` : ""}
 Question: ${question}
 ${structuredNote ? `\nSTRUCTURED LANE NOTE: ${structuredNote}. (If this means the data has no column for what's asked, say so honestly and report what the data DOES contain.)\n` : ""}
 STRUCTURED EVIDENCE (SQLite query result rows):
@@ -1239,7 +1261,10 @@ async function generateGroundedForced(
   rows: { token: string; table: string; data: Record<string, unknown> }[],
   chunks: { token: string; doc: string; page: number; text: string }[],
   today: string,
-  stylePreamble: string
+  stylePreamble: string,
+  // Prior-conversation block (or "") — resolves a follow-up's references; the answer
+  // still draws ONLY from the evidence below.
+  convo = ""
 ): Promise<{ text: string; usage: ChatUsage }> {
   const structuredEvidence =
     rows.length === 0
@@ -1265,7 +1290,7 @@ STRUCTURED EVIDENCE (SQLite query result rows):
 ${structuredEvidence}
 
 Today's date is ${today}.
-
+${convo ? `\n${convo}\n` : ""}
 Answer THIS question using ONLY the evidence above — the parties/values it asks about ARE named in the evidence; use them exactly, with their [S:...]/[P:...] citations, and do not recall a different record: ${question}`;
   const { content, usage } = await chatWithUsage(
     [

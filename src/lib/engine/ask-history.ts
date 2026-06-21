@@ -48,6 +48,77 @@ export function deriveCitations(result: AnswerResult): AskHistoryCitations {
   return { tokens, sources };
 }
 
+// ── SESSION GROUPING ────────────────────────────────────────────────────────────
+// A "session" is a conversation thread: the ask_history rows sharing one session_id,
+// ordered by created_at. The listing in /api/history collapses rows into one entry
+// per session — title = the FIRST turn's question (oldest in the thread), turn_count,
+// last_at (the newest turn's time), and (admin only) the owner's email.
+
+// The minimal shape of a persisted ask_history row the grouping reads.
+export type AskRow = {
+  id: string;
+  owner_id: string;
+  session_id: string | null;
+  question: string;
+  created_at: string;
+};
+
+// One session entry as returned by GET /api/history.
+export type SessionSummary = {
+  session_id: string;
+  title: string; // the first turn's question
+  turn_count: number;
+  last_at: string; // ISO time of the most recent turn
+  owner_email?: string | null; // admin cross-user view only
+};
+
+/**
+ * Group ask_history rows into one summary per session, NEWEST session first.
+ *
+ * Input rows may be in any order. Within a session, the OLDEST row (earliest
+ * created_at) supplies the title (the first question the user asked); the NEWEST row
+ * supplies last_at. A row whose session_id is null is treated as its OWN singleton
+ * session keyed by its row id, so a pre-migration single-shot ask still appears in the
+ * list (it just has one turn). `emailOf` (optional) attaches the owner's email for the
+ * admin cross-user view.
+ *
+ * PURE (no I/O) so the grouping contract is unit-tested without a DB.
+ */
+export function groupSessions(
+  rows: AskRow[],
+  emailOf?: Map<string, string>
+): SessionSummary[] {
+  const byKey = new Map<string, AskRow[]>();
+  for (const r of rows) {
+    // A null session_id → a legacy standalone ask: key it by its own id so it shows as
+    // a single-turn session rather than being merged with other null-session rows.
+    const key = r.session_id ?? `row:${r.id}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key)!.push(r);
+  }
+
+  const sessions: SessionSummary[] = [];
+  for (const [key, group] of byKey) {
+    // Oldest → newest within the thread.
+    const ordered = [...group].sort(
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+    );
+    const first = ordered[0];
+    const last = ordered[ordered.length - 1];
+    sessions.push({
+      session_id: first.session_id ?? key,
+      title: first.question,
+      turn_count: ordered.length,
+      last_at: last.created_at,
+      ...(emailOf ? { owner_email: emailOf.get(first.owner_id) ?? null } : {}),
+    });
+  }
+
+  // Newest session first (by its most recent turn).
+  sessions.sort((a, b) => new Date(b.last_at).getTime() - new Date(a.last_at).getTime());
+  return sessions;
+}
+
 /**
  * Should this answer be persisted at all? Skip trivial guidance/error results that
  * carry no real Q&A value: the Local/HIPAA setup-guidance turns (no evidence, no real
@@ -66,9 +137,17 @@ export function shouldLogAsk(result: AnswerResult): boolean {
 /**
  * Persist one ask. BEST-EFFORT: any failure is caught and logged to the server
  * console only — it NEVER throws, NEVER changes the response. No secrets are written
- * (only the question, the answer, the mode, the citation tokens, and the route).
+ * (only the question, the answer, the mode, the citation tokens, the route, and the
+ * session id that ties this turn to its conversation thread).
+ *
+ * `sessionId` groups this row with the other turns of the same chat (its conversation).
+ * It is optional so any non-chat caller still logs a standalone row (session_id null).
  */
-export async function logAsk(ownerId: string, result: AnswerResult): Promise<void> {
+export async function logAsk(
+  ownerId: string,
+  result: AnswerResult,
+  sessionId?: string | null
+): Promise<void> {
   try {
     if (!ownerId) return;
     if (!shouldLogAsk(result)) return;
@@ -84,6 +163,7 @@ export async function logAsk(ownerId: string, result: AnswerResult): Promise<voi
         mode: result.mode ?? null,
         citations,
         route: result.route ?? null,
+        session_id: sessionId ?? null,
       });
     if (error) {
       // Non-fatal: the answer already went out. Surface for debugging only.

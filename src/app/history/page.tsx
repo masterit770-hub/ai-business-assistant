@@ -22,8 +22,8 @@ export default async function HistoryPage() {
           </h1>
           <p className="text-sm text-faint">
             {isAdmin
-              ? "Every question asked across the workspace — with its answer and the sources used."
-              : "Your past questions — with each answer and the sources used."}
+              ? "Every conversation across the workspace — click one to resume it on the dashboard."
+              : "Your past conversations — click one to resume it on the dashboard."}
           </p>
         </header>
 

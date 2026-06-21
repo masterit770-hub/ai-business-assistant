@@ -1,9 +1,21 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { AppSidebar } from "@/components/app-sidebar";
 import { AssistantConsole } from "@/components/assistant/assistant-console";
 import { MaterialsRail } from "@/components/assistant/materials-rail";
+
+// Reads the ?session=<id> param (set when a user resumes a conversation from /history)
+// and hands it to the console so it loads that thread. Wrapped in Suspense because
+// useSearchParams suspends during prerender.
+function ConsoleWithSession() {
+  const params = useSearchParams();
+  const sessionId = params.get("session") ?? undefined;
+  // `key` so navigating to a different session (or back to none) remounts the console
+  // and re-runs its resume/clear logic from a clean slate.
+  return <AssistantConsole key={sessionId ?? "new"} initialSessionId={sessionId} />;
+}
 
 export default function DashboardPage() {
   // Real stats from /api/documents (published by MaterialsRail): uploaded count +
@@ -70,10 +82,12 @@ export default function DashboardPage() {
             <MaterialsRail />
           </div>
 
-          {/* right: the AI Business Assistant console */}
+          {/* right: the AI Business Assistant console (resumes ?session=<id> if present) */}
           <div className="flex flex-1 overflow-hidden rounded-2xl border border-line bg-surface shadow-card">
             <div className="flex flex-1 flex-col overflow-hidden">
-              <AssistantConsole />
+              <Suspense fallback={<AssistantConsole />}>
+                <ConsoleWithSession />
+              </Suspense>
             </div>
           </div>
         </div>

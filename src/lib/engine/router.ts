@@ -13,6 +13,7 @@ import { DOCUMENTS, type DocSpec } from "./documents.ts";
 import { listUploadedDocs } from "./doc-store.ts";
 import { introspectSchema } from "./structured-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
+import { buildConversationContext, type Turn } from "./conversation.ts";
 
 export type RoutePlan = {
   sources: ("structured" | "documents")[];
@@ -53,7 +54,7 @@ Respond with ONLY JSON: {"sources": [...], "docFilter": null, "rationale": "one 
 
 export async function routeQuestion(
   question: string,
-  ctx: { ownerId?: string } = {}
+  ctx: { ownerId?: string; history?: Turn[] } = {}
 ): Promise<RoutePlan> {
   const uploaded = await listUploadedDocs(ctx.ownerId);
   let tables: TableSchema[] = [];
@@ -63,10 +64,18 @@ export async function routeQuestion(
     // Structured store not built (dev) — route over documents only.
     tables = [];
   }
+  // MULTI-TURN: if this is a follow-up, put the recent conversation BEFORE the
+  // question so the router understands a reference like "what about Q2?" — it routes
+  // the RESOLVED intent, not the bare fragment. No history → empty string → the user
+  // message is byte-identical to the single-shot path (backward-compatible).
+  const convo = buildConversationContext(ctx.history);
+  const userContent = convo
+    ? `${convo}\n\n— — —\n\nNEW QUESTION (route THIS, using the conversation above only to understand what it refers to): ${question}`
+    : question;
   const raw = await chat(
     [
       { role: "system", content: buildSystem(uploaded, tables) },
-      { role: "user", content: question },
+      { role: "user", content: userContent },
     ],
     { json: true, temperature: 0 }
   );
