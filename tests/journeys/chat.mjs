@@ -1,0 +1,74 @@
+// JOURNEY 2 — CHAT. Grounded cited answer; context follow-up; New chat clears; resume from history.
+import { launch, signIn, makeRecorder, askAndWait, BASE } from "./lib.mjs";
+
+const CITE_RE = /\[(?:S|P):[^\]#]+#\d+\]/;
+
+export async function run() {
+  const rec = makeRecorder("CHAT");
+  const browser = await launch();
+  try {
+    const { ctx, page } = await signIn(browser, "admin", "/dashboard");
+
+    // 2a. Ask a golden question → a grounded, CITED answer.
+    await askAndWait(page, "Who are the parties in the Carter family court case, and what was decided?");
+    const errText = await page.locator('[data-testid="ask-error"]').textContent().catch(() => null);
+    const answer = await page.locator('[data-testid="answer"]').last().textContent().catch(() => "");
+    rec.check(!errText && answer && answer.trim().length > 40,
+      "first question returns a non-empty answer (no error card)",
+      errText ? `error: ${errText}` : `answer len ${answer.trim().length}`);
+
+    // CITED: at least one inline citation chip resolving a [P:/S:...#n] token.
+    const chipCount = await page.locator('[data-testid="citation-chip"]').count();
+    const hasToken = CITE_RE.test(answer);
+    rec.check(chipCount > 0 || hasToken,
+      "answer is CITED (citation chip / token present)",
+      `chips=${chipCount}, tokenInText=${hasToken}`);
+
+    // 2b. Context follow-up: "what did I just ask?" should reference the prior turn.
+    await askAndWait(page, "What did I just ask you in my previous question?");
+    const followup = (await page.locator('[data-testid="answer"]').last().textContent().catch(() => "") || "").toLowerCase();
+    const refsPrior = /carter|family court|previous|parties|earlier|you asked/.test(followup);
+    rec.check(refsPrior,
+      "context follow-up references the prior turn",
+      `followup snippet: ${followup.slice(0, 120)}`);
+
+    // Grab a session id from the URL or history before clearing, for the resume test.
+    // 2c. New chat clears the thread.
+    const turnsBefore = await page.locator('[data-testid="chat-turn"]').count();
+    await page.click('[data-testid="new-chat"]');
+    await page.waitForFunction(() => document.querySelectorAll('[data-testid="chat-turn"]').length === 0, null, { timeout: 10000 }).catch(() => {});
+    const turnsAfter = await page.locator('[data-testid="chat-turn"]').count();
+    rec.check(turnsBefore >= 2 && turnsAfter === 0,
+      "New chat clears the thread",
+      `before=${turnsBefore}, after=${turnsAfter}`);
+
+    // 2d. Resume a session from /history → /dashboard?session=<id> shows the prior thread.
+    await page.goto(`${BASE}/history`, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // The history panel fetches its sessions on mount — wait for the async load to
+    // populate rows (or the empty-state) before reading, so we don't race the fetch.
+    await page.waitForFunction(() =>
+      document.querySelectorAll('[data-testid="history-row"]').length > 0 ||
+      /No conversations yet/i.test(document.body.textContent || ""),
+      null, { timeout: 30000 }).catch(() => {});
+    const resume = page.locator('[data-testid="resume-session"]').first();
+    const haveHistory = await resume.count();
+    if (haveHistory > 0) {
+      const href = await resume.getAttribute("href");
+      await page.goto(`${BASE}${href}`, { waitUntil: "domcontentloaded", timeout: 45000 });
+      // Wait for the resumed thread to load its turns.
+      await page.waitForFunction(() => document.querySelectorAll('[data-testid="chat-turn"]').length > 0, null, { timeout: 30000 }).catch(() => {});
+      const resumedTurns = await page.locator('[data-testid="chat-turn"]').count();
+      const firstQ = await page.locator('[data-testid="turn-question"]').first().textContent().catch(() => "");
+      rec.check(resumedTurns > 0 && firstQ.trim().length > 0,
+        "resume session shows the prior thread",
+        `href=${href} resumedTurns=${resumedTurns} firstQ="${firstQ.slice(0,60)}"`);
+    } else {
+      rec.check(false, "resume session shows the prior thread", "no history rows found to resume");
+    }
+
+    await ctx.close();
+  } finally {
+    await browser.close();
+  }
+  return rec.summary();
+}

@@ -22,6 +22,17 @@ export const runtime = "nodejs";
 export const maxDuration = 120;
 
 const MAX_BYTES = 15 * 1024 * 1024; // 15 MB upload cap
+const SUPPORTED_FORMATS = ["PDF", "CSV", "XLSX"] as const;
+
+// The upload control reads the REAL cap + supported formats from here, so the limits it
+// shows up front always match what POST actually enforces (single source of truth).
+export async function GET() {
+  return NextResponse.json({
+    maxBytes: MAX_BYTES,
+    maxMb: Math.round(MAX_BYTES / (1024 * 1024)),
+    formats: SUPPORTED_FORMATS,
+  });
+}
 
 export async function POST(req: Request) {
   const user = await getCurrentUser();
@@ -103,7 +114,27 @@ export async function POST(req: Request) {
         : supabaseEnabled()
           ? "stored in Supabase (Postgres + pgvector) — durable, client-owned."
           : "in-memory on this serverless instance — query-able now; NOT durable across cold starts/instances.";
-    return NextResponse.json({ ok: true, ingested: result, backend, persistence, originalStored });
+
+    // ZERO-CONTENT signal: a file we accepted but from which we extracted nothing
+    // usable (e.g. an image-only scan whose text layer is empty). We can only assert
+    // this for paths that report a unit count — the local PDF fallback (chunks) and
+    // CSV/XLSX (rows). The Gemini File Search path manages chunking opaquely (no count),
+    // so we don't claim zero there (we'd be guessing). When true, the UI must NOT say
+    // "ask about it now" — it warns that nothing readable was extracted.
+    const countable =
+      result.chunks != null || result.rows != null
+        ? (result.chunks ?? 0) + (result.rows ?? 0)
+        : null; // null = unknown (File Search PDF) → don't claim zero
+    const zeroContent = countable === 0;
+
+    return NextResponse.json({
+      ok: true,
+      ingested: result,
+      backend,
+      persistence,
+      originalStored,
+      zeroContent,
+    });
   } catch (e) {
     console.error("ingest error:", e);
     const msg = e instanceof Error ? e.message : typeof e === "string" ? e : JSON.stringify(e);

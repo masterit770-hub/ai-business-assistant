@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { FileText, Database, Trash2, Loader2, RefreshCw, Download } from "lucide-react";
+import { FileText, Database, Trash2, Loader2, RefreshCw, Download, Table } from "lucide-react";
 import { UploadButton } from "@/components/upload-button";
 import { UrgencyBadge } from "@/components/urgency-badge";
+import { TableViewer } from "@/components/assistant/table-viewer";
 import type { Urgency } from "@/lib/mock";
 
 type DocLang = "en" | "he" | null;
@@ -36,6 +37,11 @@ export function MaterialsRail() {
   const [role, setRole] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  // The structured table currently open in the viewer (FIX 1), or null.
+  const [viewing, setViewing] = useState<{ table: string; label: string } | null>(null);
+  // Retrievability of each UPLOADED doc's original file, probed via HEAD (FIX 3):
+  // undefined = unknown/checking, true = downloadable, false = no stored original.
+  const [retrievable, setRetrievable] = useState<Record<string, boolean>>({});
 
   async function load() {
     try {
@@ -48,6 +54,9 @@ export function MaterialsRail() {
       setBundled(b);
       setRole(d.role ?? null);
       setError(null);
+      // Probe each uploaded doc's original-file retrievability (FIX 3) so the rail only
+      // offers a download for docs whose original is actually stored — never a dead 404.
+      probeRetrievability(docs);
       window.dispatchEvent(
         new CustomEvent("nucleus:docs", {
           detail: { total: docs.length, high: docs.filter((x) => x.urgency === "high").length },
@@ -57,6 +66,24 @@ export function MaterialsRail() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load");
     }
+  }
+
+  // For each uploaded doc, HEAD /api/documents/file to learn whether its original is
+  // retrievable. 200 → show download; 404 → no stored original (show a clear tooltip,
+  // not a dead link). Bundled docs always have a committed original, so we don't probe.
+  async function probeRetrievability(docs: DocMeta[]) {
+    await Promise.all(
+      docs.map(async (d) => {
+        try {
+          const res = await fetch(`/api/documents/file?doc=${encodeURIComponent(d.doc)}`, {
+            method: "HEAD",
+          });
+          setRetrievable((m) => ({ ...m, [d.doc]: res.ok }));
+        } catch {
+          setRetrievable((m) => ({ ...m, [d.doc]: false }));
+        }
+      })
+    );
   }
 
   useEffect(() => {
@@ -157,14 +184,27 @@ export function MaterialsRail() {
                     <UrgencyBadge urgency={d.urgency} />
                   </span>
                 )}
-                <button
-                  onClick={() => openFile(d.doc)}
-                  data-testid={`doc-download-${d.doc}`}
-                  title="Open / download"
-                  className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
-                >
-                  <Download className="size-3.5" />
-                </button>
+                {/* FIX 3: only offer the download when the original is retrievable.
+                    Unknown (probe pending) → show it (optimistic); explicitly false →
+                    a disabled, clearly-labelled control instead of a dead 404 link. */}
+                {retrievable[d.doc] === false ? (
+                  <span
+                    data-testid={`doc-no-original-${d.doc}`}
+                    title="Original file not stored — this upload was indexed but its source file isn’t kept, so it can’t be downloaded."
+                    className="inline-flex size-6 cursor-default items-center justify-center rounded-md text-faint/40"
+                  >
+                    <Download className="size-3.5" />
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => openFile(d.doc)}
+                    data-testid={`doc-download-${d.doc}`}
+                    title="Open / download"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                  >
+                    <Download className="size-3.5" />
+                  </button>
+                )}
                 <button
                   onClick={() => remove(d.doc, d.label)}
                   disabled={removing === d.doc}
@@ -216,6 +256,34 @@ export function MaterialsRail() {
                     <Download className="size-3.5" />
                   </button>
                 )}
+                {/* FIX 1: a structured table is no longer a black box — View opens the
+                    real columns + rows; Export CSV downloads them (GET /api/table). */}
+                {s.kind === "structured" && (
+                  <>
+                    <button
+                      onClick={() => setViewing({ table: s.doc, label: s.label })}
+                      data-testid={`bundled-view-${s.doc}`}
+                      title="View rows"
+                      className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                    >
+                      <Table className="size-3.5" />
+                    </button>
+                    <button
+                      onClick={() =>
+                        window.open(
+                          `/api/table?table=${encodeURIComponent(s.doc)}&format=csv`,
+                          "_blank",
+                          "noopener"
+                        )
+                      }
+                      data-testid={`bundled-export-${s.doc}`}
+                      title="Export CSV"
+                      className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                    >
+                      <Download className="size-3.5" />
+                    </button>
+                  </>
+                )}
                 {/* Built-in data is SHARED → only an admin can remove it (workspace-wide). */}
                 {role === "admin" && (
                   <button
@@ -236,6 +304,15 @@ export function MaterialsRail() {
             ))}
           </ul>
         </div>
+      )}
+
+      {/* FIX 1: the structured-table viewer modal (real columns + rows + paging + CSV). */}
+      {viewing && (
+        <TableViewer
+          table={viewing.table}
+          label={viewing.label}
+          onClose={() => setViewing(null)}
+        />
       )}
     </div>
   );
