@@ -934,7 +934,9 @@ function buildTrace(opts: {
     detail:
       mode === "grounded"
         ? "Grounded generation — answer constrained to the retrieved evidence, with inline citations."
-        : "General-knowledge generation — no relevant evidence, so answered from the model's general knowledge (uncited).",
+        : rowCount + chunkCount > 0
+          ? `Answered from general knowledge (uncited) — the model did not ground its answer in the ${rowCount + chunkCount} retrieved item(s), which are still shown below.`
+          : "General-knowledge generation — no relevant evidence, so answered from the model's general knowledge (uncited).",
   });
 
   // 5. Safety / Citation check

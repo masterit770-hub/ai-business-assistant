@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Wand2, RotateCcw, Check, Loader2, AlertCircle, Cloud, Server, ShieldCheck, KeyRound } from "lucide-react";
+import { Wand2, RotateCcw, Check, Loader2, AlertCircle, Cloud, Server, ShieldCheck, KeyRound, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -38,6 +38,12 @@ export function PromptsPanel() {
   const [modelMode, setModelMode] = useState<ModelMode>("cloud");
   const [localEndpoint, setLocalEndpoint] = useState("");
   const [localModel, setLocalModel] = useState("");
+  // "Detect models on your box" — the picker that lists the models actually pulled
+  // on the owner's machine (via Ollama's /api/tags, proxied through /api/local-models).
+  // Clicking a chip just sets `localModel`, so it's equivalent to typing the name.
+  const [detecting, setDetecting] = useState(false);
+  const [detectedModels, setDetectedModels] = useState<string[] | null>(null);
+  const [detectHint, setDetectHint] = useState<string | null>(null);
   // Cloud provider override (the paste-a-key model swap).
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>("");
   const [cloudApiKey, setCloudApiKey] = useState(""); // entered value (never loaded from server)
@@ -198,6 +204,37 @@ export function PromptsPanel() {
     }
   }
 
+  // "Detect models on your box" — ask the server (admin-only /api/local-models) to
+  // list the models actually pulled at the configured endpoint. It probes the
+  // endpoint as currently SAVED, so a just-typed-but-unsaved endpoint may need a
+  // Save first; we hint that on an unreachable result. The route never 500s — it
+  // returns { models, reachable, reason } — so we just reflect that calmly.
+  async function detectModels() {
+    setDetecting(true);
+    setDetectHint(null);
+    try {
+      const res = await fetch("/api/local-models");
+      const d = await res.json();
+      if (!res.ok) throw new Error(d?.error ?? "detect failed");
+      const models: string[] = Array.isArray(d.models) ? d.models : [];
+      setDetectedModels(models);
+      if (!d.reachable) {
+        setDetectHint(
+          "Couldn't reach your endpoint — make sure Ollama is running (and the endpoint above is saved), or just type the model name below."
+        );
+      } else if (models.length === 0) {
+        setDetectHint(
+          "Reached your endpoint, but no models are pulled yet. Run e.g. `ollama pull qwen2.5`, or type a model name below."
+        );
+      }
+    } catch (e) {
+      setDetectedModels([]);
+      setDetectHint(e instanceof Error ? e.message : "detect failed");
+    } finally {
+      setDetecting(false);
+    }
+  }
+
   // Reset clears the PROMPT overrides (empty → the engine's built-in defaults),
   // saved via the same PUT. It deliberately leaves the Model section alone — we
   // don't send model_mode/local_* — so resetting the prompts never silently flips
@@ -348,8 +385,70 @@ export function PromptsPanel() {
               />
               <p className="text-xs text-faint">
                 The model you pulled, e.g. <code className="rounded bg-canvas px-1 py-0.5">ollama pull qwen2.5</code>.
+                Or <span className="font-medium text-subtle">detect</span> what&apos;s installed below.
               </p>
             </div>
+          </div>
+
+          {/* ── Local-model PICKER — auto-detect the models pulled on the owner's box ──
+              Probes the SAVED endpoint (Ollama /api/tags via /api/local-models) and
+              renders each model as a clickable chip. Clicking a chip just sets the
+              Local model name field, so it's equivalent to typing it — the free-text
+              input above stays the fallback when nothing is detected yet. */}
+          <div className={cn("space-y-3", modelMode === "cloud" && "opacity-60")} data-testid="local-model-picker">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={detectModels}
+              disabled={detecting}
+              data-testid="detect-models-button"
+              className="gap-2"
+            >
+              {detecting ? <Loader2 className="size-4 animate-spin" /> : <Search className="size-4" />}
+              {detecting ? "Detecting…" : "Detect models on your box"}
+            </Button>
+
+            {detectedModels && detectedModels.length > 0 && (
+              <div className="space-y-2">
+                <p className="text-xs text-faint">
+                  Models found on your endpoint — click one to use it:
+                </p>
+                <div className="flex flex-wrap gap-2" data-testid="detected-models">
+                  {detectedModels.map((name) => {
+                    const active = localModel.trim() === name;
+                    return (
+                      <button
+                        key={name}
+                        type="button"
+                        onClick={() => setLocalModel(name)}
+                        aria-pressed={active}
+                        data-testid="detected-model-chip"
+                        data-active={active}
+                        className={cn(
+                          "rounded-full border px-3 py-1.5 font-mono text-[12px] transition",
+                          active
+                            ? "border-accent-ring bg-accent/10 text-accent"
+                            : "border-line bg-canvas text-subtle hover:border-accent-ring hover:text-ink"
+                        )}
+                      >
+                        {active && <Check className="mr-1 inline size-3" />}
+                        {name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {detectHint && (
+              <div
+                data-testid="detect-hint"
+                className="flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800"
+              >
+                <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                <span>{detectHint}</span>
+              </div>
+            )}
           </div>
 
           {modelMode === "local" && !localEndpoint.trim() && (
