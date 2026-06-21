@@ -288,6 +288,20 @@ async function runAnswerPipeline(
     chunks: evChunks.map((c) => ({ doc: c.doc, page: c.page, text: c.text })),
     aggregates,
   };
+  // The result-shaped evidence (with citation tokens + real scores) the UI renders.
+  // Built ONCE so the general-knowledge fallbacks can STILL show the documents that
+  // were retrieved instead of dropping them. Retrieval is retrieval — what the search
+  // found is always surfaced in the Inspector, regardless of what the model wrote.
+  const retrievedEvidence = {
+    rows: evRows.map((r) => ({ table: r.table, id: r.id, token: r.token, data: r.data })),
+    chunks: evChunks.map((c) => ({
+      doc: c.doc,
+      page: c.page,
+      token: c.token,
+      text: c.text,
+      score: c.score,
+    })),
+  };
 
   // HONEST DOC-LANE SHORT-CIRCUIT: when File Search (the UPLOADED-doc lane) failed,
   // do NOT silently answer from the wrong corpus. Surface the honest "couldn't search
@@ -421,13 +435,15 @@ async function runAnswerPipeline(
       answer: generalAnswer,
       mode: "general",
       grounded: false,
-      evidence: { rows: [], chunks: [] },
+      // PRESERVE the retrieved docs — never discard good retrieval because the model's
+      // wording tripped a regex. The Inspector still shows what the search found.
+      evidence: retrievedEvidence,
       validation: { ok: true, reasons: [] },
       inspector: buildInspector({
         tel,
         route,
-        rowCount: 0,
-        chunkCount: 0,
+        rowCount: evRows.length,
+        chunkCount: evChunks.length,
         usedFileSearch,
         fileSearchError,
         mode: "general",
@@ -516,13 +532,15 @@ async function runAnswerPipeline(
       answer: generalAnswer,
       mode: "general",
       grounded: false,
-      evidence: { rows: [], chunks: [] },
+      // PRESERVE the retrieved docs (same reason as above) — the Inspector shows what
+      // the search found even when the answer falls back to general knowledge.
+      evidence: retrievedEvidence,
       validation: { ok: true, reasons: [] },
       inspector: buildInspector({
         tel,
         route,
-        rowCount: 0,
-        chunkCount: 0,
+        rowCount: evRows.length,
+        chunkCount: evChunks.length,
         usedFileSearch,
         fileSearchError,
         mode: "general",
