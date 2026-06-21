@@ -18,11 +18,14 @@ const PROVIDER = process.env.LLM_PROVIDER ?? "deepseek";
 const BASE = process.env.LLM_BASE_URL ?? "https://api.deepseek.com";
 const MODEL = process.env.LLM_MODEL ?? "deepseek-chat";
 
-// LOCAL mode timeout. A dead local endpoint must fail FAST (so the friendly
-// "couldn't reach your local model" guidance shows promptly) — not hang for the
-// route's full 120s budget. 8s is generous for a healthy Ollama on the same box
-// yet short enough that an unreachable host errors almost immediately.
-const LOCAL_TIMEOUT_MS = 8000;
+// LOCAL mode timeout. A dead host still fails FAST regardless of this value (the
+// TCP connect is refused immediately), so this cap mainly bounds a routable-but-slow
+// endpoint. 8s was too tight: when the model runs on a *remote* box reached over a
+// tunnel (the "cloud app → your own machine" topology), the cross-region round trip
+// + non-streaming generation routinely exceeds 8s and the answer was being dropped
+// for the setup-guidance message. 45s covers a real remote/CPU generation while
+// staying well under the route's 120s budget.
+const LOCAL_TIMEOUT_MS = 45000;
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
