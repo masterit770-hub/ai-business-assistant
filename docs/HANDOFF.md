@@ -2,7 +2,7 @@
 
 **For:** the owner (Jenny) and whoever helps her set it up — **a human engineer *or* an AI assistant.**
 
-> 🤖 **Non-technical? Read this first.** You don't need to understand the technical steps. Open an AI assistant (Claude, ChatGPT, etc.), **paste this whole document in, and say: "Walk me through this one step at a time."** This guide is written so an AI can follow it precisely.
+> 🤖 **Non-technical? Read this first.** You don't need to understand the technical steps. Open an AI assistant (Claude, ChatGPT, etc.), **paste this whole document in, and say: "Walk me through this one step at a time."** This guide is written so an AI can follow it precisely — and by the end, the **entire system** (the app, your logins database, document search, and the AI model — including the HIPAA and offline options) runs on **your own accounts**, depending on nothing of the contractor's.
 
 ---
 
@@ -76,9 +76,13 @@ LLM_MODEL=deepseek-chat
 
 # ── Documents (Gemini File Search) ──
 GEMINI_API_KEY=<your-gemini-key>
+GOOGLE_API_KEY=<same-gemini-key>          # the Google SDK reads THIS name — set both equal
 GEMINI_FS_MODEL=gemini-2.5-flash-lite     # the doc-query model (separate, cheaper quota)
-# Create a Gemini File Search store once and pin its id (ask your AI: "create a Gemini
-# File Search store with my key and give me its name").
+GEMINI_FILE_SEARCH_STORE=                 # leave blank for the FIRST deploy → the app creates
+#   a store when you upload your first document. Then PIN it: read the created store name and
+#   paste it here (Vercel env) so every instance shares ONE store. If you skip this, later
+#   uploads can scatter across new stores. (Ask your AI: "upload a test doc, find the
+#   GEMINI_FILE_SEARCH_STORE name the app created, and set it in Vercel.")
 
 # ── Logins & users (Supabase, from Project Settings → API) ──
 NEXT_PUBLIC_SUPABASE_URL=https://<ref>.supabase.co
@@ -87,12 +91,16 @@ SUPABASE_SERVICE_ROLE_KEY=<service-role-key>   # server-side only, keep private
 
 # ── Internal plumbing (set once) ──
 INTERNAL_EMBED_TOKEN=<any-long-random-string>   # secures the app's internal helper call
-# ASSISTANT_TODAY pins the sample data's "today" so demo numbers stay consistent;
-# remove it for live use.
-ASSISTANT_TODAY=2026-06-09
+# ASSISTANT_TODAY: DO NOT SET on your real data — leave it unset so "today" is the actual
+#   date (so "expiring in the next 90 days" computes correctly). It exists only to freeze
+#   the sample demo's numbers; setting it on live data gives wrong, stale answers.
 ```
 
-**Database setup:** the repo ships a Supabase migration (a `profiles` table + a trigger that gives each new signup a profile and makes the **first** user an **admin**). Apply it once: `supabase link --project-ref <your-ref>` then `supabase db push` (or paste the migration SQL into Supabase → SQL Editor).
+**Database setup — apply BOTH migrations** in `supabase/migrations/` (the second is **required**, or your model switch + saved keys + prompts won't persist):
+- `001_profiles_and_roles.sql` — a `profiles` table + a trigger that gives each signup a profile and makes the **first** user an **admin**.
+- `002_engine_settings.sql` — the `engine_settings` table that persists your **model mode, per-mode keys, and editable prompts** across the serverless instances.
+
+Easiest path (AI-friendly): Supabase → **SQL Editor** → paste the contents of each file → Run. (Or with the CLI: `supabase link --project-ref <your-ref>` then `supabase db push`.) Verify: Supabase → **Table Editor** should now show `profiles` and `engine_settings`.
 
 ---
 
@@ -134,6 +142,48 @@ Nucleus has a **three-way model switch** (top of the Ask panel, and in **Setting
 - **Local** — the AI runs on **your own machine** (Ollama). Enter your endpoint and click **Detect models on your box** to pick from what you've installed. Works **self-hosted** (app on the box) **or** with the hosted Vercel app via a **tunnel**. Full tested setup (both ways, the 24/7 self-healing tunnel, the model trade-off) → **[LOCAL-MODEL.md](LOCAL-MODEL.md)**.
 
 All of this is in-app (Settings → Model) — **no redeploy**. Keys are write-only (saved, never shown back).
+
+---
+
+## Set up Azure OpenAI as your HIPAA-eligible AI backend
+
+*(Only if you'll run real patient/legal data. Skip otherwise.)* This connects the app's **HIPAA mode** to Microsoft's Azure OpenAI. By the end you'll have **four values** to paste into **Settings → Model → HIPAA**: an **Endpoint**, an **API key**, a **Deployment name**, and (already defaulted) an **API version**. Your AI helper can do most of the clicking; you approve and copy/paste.
+
+> Set everything up in a **United States region** and keep it there — HIPAA coverage applies to US-hosted resources.
+
+### 1. Create an Azure account + subscription
+1. Go to **https://azure.microsoft.com** → **Start free** (or sign in if your business already has an account).
+2. Sign up with a work email, phone, and a credit card (identity check; the free tier doesn't charge unless you exceed it). This creates your **subscription** (billing container).
+3. **Cost:** opening the account is free. Azure OpenAI is **pay-as-you-go** (billed per million "tokens"). A light internal workload is usually a few to low-tens of dollars/month. Set a **budget/alert** in **Cost Management** to avoid surprises.
+
+### 2. Create an Azure OpenAI resource
+1. In the **Azure portal** (https://portal.azure.com) → **Create a resource** → search **Azure OpenAI** → **Create**.
+2. **Basics:** **Subscription** (step 1), **Resource group** (new, e.g. `hipaa-ai`), **Region** (a **US** region like *East US 2*), **Name** (e.g. `myclinic-openai`), tier **Standard**.
+3. **Next** through the wizard → **Review + submit** → **Create** → **Go to resource**.
+4. **Access (2026):** you generally **no longer fill out an access form** — Microsoft grants all customers access to standard models. (A form is only needed for *Limited Access* models or to turn off content filtering — not needed here.) ([Microsoft Learn](https://learn.microsoft.com/en-us/azure/foundry/responsible-ai/openai/limited-access))
+
+### 3. Deploy a model
+1. Go to **https://ai.azure.com**, open your resource → **Deployments** (a.k.a. **Models + endpoints**).
+2. **+ Deploy model → Deploy base model** → pick a current **GPT-4-class** model (**`gpt-4o`**, or **`gpt-4o-mini`** for lower cost) → **Confirm**.
+3. **Set the Deployment name** (one of your four values) — type anything (e.g. `chat-gpt4o`) and **write down exactly what you typed**. Type **Standard** → **Deploy** → wait for **Succeeded**. ([Microsoft Learn](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/create-resource))
+
+### 4. Copy the four values into the app
+| App field (Settings → Model → HIPAA) | Where in Azure |
+|---|---|
+| **Endpoint** | Resource → **Keys and Endpoint** → **Endpoint** (e.g. `https://myclinic-openai.openai.azure.com`). |
+| **API key** | Same page → **KEY 1** (or KEY 2). Treat like a password. |
+| **Deployment name** | The exact name you typed in step 3. |
+| **API version** | App **defaults** this — leave as-is. If ever needed, a recent stable one is **`2024-10-21`**. ([Microsoft Learn](https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle)) |
+
+Paste the first three, save, flip to **HIPAA**. (HIPAA mode **fails closed** — until these are set it refuses to answer rather than fall back to the shared cloud model.)
+
+### The HIPAA BAA — required, and your responsibility
+- Azure OpenAI is a **HIPAA-eligible** service; Microsoft offers the **BAA as part of its standard Product Terms / DPA** — no separate per-product contract.
+- For most customers the BAA is **already included** in an eligible agreement (a Microsoft **Enterprise Agreement** or a purchase via a **Cloud Solution Provider/partner**). On a basic pay-as-you-go account, **confirm with Microsoft (or your partner)** that your account is under a BAA-covering agreement *before* sending patient data. Terms: **https://www.microsoft.com/licensing/terms**. ([Microsoft Q&A](https://learn.microsoft.com/en-us/answers/questions/2258799/does-azure-openai-services-provide-hipaa-complianc))
+- **Honest caveat:** having the BAA, keeping the resource in a **US region**, and using it within HIPAA practices is **your** responsibility. The app **cannot verify** your account is BAA-covered — it just sends requests to the endpoint/key you give it. Don't enter real patient data until you've confirmed coverage.
+
+### Google Vertex AI (GCP alternative) — follow-up only
+Google **Vertex AI** is a comparable HIPAA-eligible option, but it authenticates with a **service-account JSON / OAuth token**, not a pasted key — which the current "paste-a-key" HIPAA flow doesn't support. If you specifically need Google, flag it as a **follow-up** to be built; for now Azure is the supported path.
 
 ---
 
