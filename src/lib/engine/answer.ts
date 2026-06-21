@@ -837,7 +837,12 @@ function deriveConfidence(opts: {
   hasRows: boolean;
 }): Confidence {
   if (!opts.grounded) {
-    return { value: 0.4, basis: "general knowledge — no matching evidence in your sources" };
+    // If evidence WAS retrieved but the model answered generally anyway (a weak model
+    // punting), say so — don't claim "no matching evidence" when there was some.
+    const hadEvidence = opts.topScore !== null || opts.hasRows;
+    return hadEvidence
+      ? { value: 0.4, basis: "general answer — the model did not ground in the retrieved evidence" }
+      : { value: 0.4, basis: "general knowledge — no matching evidence in your sources" };
   }
   // A structured (SQL) turn with rows is a deterministic exact-match → high floor.
   let base: number;
