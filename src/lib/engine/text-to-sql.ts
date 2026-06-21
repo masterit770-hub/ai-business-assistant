@@ -22,7 +22,9 @@ import {
 } from "./structured-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
 
-const TODAY = process.env.ASSISTANT_TODAY ?? new Date().toISOString().slice(0, 10);
+// `||` (not `??`) so an empty env value ("") falls through to the real date instead
+// of producing a broken date filter like date('', '+90 days') → NULL.
+const TODAY = process.env.ASSISTANT_TODAY || new Date().toISOString().slice(0, 10);
 
 export type StructuredPlan = {
   // Tables the planner decided are relevant (subset of the catalog). Empty = none.

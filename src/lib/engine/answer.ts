@@ -99,7 +99,8 @@ export type InspectorTrace = {
   cost: CostReport;
 };
 
-const TODAY = process.env.ASSISTANT_TODAY ?? new Date().toISOString().slice(0, 10);
+// `||` (not `??`) so an empty env value ("") falls through to the real date.
+const TODAY = process.env.ASSISTANT_TODAY || new Date().toISOString().slice(0, 10);
 
 /**
  * Decide whether to surface the HONEST "couldn't search your uploaded documents"

@@ -15,7 +15,8 @@ import { fileSearchEnabled, uploadToStore, registerTitleMapping } from "./file-s
 import { registerFileSearchDoc, setDocFileId } from "./runtime-store.ts";
 import type { RuntimeSqlRow } from "./runtime-store.ts";
 
-const TODAY = process.env.ASSISTANT_TODAY ?? new Date().toISOString().slice(0, 10);
+// `||` (not `??`) so an empty env value ("") falls through to the real date.
+const TODAY = process.env.ASSISTANT_TODAY || new Date().toISOString().slice(0, 10);
 
 // A stable, citation-safe doc id from a filename: lowercased, non-alphanumerics
 // to hyphens. This is the [P:<doc>#page] namespace, so it must be URL/token-safe.
