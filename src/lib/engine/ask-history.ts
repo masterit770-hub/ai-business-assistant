@@ -73,20 +73,40 @@ export type SessionSummary = {
 };
 
 /**
+ * Pick the DISPLAY title for a session: the user's rename OVERRIDE when present and
+ * non-blank, else the first turn's question (the default). PURE so the merge rule is
+ * unit-tested without a DB.
+ *
+ * - `firstQuestion` is the immutable first turn's text (the default title).
+ * - `override` is the stored session_titles.title for this session, if any.
+ *   A null/undefined/blank/whitespace-only override is ignored (falls back to the
+ *   question) so an empty rename can never blank out a thread's title.
+ */
+export function resolveSessionTitle(
+  firstQuestion: string,
+  override?: string | null
+): string {
+  return override && override.trim() ? override.trim() : firstQuestion;
+}
+
+/**
  * Group ask_history rows into one summary per session, NEWEST session first.
  *
  * Input rows may be in any order. Within a session, the OLDEST row (earliest
- * created_at) supplies the title (the first question the user asked); the NEWEST row
- * supplies last_at. A row whose session_id is null is treated as its OWN singleton
- * session keyed by its row id, so a pre-migration single-shot ask still appears in the
- * list (it just has one turn). `emailOf` (optional) attaches the owner's email for the
- * admin cross-user view.
+ * created_at) supplies the DEFAULT title (the first question the user asked); the
+ * NEWEST row supplies last_at. A row whose session_id is null is treated as its OWN
+ * singleton session keyed by its row id, so a pre-migration single-shot ask still
+ * appears in the list (it just has one turn). `emailOf` (optional) attaches the
+ * owner's email for the admin cross-user view. `titleOf` (optional) maps a session_id
+ * to a RENAME override — when present and non-blank it replaces the first question as
+ * the displayed title (see resolveSessionTitle).
  *
  * PURE (no I/O) so the grouping contract is unit-tested without a DB.
  */
 export function groupSessions(
   rows: AskRow[],
-  emailOf?: Map<string, string>
+  emailOf?: Map<string, string>,
+  titleOf?: Map<string, string>
 ): SessionSummary[] {
   const byKey = new Map<string, AskRow[]>();
   for (const r of rows) {
@@ -105,9 +125,12 @@ export function groupSessions(
     );
     const first = ordered[0];
     const last = ordered[ordered.length - 1];
+    const sessionId = first.session_id ?? key;
     sessions.push({
-      session_id: first.session_id ?? key,
-      title: first.question,
+      session_id: sessionId,
+      // The user's rename override wins (when present + non-blank); else the first
+      // turn's question. A legacy null-session row keyed by `row:<id>` has no override.
+      title: resolveSessionTitle(first.question, titleOf?.get(sessionId)),
       turn_count: ordered.length,
       last_at: last.created_at,
       ...(emailOf ? { owner_email: emailOf.get(first.owner_id) ?? null } : {}),

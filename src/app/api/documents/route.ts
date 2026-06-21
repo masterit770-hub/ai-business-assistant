@@ -1,11 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
 import { listDocsWithMeta } from "@/lib/engine/doc-store";
-import {
-  fileSearchEnabled,
-  listStoreDocuments,
-  deleteDocumentByDocId,
-} from "@/lib/engine/file-search";
+import { listUploadedDocs, deleteUploadedDoc } from "@/lib/engine/pgvector-store";
 import { removeRuntimeDoc } from "@/lib/engine/runtime-store";
 import { bundledSources } from "@/lib/engine/bundled-sources";
 import {
@@ -38,9 +34,18 @@ export async function GET() {
   try {
     // Refresh the hidden-set so the bundled list omits admin-deleted sources.
     await refreshDeletedSources();
-    const uploaded = fileSearchEnabled()
-      ? await listStoreDocuments(scopeOwner)
-      : await listDocsWithMeta();
+    // DURABLE, owner-isolated uploaded-doc list from the pgvector store (doc_chunks),
+    // when Supabase is configured; otherwise the in-memory dev/offline registry.
+    // Urgency lives only in the in-memory registry (classified at ingest), so we
+    // overlay it onto the durable list when the same doc id is still in memory.
+    let uploaded: { doc: string; label: string; urgency: "high" | "medium" | "low" | null }[];
+    if (supabaseEnabled()) {
+      const durable = await listUploadedDocs(scopeOwner);
+      const memMeta = new Map((await listDocsWithMeta()).map((d) => [d.doc, d.urgency]));
+      uploaded = durable.map((d) => ({ ...d, urgency: memMeta.get(d.doc) ?? d.urgency }));
+    } else {
+      uploaded = await listDocsWithMeta();
+    }
     return NextResponse.json({
       documents: uploaded,
       bundled: bundledSources(),
@@ -92,11 +97,13 @@ export async function DELETE(req: Request) {
     }
   }
 
-  // ── UPLOADED doc → per-user removal from the File Search store + registry ───────
+  // ── UPLOADED doc → per-user removal from the pgvector store + in-memory registry ─
+  // Owner-scoped so a member can only delete their OWN doc; an admin may delete any.
   try {
     let removed = 0;
-    if (fileSearchEnabled()) {
-      removed = await deleteDocumentByDocId(doc);
+    if (supabaseEnabled()) {
+      const scopeOwner = user.role === "admin" ? undefined : user.id;
+      removed = await deleteUploadedDoc(scopeOwner, doc, user.role === "admin");
     }
     removeRuntimeDoc(doc);
     return NextResponse.json({ ok: true, doc, removedFromStore: removed });

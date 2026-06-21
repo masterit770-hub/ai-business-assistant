@@ -11,8 +11,10 @@ import { embedPassage } from "./embeddings.ts";
 import type { DocSpec, VectorRecord } from "./documents.ts";
 import { storeDocument, storeRows, type Urgency } from "./doc-store.ts";
 import { classifyUrgency } from "./urgency.ts";
-import { fileSearchEnabled, uploadToStore, registerTitleMapping } from "./file-search.ts";
-import { registerFileSearchDoc, setDocFileId } from "./runtime-store.ts";
+import { ocrLowTextPages } from "./ocr.ts";
+import { storeDocChunks, type StorableChunk } from "./pgvector-store.ts";
+import { pdfToken } from "./citations.ts";
+import { supabaseEnabled } from "./supabase.ts";
 import type { RuntimeSqlRow } from "./runtime-store.ts";
 
 // `||` (not `??`) so an empty env value ("") falls through to the real date.
@@ -40,6 +42,7 @@ export type IngestResult = {
   rows?: number;
   sheets?: number;
   urgency?: Urgency; // LLM-classified dashboard badge
+  persisted?: number; // chunks written to the durable pgvector store (when Supabase is on)
 };
 
 /** Extract per-page text from a PDF buffer using unpdf (serverless-safe). */
@@ -52,11 +55,43 @@ async function extractPdfPages(buf: Uint8Array): Promise<string[]> {
 }
 
 /**
- * Ingest a PDF buffer: extract → chunk (printed-pagination aware) → embed each
- * chunk with the local multilingual model → persist to the document store
- * (Supabase pgvector, or in-memory fallback). After this resolves, a
- * documents-routed question can retrieve and cite [P:<doc>#page].
- * @param ownerId  the uploading user (Phase C); undefined = shared/single-user.
+ * Extract per-page text, then BEST-EFFORT OCR the low-text (scanned/image-only) pages
+ * and splice the recovered text back in. The TEXT path is the contract — OCR is pure
+ * enrichment and NEVER throws (ocrLowTextPages is bounded + non-throwing): if it can't
+ * run (serverless WASM limits) the pages just stay as their text-layer extraction.
+ * pdf.js detaches the buffer it reads, so OCR gets its OWN copy of the bytes.
+ */
+async function extractPdfPagesWithOcr(buf: Uint8Array): Promise<string[]> {
+  const ocrCopy = buf.slice(); // keep untouched bytes — extractPdfPages detaches buf
+  const pages = await extractPdfPages(buf);
+  try {
+    const recovered = await ocrLowTextPages(ocrCopy, pages);
+    for (const [idxStr, text] of Object.entries(recovered)) {
+      const i = Number(idxStr);
+      if (text && (pages[i] ?? "").replace(/\s+/g, "").length < text.replace(/\s+/g, "").length) {
+        pages[i] = text;
+      }
+    }
+  } catch (e) {
+    // OCR is best-effort; a failure must never break a text-PDF ingest.
+    console.warn("[ingest] OCR enrichment skipped:", e instanceof Error ? e.message : e);
+  }
+  return pages;
+}
+
+/**
+ * Ingest a PDF buffer into the SELF-HOSTED HYBRID document lane (no Gemini):
+ *   extract per-page text (unpdf) → OCR low-text/scanned pages (Tesseract,
+ *   best-effort) → chunk (printed-pagination aware) → embed each chunk with the
+ *   local multilingual e5 model → persist to Supabase pgvector (doc_chunks, the
+ *   HYBRID dense+BM25 store) AND the in-memory document store (the dev/offline
+ *   fallback). After this resolves, a documents-routed question retrieves these
+ *   chunks via the hybrid (dense × BM25 → RRF) search and cites [P:<doc>#page].
+ *
+ * The TEXT path is the contract; OCR is enrichment that never breaks ingest. If a
+ * PDF yields NO text even after OCR, we throw the honest zero-content error (the
+ * route surfaces it) rather than store an empty doc.
+ * @param ownerId  the uploading user; undefined = shared/single-user.
  */
 export async function ingestPdf(
   buf: Uint8Array,
@@ -65,87 +100,55 @@ export async function ingestPdf(
   ownerId?: string
 ): Promise<IngestResult> {
   const doc = docIdFromFilename(filename);
+  const docLabel = label || filename;
 
-  // This LOCAL fallback path handles born-digital PDFs (text layer present). It
-  // runs only when Gemini File Search is NOT configured (a dev/offline mode).
-  //
-  // SCANNED / image-only PDFs are NOT handled here by design: Gemini's multimodal
-  // models read scans natively, so scanned-document support lives in the File
-  // Search doc lane (the production path), NOT a separate local OCR pipeline.
-  const pages = await extractPdfPages(buf);
+  // Text path + best-effort OCR for scanned/image-only pages (see ocr.ts: bounded,
+  // serverless-safe degradation, never throws).
+  const pages = await extractPdfPagesWithOcr(buf);
   const chunks = pagesToChunks(pages, doc);
   if (chunks.length === 0) {
     throw new Error(
-      "no extractable text in this PDF. If it's a scanned/image PDF, ingest it via " +
-        "the Gemini File Search path (set GEMINI_API_KEY) — Gemini reads scans natively; " +
-        "this local fallback handles born-digital PDFs only."
+      "no extractable text in this PDF. If it's a scanned/image PDF, OCR couldn't read " +
+        "it in this environment (OCR is best-effort and may be unavailable on a " +
+        "constrained serverless function). Born-digital PDFs, CSV, and XLSX are unaffected."
     );
   }
+
+  // Embed every chunk with the SAME local e5 model the bundled index + the query side
+  // use (384-dim) → so an uploaded chunk lands in the same space as a bundled one.
   const records: VectorRecord[] = [];
+  const storable: StorableChunk[] = [];
   for (const c of chunks) {
     const embedding = await embedPassage(c.text);
     records.push({ doc: c.doc, page: c.page, text: c.text, embedding });
+    storable.push({ page: c.page, text: c.text, token: pdfToken(c.doc, c.page), embedding });
   }
+
   // Classify urgency from the document's leading text (real LLM call, editable
   // prompt) so the dashboard badge reflects the actual content.
   const urgency = await classifyUrgency(pages.join("\n"), TODAY);
-  const spec: DocSpec = { doc, label: label || filename, file: filename };
+  const spec: DocSpec = { doc, label: docLabel, file: filename };
+
+  // DURABLE per-user store: persist the embedded chunks to Supabase pgvector
+  // (doc_chunks). fts is auto-generated → the BM25/lexical lane needs no extra write.
+  // Owner-tagged for per-user isolation. Fail-open (storeDocChunks returns 0 on any
+  // error, never throws) so a Supabase blip doesn't fail an ingest that still
+  // populated the in-memory store below.
+  const stored = await storeDocChunks(ownerId, doc, docLabel, storable);
+
+  // Also register in the in-memory document store so the doc is query-able + listed
+  // even when Supabase is off (dev/offline), and the router catalog/dashboard see it.
   await storeDocument(spec, records, ownerId, urgency);
+
   return {
     kind: "pdf",
     doc,
-    label: spec.label,
+    label: docLabel,
     chunks: records.length,
     pages: pages.filter((p) => p.length > 0).length,
     urgency,
+    persisted: supabaseEnabled() ? stored : undefined,
   };
-}
-
-/**
- * Ingest a document into Gemini File Search (the managed, durable doc store).
- * Gemini chunks/embeds/persists the file and reads scans/Office formats natively,
- * so this path needs no local OCR/chunking. We still classify urgency from the
- * file's text (best-effort) and register the doc id so the router catalog + the
- * dashboard see it. The citation namespace [P:<doc>#page] is derived from the
- * filename so File Search grounding chunks map back to the same chips.
- */
-export async function ingestDocumentToFileSearch(
-  buf: Uint8Array,
-  filename: string,
-  mimeType?: string,
-  ownerId?: string
-): Promise<IngestResult> {
-  const doc = docIdFromFilename(filename);
-
-  // pdf.js detaches the buffer it reads, so keep an untouched copy for the upload
-  // before local text extraction (for urgency) consumes the original.
-  const uploadCopy = buf.slice();
-
-  // Best-effort urgency: extract text locally just for classification (a scanned
-  // PDF may yield nothing — then we leave urgency unset rather than guess wrong).
-  let urgency: Urgency | undefined;
-  try {
-    const pages = await extractPdfPages(buf);
-    const text = pages.join("\n");
-    if (text.replace(/\s/g, "").length > 0) urgency = await classifyUrgency(text, TODAY);
-  } catch {
-    // non-PDF or unreadable for local extraction — skip urgency, File Search still indexes it
-  }
-
-  // Index the file into Gemini File Search. Store doc_id / label / urgency in the
-  // file's custom_metadata so the dashboard list + delete are rebuilt DURABLY from
-  // the store (survive cold starts), not the per-Lambda in-memory registry.
-  const { fileId } = await uploadToStore(uploadCopy, doc, mimeType ?? "application/pdf", ownerId, {
-    docId: doc,
-    label: filename,
-    urgency,
-  });
-  registerTitleMapping(fileId, doc);
-  setDocFileId(doc, fileId);
-
-  // Also register in-process (router catalog + same-instance dashboard fallback).
-  registerFileSearchDoc({ doc, label: filename, file: filename }, urgency);
-  return { kind: "pdf", doc, label: filename, urgency };
 }
 
 // Turn one tabular row into a compact, human-readable line so it can be embedded

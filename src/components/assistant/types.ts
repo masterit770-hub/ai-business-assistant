@@ -15,7 +15,19 @@ export type EngineResult = {
   localGuidance?: "not-configured" | "unreachable";
   evidence: {
     rows: { table: string; id: number; token: string; data: Record<string, unknown> }[];
-    chunks: { doc: string; page: number; token: string; text: string; score?: number }[];
+    // `score` is the headline relevance (RRF fused score for a hybrid result). The
+    // hybrid breakdown (denseRank / bm25Rank / rrfScore) is the REAL per-chunk ranking
+    // the inspector's document-retrieval table shows — engine-computed, never hardcoded.
+    chunks: {
+      doc: string;
+      page: number;
+      token: string;
+      text: string;
+      score?: number;
+      denseRank?: number;
+      bm25Rank?: number;
+      rrfScore?: number;
+    }[];
   };
   validation: { ok: boolean; reasons: string[] };
   inspector?: InspectorTrace;

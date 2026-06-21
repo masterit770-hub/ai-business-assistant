@@ -5,7 +5,9 @@ allowBuilds:
   canvas: true
   protobufjs: true
   sharp: true
+  tesseract.js: true
   unrs-resolver: true
 onlyBuiltDependencies:
   - sharp
   - unrs-resolver
+  - tesseract.js

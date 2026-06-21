@@ -125,8 +125,16 @@ export function ModelSwitch({
     );
   };
 
+  // Plain-language one-liner for the ACTIVE mode, shown right under the switch so a
+  // non-technical owner knows what each choice means without leaving the control.
+  const MODE_BLURB: Record<Mode, string> = {
+    cloud: "Cloud — a hosted AI; works with any provider key.",
+    hipaa: "HIPAA — your own Azure key, for patient data under a BAA.",
+    local: "Local — runs on your own machine; nothing leaves it.",
+  };
+
   return (
-    <div className="flex flex-wrap items-center gap-2" data-testid="model-switch" data-mode={mode}>
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1" data-testid="model-switch" data-mode={mode}>
       <span
         className={cn(
           "font-medium uppercase tracking-wide text-faint",
@@ -144,6 +152,13 @@ export function ModelSwitch({
         {seg("hipaa", "HIPAA", ShieldCheck)}
         {seg("local", "Local", Server)}
       </div>
+      {/* What the active mode means, in plain language (basis-full → its own line). */}
+      <p
+        data-testid="model-switch-blurb"
+        className={cn("basis-full text-faint", big ? "text-xs" : "text-[11px]")}
+      >
+        {MODE_BLURB[mode]}
+      </p>
       {/* Inline hint when Local is the active mode but no endpoint is configured. */}
       {mode === "local" && !endpointSet && (
         <Link

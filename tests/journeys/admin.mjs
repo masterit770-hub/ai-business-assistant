@@ -26,22 +26,35 @@ export async function run() {
     const testEmail = `qa-verify-${Date.now()}@example.com`;
     page.on("dialog", (d) => d.accept().catch(() => {}));
     const form = page.locator('[data-testid="create-user-form"]');
-    await form.locator('input[type="email"]').fill(testEmail);
-    await form.locator('input[type="text"]').fill("TempPass123!");
+    const emailInput = form.locator('input[type="email"]');
+    const pwInput = form.locator('input[type="text"]');
+    await emailInput.click(); await emailInput.type(testEmail, { delay: 8 });
+    await pwInput.click(); await pwInput.type("TempPass123!", { delay: 8 });
     await form.locator('button[type="submit"]').click();
 
     const card = page.locator('[data-testid="invite-card"]');
-    const cardShown = await card.isVisible({ timeout: 20000 }).catch(() => false);
+    // Wait for either the invite card or an error banner to settle (the create hits the
+    // real Supabase admin API, which can take a couple seconds).
+    await Promise.race([
+      card.waitFor({ state: "visible", timeout: 25000 }).catch(() => {}),
+      page.locator('[data-testid="users-panel"] .bg-red-50').first().waitFor({ state: "visible", timeout: 25000 }).catch(() => {}),
+    ]);
+    const cardShown = await card.isVisible().catch(() => false);
     // A real create error renders in the panel's red error BANNER (the bg-red-50 row at
     // the top of the panel), NOT in a button's red text — read that precise element.
     const errText = await page.locator('[data-testid="users-panel"] .bg-red-50').first().textContent({ timeout: 1500 }).catch(() => null);
     let surfaced = false, detail = "";
     if (cardShown) {
-      const link = await card.locator('[data-testid="invite-link"]').count().catch(() => 0);
-      const pw = await card.locator('[data-testid="invite-password"]').count().catch(() => 0);
+      // CopyField renders its testid as "<id>-value" on the readonly input (and
+      // "<id>-copy" on the button), so query those. A successful create surfaces an
+      // invite link AND a temp password (verified against the real admin API response).
+      const link = await card.locator('[data-testid="invite-link-value"]').count().catch(() => 0);
+      const pw = await card.locator('[data-testid="invite-password-value"]').count().catch(() => 0);
+      const linkVal = link > 0 ? await card.locator('[data-testid="invite-link-value"]').inputValue().catch(() => "") : "";
+      const pwVal = pw > 0 ? await card.locator('[data-testid="invite-password-value"]').inputValue().catch(() => "") : "";
       const linkMissing = await card.locator('[data-testid="invite-link-missing"]').count().catch(() => 0);
-      surfaced = (link > 0) || (pw > 0);
-      detail = `inviteLink=${link} tempPassword=${pw} linkMissingNote=${linkMissing}`;
+      surfaced = (link > 0 && linkVal.length > 0) || (pw > 0 && pwVal.length > 0);
+      detail = `inviteLink=${link}(${linkVal ? "set" : "empty"}) tempPassword=${pw}(${pwVal ? "set" : "empty"}) linkMissingNote=${linkMissing}`;
     } else {
       detail = errText ? `error: ${errText}` : "no invite card";
     }

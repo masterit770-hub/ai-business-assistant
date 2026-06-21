@@ -268,16 +268,23 @@ export function OrchestratorTrace({ result }: { result: EngineResult }) {
   );
 }
 
-// ── Document retrieval table (REAL per-passage scores) ───────────────────────
+// ── Document retrieval table (REAL hybrid dense / BM25 / RRF per passage) ─────
 export function DocumentRetrieval({ result }: { result: EngineResult }) {
   const insp = result.inspector;
   const chunks = result.evidence.chunks;
   const rows = result.evidence.rows;
-  // Sort document chunks by real score (desc) for the table.
-  const ranked = [...chunks]
-    .map((c, i) => ({ ...c, rank: i }))
-    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  const maxScore = Math.max(0.0001, ...ranked.map((c) => c.score ?? 0));
+  // Rank by the REAL fused RRF score (desc) — the value the engine ordered by. Fall
+  // back to `score` (which IS the rrf score for a hybrid result) so order is stable.
+  const ranked = [...chunks].sort(
+    (a, b) => (b.rrfScore ?? b.score ?? 0) - (a.rrfScore ?? a.score ?? 0)
+  );
+  const maxRrf = Math.max(0.0001, ...ranked.map((c) => c.rrfScore ?? c.score ?? 0));
+  // Are these hybrid results (carrying real dense/BM25 ranks)? Every uploaded + bundled
+  // chunk now does; the flag just guards the legacy/empty case.
+  const isHybrid = ranked.some((c) => c.denseRank !== undefined || c.rrfScore !== undefined);
+  // A rank of 0 means "that lane did not rank this chunk" (e.g. no keyword overlap → no
+  // BM25 rank). Show it as an em dash, not "0", so the absence is honest.
+  const rankCell = (r?: number) => (r === undefined ? "n/a" : r === 0 ? "—" : `#${r}`);
 
   return (
     <Panel
@@ -291,28 +298,32 @@ export function DocumentRetrieval({ result }: { result: EngineResult }) {
         </span>
       }
     >
-      {/* Honest method label + lane chips — NOT a copied "dense × BM25 → RRF → rerank". */}
+      {/* Honest method label — the document lane is a REAL hybrid (dense × BM25 → RRF). */}
       <p className="text-[13px] text-subtle">
         Retrieval method:{" "}
         <span className="font-medium text-ink">{insp?.retrievalMethod ?? "—"}</span>
       </p>
-      {/* The dense-lane config chips ONLY apply when the documents lane actually ran. */}
+      {/* The hybrid-lane config chips ONLY apply when the documents lane actually ran. */}
       {chunks.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5">
-          {["embed: multilingual-e5 (local)", "similarity: cosine", "rerank: none", "top_k: 8"].map(
-            (chip) => (
-              <span
-                key={chip}
-                className="rounded-md border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-faint"
-              >
-                {chip}
-              </span>
-            )
-          )}
+          {[
+            "embed: multilingual-e5 (local)",
+            "dense: cosine",
+            "lexical: BM25",
+            "fusion: RRF (k=60)",
+            "top_k: 8",
+          ].map((chip) => (
+            <span
+              key={chip}
+              className="rounded-md border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-faint"
+            >
+              {chip}
+            </span>
+          ))}
         </div>
       )}
 
-      {/* Document passages — REAL cosine scores */}
+      {/* Document passages — REAL hybrid dense rank, BM25 rank, RRF score */}
       {ranked.length > 0 && (
         <div className="mt-4 overflow-hidden rounded-xl border border-line">
           <table className="w-full border-collapse text-[13px]" data-testid="retrieval-table">
@@ -321,35 +332,52 @@ export function DocumentRetrieval({ result }: { result: EngineResult }) {
                 <th className="px-3 py-2 font-semibold">#</th>
                 <th className="px-3 py-2 font-semibold">Document</th>
                 <th className="px-2 py-2 text-center font-semibold">p.</th>
-                <th className="px-3 py-2 font-semibold">score (cosine)</th>
+                <th className="px-2 py-2 text-center font-semibold" title="Dense (cosine) ranking">
+                  dense
+                </th>
+                <th className="px-2 py-2 text-center font-semibold" title="BM25 (lexical/keyword) ranking">
+                  BM25
+                </th>
+                <th className="px-3 py-2 font-semibold" title="Reciprocal Rank Fusion score (k=60)">
+                  RRF
+                </th>
               </tr>
             </thead>
             <tbody>
-              {ranked.map((c, i) => (
-                <tr key={c.token} className="border-t border-line">
-                  <td className="px-3 py-2 text-faint tabular">{i + 1}</td>
-                  <td className="px-3 py-2">
-                    <span className="inline-flex items-center gap-1.5 font-medium text-ink">
-                      <FileText className="size-3.5 text-accent" />
-                      {c.doc}
-                    </span>
-                  </td>
-                  <td className="px-2 py-2 text-center tabular text-subtle">{c.page}</td>
-                  <td className="px-3 py-2">
-                    <span className="flex items-center gap-2">
-                      <span className="h-1.5 w-16 overflow-hidden rounded-full bg-surface-2">
-                        <span
-                          className="block h-full rounded-full bg-accent"
-                          style={{ width: `${Math.round(((c.score ?? 0) / maxScore) * 100)}%` }}
-                        />
+              {ranked.map((c, i) => {
+                const rrf = c.rrfScore ?? c.score ?? 0;
+                return (
+                  <tr key={c.token} className="border-t border-line">
+                    <td className="px-3 py-2 text-faint tabular">{i + 1}</td>
+                    <td className="px-3 py-2">
+                      <span className="inline-flex items-center gap-1.5 font-medium text-ink">
+                        <FileText className="size-3.5 text-accent" />
+                        {c.doc}
                       </span>
-                      <span className="tabular text-xs text-subtle">
-                        {c.score !== undefined ? c.score.toFixed(3) : "n/a"}
+                    </td>
+                    <td className="px-2 py-2 text-center tabular text-subtle">{c.page}</td>
+                    <td className="px-2 py-2 text-center tabular text-subtle" data-testid="dense-rank">
+                      {rankCell(c.denseRank)}
+                    </td>
+                    <td className="px-2 py-2 text-center tabular text-subtle" data-testid="bm25-rank">
+                      {rankCell(c.bm25Rank)}
+                    </td>
+                    <td className="px-3 py-2">
+                      <span className="flex items-center gap-2">
+                        <span className="h-1.5 w-16 overflow-hidden rounded-full bg-surface-2">
+                          <span
+                            className="block h-full rounded-full bg-accent"
+                            style={{ width: `${Math.round((rrf / maxRrf) * 100)}%` }}
+                          />
+                        </span>
+                        <span className="tabular text-xs text-subtle" data-testid="rrf-score">
+                          {isHybrid ? rrf.toFixed(4) : "n/a"}
+                        </span>
                       </span>
-                    </span>
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

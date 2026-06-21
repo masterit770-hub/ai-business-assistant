@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Wand2, RotateCcw, Check, Loader2, AlertCircle, Cloud, Server, ShieldCheck, KeyRound, Search } from "lucide-react";
+import { Wand2, RotateCcw, Check, Loader2, AlertCircle, Cloud, Server, ShieldCheck, KeyRound, Search, Plug } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -79,6 +79,37 @@ export function PromptsPanel() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // "Test connection" — a tiny REAL chat call against the currently-SAVED provider/key,
+  // so the owner learns a bad key immediately. `testing` marks which section is in
+  // flight ("cloud" | "hipaa"); `testResult` holds the friendly ok/failure outcome.
+  const [testing, setTesting] = useState<"cloud" | "hipaa" | null>(null);
+  const [testResult, setTestResult] = useState<{
+    section: "cloud" | "hipaa";
+    ok: boolean;
+    message: string;
+  } | null>(null);
+
+  // POST /api/test-connection (admin-only). It tests the model backend as SAVED, so a
+  // just-typed-but-unsaved key needs a Save first; we surface that hint when relevant.
+  // The route never throws for a bad key — it returns { ok, message } — so we just
+  // reflect that. `section` only labels which button the result belongs to.
+  async function testConnection(section: "cloud" | "hipaa") {
+    setTesting(section);
+    setTestResult(null);
+    try {
+      const res = await fetch("/api/test-connection", { method: "POST" });
+      const d = await res.json();
+      if (!res.ok) {
+        // Auth/role failures (401/403) come back with `error`, not `ok`.
+        throw new Error(d?.error ?? "test failed");
+      }
+      setTestResult({ section, ok: Boolean(d.ok), message: d.message ?? (d.ok ? "Connected." : "Connection failed.") });
+    } catch (e) {
+      setTestResult({ section, ok: false, message: e instanceof Error ? e.message : "test failed" });
+    } finally {
+      setTesting(null);
+    }
+  }
 
   // Apply a settings payload (from GET or the PUT echo) to local state. The api key
   // is WRITE-ONLY — the server returns only `cloud_api_key_set` (a boolean), never the
@@ -341,6 +372,32 @@ export function PromptsPanel() {
               Local
             </button>
           </div>
+
+          {/* Plain-language legend — what each of the three modes means, near the
+              control, so a non-technical owner can choose without a docs trip. */}
+          <ul className="space-y-1.5 text-sm text-faint" data-testid="model-mode-legend">
+            <li className="flex items-start gap-2">
+              <Cloud className="mt-0.5 size-4 shrink-0 text-subtle" />
+              <span>
+                <span className="font-medium text-subtle">Cloud</span> — a hosted AI; works
+                with any provider key (OpenAI, Gemini, DeepSeek, Azure).
+              </span>
+            </li>
+            <li className="flex items-start gap-2">
+              <ShieldCheck className="mt-0.5 size-4 shrink-0 text-subtle" />
+              <span>
+                <span className="font-medium text-subtle">HIPAA</span> — your own Azure key,
+                for patient data under a Microsoft BAA.
+              </span>
+            </li>
+            <li className="flex items-start gap-2">
+              <Server className="mt-0.5 size-4 shrink-0 text-subtle" />
+              <span>
+                <span className="font-medium text-subtle">Local</span> — runs on your own
+                machine; nothing leaves it (you self-host Nucleus by your model).
+              </span>
+            </li>
+          </ul>
 
           <p className="text-sm text-faint">
             <span className="font-medium text-subtle">Local</span> runs the AI on your own
@@ -611,6 +668,40 @@ export function PromptsPanel() {
               (<code className="rounded bg-canvas px-1 py-0.5">LLM_API_KEY</code>) instead of pasting
               it here — this Settings override simply takes precedence when present.
             </p>
+
+            {/* ── TEST CONNECTION — make a tiny real call against the SAVED cloud key ── */}
+            <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4" data-testid="cloud-test-connection">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => testConnection("cloud")}
+                disabled={testing !== null}
+                data-testid="cloud-test-button"
+                className="gap-2"
+              >
+                {testing === "cloud" ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
+                {testing === "cloud" ? "Testing…" : "Test connection"}
+              </Button>
+              <span className="text-xs text-faint">Tests the key as currently saved — Save first if you just changed it.</span>
+              {testResult?.section === "cloud" && (
+                <div
+                  data-testid="cloud-test-result"
+                  className={cn(
+                    "flex w-full items-start gap-2 rounded-xl border px-4 py-3 text-sm",
+                    testResult.ok
+                      ? "border-emerald-300 bg-emerald-50 text-emerald-800"
+                      : "border-red-300 bg-red-50 text-red-700"
+                  )}
+                >
+                  {testResult.ok ? (
+                    <Check className="mt-0.5 size-4 shrink-0" strokeWidth={2.5} />
+                  ) : (
+                    <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                  )}
+                  <span>{testResult.message}</span>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* ── HIPAA MODEL — Azure OpenAI under a Microsoft BAA (its OWN key slot) ── */}
@@ -727,6 +818,44 @@ export function PromptsPanel() {
                 </span>
               </div>
             )}
+
+            {/* ── TEST CONNECTION — make a tiny real call against the SAVED Azure key ──
+                Note: this tests whatever backend the SAVED model_mode resolves to, so
+                to test the Azure/HIPAA key specifically, set the mode to HIPAA + Save. */}
+            <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4" data-testid="hipaa-test-connection">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => testConnection("hipaa")}
+                disabled={testing !== null}
+                data-testid="hipaa-test-button"
+                className="gap-2"
+              >
+                {testing === "hipaa" ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
+                {testing === "hipaa" ? "Testing…" : "Test connection"}
+              </Button>
+              <span className="text-xs text-faint">
+                Set the mode to HIPAA and Save, then test — it calls the backend as saved.
+              </span>
+              {testResult?.section === "hipaa" && (
+                <div
+                  data-testid="hipaa-test-result"
+                  className={cn(
+                    "flex w-full items-start gap-2 rounded-xl border px-4 py-3 text-sm",
+                    testResult.ok
+                      ? "border-emerald-300 bg-emerald-50 text-emerald-800"
+                      : "border-red-300 bg-red-50 text-red-700"
+                  )}
+                >
+                  {testResult.ok ? (
+                    <Check className="mt-0.5 size-4 shrink-0" strokeWidth={2.5} />
+                  ) : (
+                    <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                  )}
+                  <span>{testResult.message}</span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>

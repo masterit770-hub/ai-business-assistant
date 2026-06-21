@@ -55,8 +55,28 @@ export async function GET() {
       emailOf = new Map((profiles ?? []).map((p) => [p.id as string, (p.email as string) ?? ""]));
     }
 
+    // Rename OVERRIDES: prefer a user-set title over the first question when present.
+    // Scope the same way as the rows — a member's overrides only, an admin sees all —
+    // and only fetch for the sessions actually in this listing (best-effort; a missing
+    // session_titles table or read error simply falls back to the question titles).
+    let titleOf: Map<string, string> | undefined;
+    const sessionIds = [...new Set(rows.map((r) => r.session_id).filter((s): s is string => !!s))];
+    if (sessionIds.length > 0) {
+      let tq = admin()
+        .from("session_titles")
+        .select("session_id, owner_id, title")
+        .in("session_id", sessionIds);
+      if (!isAdmin) tq = tq.eq("owner_id", user.id);
+      const { data: titles } = await tq;
+      if (titles && titles.length > 0) {
+        titleOf = new Map(
+          titles.map((t) => [t.session_id as string, (t.title as string) ?? ""])
+        );
+      }
+    }
+
     // Collapse the rows into one entry per conversation, newest session first.
-    const sessions = groupSessions(rows, emailOf);
+    const sessions = groupSessions(rows, emailOf, titleOf);
     return NextResponse.json({ sessions });
   } catch (e) {
     return NextResponse.json(

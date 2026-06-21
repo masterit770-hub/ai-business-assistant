@@ -1,23 +1,19 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
-import {
-  ingestPdf,
-  ingestCsv,
-  ingestXlsx,
-  ingestDocumentToFileSearch,
-} from "@/lib/engine/ingest";
+import { ingestPdf, ingestCsv, ingestXlsx } from "@/lib/engine/ingest";
 import { supabaseEnabled } from "@/lib/engine/supabase";
-import { fileSearchEnabled } from "@/lib/engine/file-search";
 import { storeOriginalFile } from "@/lib/engine/doc-files";
 
 // Runtime ingestion — engine logic IN-PROCESS (no proxy). The dashboard Upload
-// button posts the chosen file here as multipart/form-data; we parse → (PDF →
-// Gemini File Search; CSV/XLSX → the SQL + local-RAG lane) so the document is
-// IMMEDIATELY query-able with citations via /api/ask. No mock.
+// button posts the chosen file here as multipart/form-data; we parse → (PDF → the
+// SELF-HOSTED HYBRID document lane: unpdf text extraction + best-effort OCR +
+// local e5 embeddings → Supabase pgvector; CSV/XLSX → the SQL + local-RAG lane) so
+// the document is IMMEDIATELY query-able with citations via /api/ask. No Gemini.
 //
 // AUTH: requires a signed-in, enabled user. The doc is tagged with the uploader's
 // id (from the session) for per-user isolation — a user only retrieves their OWN
-// uploads. PDFs go to Gemini File Search (managed, durable, reads scans natively).
+// uploads (RLS + owner-scoped retrieval). The hybrid (dense × BM25 → RRF) search
+// reads scanned PDFs via best-effort OCR; born-digital PDFs via the text layer.
 export const runtime = "nodejs";
 export const maxDuration = 120;
 
@@ -79,19 +75,14 @@ export async function POST(req: Request) {
 
   try {
     let result;
-    let backend: "file-search" | "local" = "local";
+    const backend: "pgvector" | "local" = supabaseEnabled() ? "pgvector" : "local";
     if (isCsv) {
       result = await ingestCsv(new TextDecoder().decode(buf), name, ownerId);
     } else if (isXlsx) {
       result = await ingestXlsx(buf, name, ownerId);
     } else if (isPdf) {
-      if (fileSearchEnabled()) {
-        result = await ingestDocumentToFileSearch(buf, name, "application/pdf", ownerId);
-        backend = "file-search";
-      } else {
-        const label = (form.get("label") as string) || name;
-        result = await ingestPdf(buf, name, label);
-      }
+      const label = (form.get("label") as string) || name;
+      result = await ingestPdf(buf, name, label, ownerId);
     } else {
       return NextResponse.json(
         { error: `unsupported file type: ${name} (supported: .pdf, .csv, .xlsx)` },
@@ -109,22 +100,16 @@ export async function POST(req: Request) {
     }
 
     const persistence =
-      backend === "file-search"
-        ? "stored in Gemini File Search — durable + managed (survives restarts, shared across instances). Queries use the Gemini generateContent quota."
-        : supabaseEnabled()
-          ? "stored in Supabase (Postgres + pgvector) — durable, client-owned."
-          : "in-memory on this serverless instance — query-able now; NOT durable across cold starts/instances.";
+      backend === "pgvector"
+        ? "stored in Supabase (Postgres + pgvector) — durable, client-owned. Retrieved by hybrid search (dense × BM25 → RRF)."
+        : "in-memory on this serverless instance — query-able now; NOT durable across cold starts/instances.";
 
     // ZERO-CONTENT signal: a file we accepted but from which we extracted nothing
-    // usable (e.g. an image-only scan whose text layer is empty). We can only assert
-    // this for paths that report a unit count — the local PDF fallback (chunks) and
-    // CSV/XLSX (rows). The Gemini File Search path manages chunking opaquely (no count),
-    // so we don't claim zero there (we'd be guessing). When true, the UI must NOT say
-    // "ask about it now" — it warns that nothing readable was extracted.
-    const countable =
-      result.chunks != null || result.rows != null
-        ? (result.chunks ?? 0) + (result.rows ?? 0)
-        : null; // null = unknown (File Search PDF) → don't claim zero
+    // usable (e.g. an image-only scan whose text layer is empty AND OCR couldn't read
+    // it). Every lane (PDF hybrid → chunks; CSV/XLSX → rows) reports a unit count, so
+    // we can assert zero honestly. When true, the UI must NOT say "ask about it now" —
+    // it warns that nothing readable was extracted.
+    const countable = (result.chunks ?? 0) + (result.rows ?? 0);
     const zeroContent = countable === 0;
 
     return NextResponse.json({

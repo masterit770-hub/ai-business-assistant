@@ -26,8 +26,12 @@ export async function run() {
       return b && !b.disabled;
     }, null, { timeout: 10000 });
     await page.click('[data-testid="save-name"]');
-    const saved = await page.locator('[data-testid="name-saved"]').isVisible({ timeout: 15000 }).catch(() => false);
-    const nameErr = await page.locator('[data-testid="name-error"]').textContent().catch(() => null);
+    // The "Saved" confirmation appears on success and auto-dismisses after ~2.6s, so we
+    // race to catch it. An error (if any) renders in a name-error element that only EXISTS
+    // on failure — its absence means no error.
+    const saved = await page.locator('[data-testid="name-saved"]').waitFor({ state: "visible", timeout: 12000 }).then(() => true).catch(() => false);
+    const errCount = await page.locator('[data-testid="name-error"]').count();
+    const nameErr = errCount > 0 ? await page.locator('[data-testid="name-error"]').textContent().catch(() => "err") : null;
     rec.check(saved && !nameErr, "saving a display name shows Saved (real auth update)", nameErr ? `error: ${nameErr}` : "Saved shown");
 
     // 7c. Toggle theme: clicking Dark sets data-theme="dark" on <html>.

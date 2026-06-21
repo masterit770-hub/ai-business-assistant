@@ -9,7 +9,11 @@
 import { launch, signIn, makeRecorder, askAndWait } from "./lib.mjs";
 
 // A raw provider/HTML blob that must NEVER be shown to the user.
-const RAW_BLOB_RE = /unexpected token <|<!doctype|<html|deepseek \(|azure-hipaa \(|\b50[0-9]:\s|api[_ ]?key|bearer |sk-[a-z0-9]/i;
+// A RAW provider/HTML blob leaking to the user. Deliberately precise so a FRIENDLY
+// message that legitimately mentions "API key" (the keyless-provider guidance) is NOT
+// flagged. Real leaks: the "<provider> (<model>) <status>: <body>" throw format, an HTML
+// gateway page, a bearer token, or a raw sk- secret.
+const RAW_BLOB_RE = /unexpected token\s*<|<!doctype|<html|\b(deepseek|gemini|openai|azure-hipaa|azure)\s*\([^)]*\)\s*\d{3}\s*:|bearer\s+[a-z0-9._-]{12,}|\bsk-[a-z0-9]{16,}/i;
 
 async function setSettings(page, body) {
   return page.evaluate(async (b) => {

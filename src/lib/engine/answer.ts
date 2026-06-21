@@ -10,8 +10,9 @@
 import { routeQuestion, type RoutePlan } from "./router.ts";
 import { answerStructured } from "./text-to-sql.ts";
 import type { SqlRow } from "./structured-store.ts";
-import { vectorSearch as vectorSearchLocal, type DocChunk } from "./retrieval.ts";
-import { fileSearchEnabled, queryFileSearch } from "./file-search.ts";
+import { hybridVectorSearch, type DocChunk } from "./retrieval.ts";
+import { hybridSearch } from "./pgvector-store.ts";
+import { supabaseEnabled } from "./supabase.ts";
 import { embedQuery } from "./embeddings.ts";
 import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable, isHipaaNotConfigured, isCloudProviderNotConfigured } from "./llm.ts";
 import { sqlToken, pdfToken, extractCitationTokens } from "./citations.ts";
@@ -47,7 +48,20 @@ export type AnswerResult = {
   localGuidance?: "not-configured" | "unreachable";
   evidence: {
     rows: { table: string; id: number; token: string; data: Record<string, unknown> }[];
-    chunks: { doc: string; page: number; token: string; text: string; score?: number }[];
+    // `score` is the headline relevance (RRF fused score for a hybrid result). The
+    // hybrid breakdown (denseRank / bm25Rank / rrfScore) is the REAL per-chunk
+    // ranking the inspector's document-retrieval table renders — all engine-computed,
+    // never hardcoded. A rank of 0 = "that lane did not rank this chunk".
+    chunks: {
+      doc: string;
+      page: number;
+      token: string;
+      text: string;
+      score?: number;
+      denseRank?: number;
+      bm25Rank?: number;
+      rrfScore?: number;
+    }[];
   };
   validation: { ok: boolean; reasons: string[] };
   // ── INSPECTOR TRANSPARENCY (all reconstructed from real pipeline state) ───────
@@ -89,9 +103,10 @@ export type CostReport = {
 };
 
 export type InspectorTrace = {
-  // The honest retrieval-method label per what ACTUALLY ran this turn (e.g. the SQL
-  // lane, the local cosine dense lane, Gemini File Search) — never a copied false
-  // "dense × BM25 → RRF → rerank".
+  // The honest retrieval-method label per what ACTUALLY ran this turn (the SQL
+  // text-to-SQL lane and/or the document HYBRID lane "dense × BM25 → RRF"). It is
+  // REAL: the document-retrieval table renders the actual per-chunk dense rank, BM25
+  // rank, and RRF score from the same retrieval.
   retrievalMethod: string;
   passages: number; // count of document chunks retrieved
   evidenceCount: number; // rows + chunks
@@ -103,26 +118,6 @@ export type InspectorTrace = {
 
 // `||` (not `??`) so an empty env value ("") falls through to the real date.
 const TODAY = process.env.ASSISTANT_TODAY || new Date().toISOString().slice(0, 10);
-
-/**
- * Decide whether to surface the HONEST "couldn't search your uploaded documents"
- * error instead of answering. Pure, so it's unit-testable without the LLM/index.
- *
- * Fires when File Search (the uploaded-doc lane) failed AND there's no legitimate
- * substitute evidence: no structured rows, and either no doc chunks at all OR the
- * question targeted a specific uploaded doc (so the always-returned bundled Carter
- * chunks must NOT be used to answer it). A genuine bundled question still answers.
- */
-export function shouldSurfaceDocLaneError(s: {
-  fileSearchError: string | null;
-  rowCount: number;
-  chunkCount: number;
-  targetedUploadedDoc: boolean;
-}): boolean {
-  if (!s.fileSearchError) return false;
-  if (s.rowCount > 0) return false; // a structured-backed turn still answers
-  return s.chunkCount === 0 || s.targetedUploadedDoc;
-}
 
 // ── LOCAL-MODE FRIENDLY GUIDANCE ───────────────────────────────────────────────
 // When the workspace is in Local mode but the local model can't actually answer —
@@ -251,11 +246,13 @@ async function runAnswerPipeline(
   // generation call below. Empty string when there's no history (→ single-shot
   // behavior unchanged). The router gets the raw turns (it builds its own block).
   const convo = buildConversationContext(ctx.history);
-  // Whether the Gemini File Search lane actually contributed chunks this turn (for
-  // the honest retrieval-method label + the trace).
-  let usedFileSearch = false;
-  // The top REAL retrieval (cosine) score across the bundled dense lane — the
-  // primary signal for the derived confidence. Null when no dense lane ran.
+  // Whether the uploaded-doc pgvector hybrid lane actually contributed chunks this
+  // turn (for the honest retrieval-method label + the trace).
+  let usedUploadedDocs = false;
+  // The top REAL dense COSINE similarity across the documents lane — the primary
+  // signal for the derived confidence (kept on a 0..1 cosine scale, NOT the RRF
+  // scale, so the confidence mapping below is unchanged). Null when no documents
+  // lane ran.
   let topScore: number | null = null;
 
   // Workspace-level soft-delete: load the hidden-set ONCE per request so every
@@ -298,51 +295,31 @@ async function runAnswerPipeline(
   }
 
   let chunks: DocChunk[] = [];
-  let fileSearchError: string | null = null;
-  // Did the router target a specific UPLOADED doc (a docFilter that isn't one of the
-  // bundled Carter ids)? The local vector index ALWAYS returns its top-k Carter chunks
-  // even for an uploaded-doc question, so we can't tell from the chunks alone whether
-  // the bundled text actually answers the question. The route's docFilter is the
-  // reliable signal: if it names a non-bundled doc, the UPLOADED-doc lane (File Search)
-  // was the intended source — and if that lane failed, we must surface the honest
-  // error, not silently answer from the Carter corpus. (A flat cosine threshold was
-  // tried and is NOT separable — multilingual-e5 puts Carter and uploaded-doc
-  // questions in the same high score band; verified empirically.)
-  const BUNDLED_DOC_IDS = new Set(DOCUMENTS.map((d) => d.doc));
-  const targetedUploadedDoc = !!route.docFilter && !BUNDLED_DOC_IDS.has(route.docFilter);
   if (route.sources.includes("documents")) {
-    // BUNDLED corpus (Carter) → the verified LOCAL vector path. Retrieve across ALL
-    // bundled docs (no filter) so corroboration / conflict-surfacing across both
-    // companion PDFs works.
     const qEmbedding = await embedQuery(question);
-    const localRaw = vectorSearchLocal(qEmbedding, 12);
-    // The best REAL cosine score this turn — the primary confidence signal.
-    if (localRaw.length > 0) {
-      topScore = Math.max(...localRaw.map((c) => c.score));
-    }
-    let merged = localRaw;
 
-    // UPLOADED docs → Gemini File Search (managed, durable). One generateContent
-    // call returns grounding chunks we map to the engine's [P:doc#page] shape and
-    // merge with the bundled chunks, so a single answer can cite both corpora. A
-    // quota 429 is captured (not swallowed) and surfaced honestly downstream.
-    if (fileSearchEnabled()) {
-      try {
-        const fs = await queryFileSearch(question, scopeOwner);
-        if (fs.chunks.length > 0) usedFileSearch = true;
-        merged = [
-          ...merged,
-          ...fs.chunks.map((c) => ({ doc: c.doc, page: c.page, text: c.text, score: 0.99 })),
-        ];
-      } catch (e) {
-        // File Search is an ENRICHMENT of the answer (the caller's UPLOADED docs).
-        // It must never be fatal to a bundled/structured answer: a quota block OR a
-        // transient transport blip ("terminated"/"fetch failed") to Gemini is
-        // captured here and surfaced honestly downstream — the local bundled chunks
-        // and any structured rows still answer. (Previously a non-quota error
-        // re-threw and took down a bundled-PDF answer that didn't even need Gemini.)
-        fileSearchError = e instanceof Error ? e.message : String(e);
-      }
+    // BUNDLED corpus (Carter) → IN-PROCESS HYBRID: a dense cosine ranking × a BM25
+    // lexical ranking, fused with RRF (the SAME fusion the uploaded pgvector lane
+    // uses). Retrieve across ALL bundled docs (no filter) so corroboration /
+    // conflict-surfacing across both companion PDFs works. Each chunk carries its
+    // REAL denseRank / bm25Rank / rrfScore for the inspector.
+    const bundled = hybridVectorSearch(qEmbedding, question, 12);
+    // Confidence keys off the top REAL dense COSINE similarity (0..1 scale), not the
+    // RRF scale — so the existing confidence mapping is unchanged. We recompute the
+    // best cosine from the bundled candidates the dense lane ranked #1.
+    const bundledTopCosine = topCosineOfRank1(bundled);
+    if (bundledTopCosine !== null) topScore = bundledTopCosine;
+    let merged = bundled;
+
+    // UPLOADED docs → Supabase pgvector HYBRID (dense × BM25 → RRF), owner-scoped for
+    // per-user isolation (RLS + the RPC's owner filter). Returns the same DocChunk
+    // shape with REAL dense/BM25/RRF ranks, so it merges 1:1 with the bundled hybrid
+    // chunks and a single answer can cite both corpora. FAIL-OPEN: hybridSearch
+    // returns [] on any failure (logged) — never throws into the answer pipeline.
+    if (supabaseEnabled()) {
+      const uploaded = await hybridSearch(scopeOwner, ctx.role === "admin", qEmbedding, question, 8);
+      if (uploaded.length > 0) usedUploadedDocs = true;
+      merged = [...merged, ...uploaded];
     }
     chunks = diversifyByDoc(merged, 8);
   }
@@ -380,51 +357,19 @@ async function runAnswerPipeline(
       token: c.token,
       text: c.text,
       score: c.score,
+      // The REAL hybrid breakdown the inspector renders (dense / BM25 / RRF ranks).
+      denseRank: c.denseRank,
+      bm25Rank: c.bm25Rank,
+      rrfScore: c.rrfScore,
     })),
   };
 
-  // HONEST DOC-LANE SHORT-CIRCUIT: when File Search (the UPLOADED-doc lane) failed,
-  // do NOT silently answer from the wrong corpus. Surface the honest "couldn't search
-  // your uploaded documents" message when there's no legitimate substitute evidence:
-  //   • no structured rows (a structured-backed turn still answers), AND
-  //   • EITHER no doc chunks came back at all, OR the question targeted a specific
-  //     UPLOADED doc (route.docFilter names a non-bundled doc) — in which case the
-  //     always-returned bundled chunks are NOT a valid answer and must not be used.
-  // A genuine bundled-document question — no uploaded-doc docFilter — still answers
-  // from its chunks despite a File Search blip (the earlier not-fatal fix).
-  if (
-    shouldSurfaceDocLaneError({
-      fileSearchError,
-      rowCount: evRows.length,
-      chunkCount: evChunks.length,
-      targetedUploadedDoc,
-    })
-  ) {
-    return {
-      question,
-      route,
-      answer:
-        "I couldn't search your uploaded documents right now: " +
-        fileSearchError +
-        " (Bundled data and structured questions are unaffected.)",
-      mode: "grounded",
-      grounded: true,
-      evidence: { rows: [], chunks: [] },
-      validation: { ok: false, reasons: ["file-search-unavailable"] },
-      inspector: buildInspector({
-        tel,
-        route,
-        rowCount: evRows.length,
-        chunkCount: evChunks.length,
-        usedFileSearch,
-        fileSearchError,
-        mode: "grounded",
-        validationOk: false,
-        validationReasons: ["file-search-unavailable"],
-        topScore,
-      }),
-    };
-  }
+  // (The self-hosted pgvector hybrid lane is FAIL-OPEN — hybridSearch returns [] on
+  // any failure and never throws — so there is no honest "couldn't search your
+  // uploaded documents" error to surface here as the Gemini File Search lane once
+  // required. A Supabase outage simply yields no uploaded chunks; the bundled hybrid
+  // + structured lanes still answer, and the general-knowledge fallback below covers
+  // the no-evidence case.)
 
   // ── GENERAL-KNOWLEDGE FALLBACK ────────────────────────────────────────────
   // Did retrieval actually find anything the user can be answered FROM? Evidence
@@ -459,8 +404,7 @@ async function runAnswerPipeline(
         route,
         rowCount: 0,
         chunkCount: 0,
-        usedFileSearch,
-        fileSearchError,
+        usedUploadedDocs,
         mode: "general",
         validationOk: true,
         validationReasons: [],
@@ -529,8 +473,7 @@ async function runAnswerPipeline(
         route,
         rowCount: evRows.length,
         chunkCount: evChunks.length,
-        usedFileSearch,
-        fileSearchError,
+        usedUploadedDocs,
         mode: "general",
         validationOk: true,
         validationReasons: [],
@@ -624,8 +567,7 @@ async function runAnswerPipeline(
         route,
         rowCount: evRows.length,
         chunkCount: evChunks.length,
-        usedFileSearch,
-        fileSearchError,
+        usedUploadedDocs,
         mode: "general",
         validationOk: true,
         validationReasons: [],
@@ -648,6 +590,10 @@ async function runAnswerPipeline(
         token: c.token,
         text: c.text,
         score: c.score,
+        // The REAL hybrid breakdown the inspector renders (dense / BM25 / RRF ranks).
+        denseRank: c.denseRank,
+        bm25Rank: c.bm25Rank,
+        rrfScore: c.rrfScore,
       })),
     },
     validation: { ok: validationOk, reasons },
@@ -656,8 +602,7 @@ async function runAnswerPipeline(
       route,
       rowCount: evRows.length,
       chunkCount: evChunks.length,
-      usedFileSearch,
-      fileSearchError,
+      usedUploadedDocs,
       mode: "grounded",
       validationOk,
       validationReasons: reasons,
@@ -853,16 +798,19 @@ function buildCost(usages: ChatUsage[]): CostReport {
 }
 
 // The HONEST retrieval-method label — describes the lane(s) that ACTUALLY ran this
-// turn. Deliberately NOT a copied "dense × BM25 → RRF → rerank": the engine uses a
-// text-to-SQL lane for structured data + local cosine-similarity dense embeddings
-// (multilingual-e5, bundled) + Gemini File Search for uploaded docs. We print only
-// what ran.
-function retrievalMethodLabel(route: RoutePlan, usedFileSearch: boolean): string {
+// turn. The document lane is now an HONEST HYBRID: a dense cosine ranking × a BM25
+// lexical ranking, fused with Reciprocal Rank Fusion (RRF) — run in-process over the
+// bundled corpus AND in Supabase pgvector over the uploaded corpus (same fusion). We
+// print only what ran. This label is REAL: the document-retrieval table below shows
+// the actual per-chunk dense rank, BM25 rank, and RRF score.
+function retrievalMethodLabel(route: RoutePlan, usedUploadedDocs: boolean): string {
   const lanes: string[] = [];
   if (route.sources.includes("structured")) lanes.push("text-to-SQL lane (generated SELECT over the live schema)");
   if (route.sources.includes("documents")) {
-    lanes.push("dense cosine similarity (multilingual-e5, local)");
-    if (usedFileSearch) lanes.push("Gemini File Search (uploaded docs)");
+    const corpora = usedUploadedDocs
+      ? "bundled + your uploaded docs (pgvector)"
+      : "bundled corpus";
+    lanes.push(`hybrid retrieval (dense × BM25 → RRF) over the ${corpora}, multilingual-e5 embeddings`);
   }
   if (lanes.length === 0) return "no source matched — general knowledge";
   return lanes.join(" + ");
@@ -914,8 +862,7 @@ function buildTrace(opts: {
   route: RoutePlan;
   rowCount: number;
   chunkCount: number;
-  usedFileSearch: boolean;
-  fileSearchError: string | null;
+  usedUploadedDocs: boolean;
   mode: "grounded" | "general";
   validationOk: boolean;
   validationReasons: string[];
@@ -954,22 +901,15 @@ function buildTrace(opts: {
   });
 
   // 3. Retrieval
-  if (opts.fileSearchError) {
-    steps.push({
-      key: "retrieval",
-      label: "Retrieval",
-      status: "warn",
-      detail: `Retrieved ${rowCount} row(s) + ${chunkCount} passage(s). File Search unavailable: ${opts.fileSearchError}`,
-    });
-  } else {
+  {
     steps.push({
       key: "retrieval",
       label: "Retrieval",
       status: rowCount + chunkCount > 0 ? "ok" : "skip",
       detail:
         rowCount + chunkCount > 0
-          ? `Retrieved ${rowCount} structured row(s) + ${chunkCount} document passage(s)${
-              opts.usedFileSearch ? " (incl. Gemini File Search)" : ""
+          ? `Retrieved ${rowCount} structured row(s) + ${chunkCount} document passage(s) via hybrid search (dense × BM25 → RRF)${
+              opts.usedUploadedDocs ? ", incl. your uploaded docs (pgvector)" : ""
             }.`
           : "No evidence retrieved for this question.",
     });
@@ -1016,8 +956,7 @@ function buildInspector(opts: {
   route: RoutePlan;
   rowCount: number;
   chunkCount: number;
-  usedFileSearch: boolean;
-  fileSearchError: string | null;
+  usedUploadedDocs: boolean;
   mode: "grounded" | "general";
   validationOk: boolean;
   validationReasons: string[];
@@ -1032,7 +971,7 @@ function buildInspector(opts: {
     totalMs,
   };
   return {
-    retrievalMethod: retrievalMethodLabel(opts.route, opts.usedFileSearch),
+    retrievalMethod: retrievalMethodLabel(opts.route, opts.usedUploadedDocs),
     passages: opts.chunkCount,
     evidenceCount: opts.rowCount + opts.chunkCount,
     confidence: deriveConfidence({
@@ -1108,6 +1047,21 @@ function collectRowNumbers(rows: SqlRow[]): number[] {
     }
   }
   return out;
+}
+
+// The best DENSE cosine similarity (0..1) across the bundled hybrid chunks — the
+// confidence signal. The bundled in-process lane carries the raw cosine per chunk
+// (denseScore); we take the max (the dense-rank-1 chunk). Returns null when no
+// bundled chunk carried a cosine (e.g. empty corpus). Kept on the cosine scale so
+// the existing confidence mapping (0.6..0.97) is unchanged by the move to hybrid.
+function topCosineOfRank1(chunks: DocChunk[]): number | null {
+  let best: number | null = null;
+  for (const c of chunks) {
+    if (typeof c.denseScore === "number" && (best === null || c.denseScore > best)) {
+      best = c.denseScore;
+    }
+  }
+  return best;
 }
 
 // Keep the top chunks but guarantee each represented document gets at least a
