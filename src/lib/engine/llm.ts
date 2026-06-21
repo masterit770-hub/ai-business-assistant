@@ -26,8 +26,52 @@ const LOCAL_TIMEOUT_MS = 8000;
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
-// The slice of an OpenAI-compatible chat-completions response we read.
-type ChatCompletion = { choices?: { message?: { content?: string } }[] };
+// Real token accounting, surfaced from the provider's `usage` block when present.
+// Every field is OPTIONAL: a provider that omits usage (or an unreachable local
+// endpoint) yields `undefined`, which the UI renders as "n/a" — never a fabricated
+// number. `provider`/`model` record which backend actually answered this call.
+export type ChatUsage = {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  provider: string;
+  model: string;
+  // True when this call hit a real backend (so cost/token rows are meaningful);
+  // a local call that couldn't report usage still sets this so "1 live call" is honest.
+  live: boolean;
+};
+
+// The richer return shape: the generated text PLUS the real usage for this call.
+export type ChatResult = { content: string; usage: ChatUsage };
+
+// The slice of an OpenAI-compatible chat-completions response we read. `usage` is
+// the standard OpenAI/Gemini/DeepSeek token block; absent on some providers.
+type ChatCompletion = {
+  choices?: { message?: { content?: string } }[];
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+};
+
+function readUsage(
+  data: ChatCompletion,
+  provider: string,
+  model: string,
+  live: boolean
+): ChatUsage {
+  const u = data.usage;
+  return {
+    promptTokens: typeof u?.prompt_tokens === "number" ? u.prompt_tokens : undefined,
+    completionTokens:
+      typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
+    totalTokens: typeof u?.total_tokens === "number" ? u.total_tokens : undefined,
+    provider,
+    model,
+    live,
+  };
+}
 
 // ── Typed, recognizable errors for the Local backend ───────────────────────────
 // The Ask path catches these specifically and returns a FRIENDLY 200 answer (the
@@ -83,10 +127,21 @@ const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 4;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Back-compat string entry — most callers (the router, the general-knowledge
+// generator) only want the text. It delegates to chatWithUsage and drops the usage.
 export async function chat(
   messages: ChatMessage[],
   opts: { json?: boolean; temperature?: number } = {}
 ): Promise<string> {
+  return (await chatWithUsage(messages, opts)).content;
+}
+
+// Usage-aware entry — the answer orchestrator uses this so it can surface the REAL
+// token counts + which backend answered in the Inspector's Cost & Tokens panel.
+export async function chatWithUsage(
+  messages: ChatMessage[],
+  opts: { json?: boolean; temperature?: number } = {}
+): Promise<ChatResult> {
   // Read the Cloud⇄Local switch at REQUEST time so flipping the toggle takes
   // effect on the very next question — no restart, no redeploy.
   const cfg = await getModelConfig();
@@ -96,11 +151,11 @@ export async function chat(
   return chatCloud(messages, opts);
 }
 
-// CLOUD — the original, unchanged behavior (env-configured provider).
+// CLOUD — env-configured provider. Now returns the provider's real `usage` block.
 async function chatCloud(
   messages: ChatMessage[],
   opts: { json?: boolean; temperature?: number }
-): Promise<string> {
+): Promise<ChatResult> {
   const key = process.env.LLM_API_KEY;
   if (!key) throw new Error("LLM_API_KEY not set");
   const payload = JSON.stringify({
@@ -119,7 +174,10 @@ async function chatCloud(
     });
     if (res.ok) {
       const data = (await res.json()) as ChatCompletion;
-      return data.choices?.[0]?.message?.content ?? "";
+      return {
+        content: data.choices?.[0]?.message?.content ?? "",
+        usage: readUsage(data, PROVIDER, MODEL, true),
+      };
     }
     const body = await res.text().catch(() => "");
     // Provider-labelled so a billing/auth error names the active backend.
@@ -144,7 +202,7 @@ async function chatLocal(
   opts: { json?: boolean; temperature?: number },
   endpoint: string,
   model: string
-): Promise<string> {
+): Promise<ChatResult> {
   if (!endpoint) throw new LocalNotConfiguredError();
   // Normalize: tolerate a trailing slash so "…/v1/" and "…/v1" both work.
   const base = endpoint.replace(/\/+$/, "");
@@ -188,5 +246,11 @@ async function chatLocal(
     throw new LocalUnreachableError(endpoint, `HTTP ${res.status}: ${body.slice(0, 160)}`);
   }
   const data = (await res.json()) as ChatCompletion;
-  return data.choices?.[0]?.message?.content ?? "";
+  // Ollama (and other OpenAI-compat local servers) usually DO report a usage block;
+  // when absent the tokens come back undefined → the UI shows "n/a" rather than a
+  // fabricated count. The provider label is "local" + the configured model name.
+  return {
+    content: data.choices?.[0]?.message?.content ?? "",
+    usage: readUsage(data, "local", model, true),
+  };
 }

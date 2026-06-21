@@ -6,29 +6,119 @@
 @custom-variant data-horizontal (&[data-orientation="horizontal"], &[data-horizontal]);
 @custom-variant data-vertical (&[data-orientation="vertical"], &[data-vertical]);
 
-@theme {
-  /* ── Surfaces & ink ── */
-  --color-canvas: #fafaf9;
-  --color-surface: #ffffff;
-  --color-ink: #0a0a0b;
-  --color-subtle: #44403c;   /* secondary text */
-  --color-faint: #78716c;    /* tertiary / captions */
-  --color-line: #e7e5e4;
-  --color-line-strong: #d6d3d1;
+/* The `dark:` variant is driven by a `data-theme="dark"` attribute on <html> (set
+   by the theme toggle + the no-flash inline script in layout.tsx), NOT by the OS
+   media query — so the user's explicit choice wins and is persisted. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
-  /* ── Accent — one confident teal ── */
-  --color-accent: #0d9488;
-  --color-accent-fg: #ffffff;
-  --color-accent-soft: #f0fdfa;
-  --color-accent-ring: #99f6e4;
+/* ─────────────────────────────────────────────────────────────────────────
+   THEME TOKENS — a purple/violet "neon" system with a LIGHT (default) and a
+   DARK variant. The actual color values live in :root (light) and
+   [data-theme="dark"] (dark) as plain CSS custom properties; the @theme block
+   below maps Tailwind's color utilities onto those variables, so a single
+   attribute flip on <html> re-themes the whole app at runtime (no rebuild).
+   ───────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* ── Surfaces & ink (LIGHT) ── */
+  --canvas: #f7f6fb;        /* app background — a faint violet-tinted off-white */
+  --surface: #ffffff;       /* cards / panels */
+  --surface-2: #faf9fe;     /* nested / subtle panel tint */
+  --ink: #15101f;           /* primary text — near-black with a violet cast */
+  --subtle: #4a4458;        /* secondary text */
+  --faint: #786e8c;         /* tertiary / captions */
+  --line: #e9e6f2;          /* hairline borders */
+  --line-strong: #d8d3e6;
+
+  /* ── Accent — a vivid "neon" violet ── */
+  --accent: #7c3aed;        /* violet-600 */
+  --accent-strong: #6d28d9; /* violet-700 (hover / pressed) */
+  --accent-fg: #ffffff;
+  --accent-soft: #f3effe;   /* soft violet wash (chips, active nav) */
+  --accent-ring: #c9b6fb;   /* focus ring / chip border */
+  --accent-glow: 124 58 237; /* rgb triple for neon glow shadows */
 
   /* ── Urgency ── */
-  --color-high: #e11d48;
-  --color-high-soft: #fff1f2;
-  --color-medium: #d97706;
-  --color-medium-soft: #fffbeb;
-  --color-low: #64748b;
-  --color-low-soft: #f1f5f9;
+  --high: #e11d48;
+  --high-soft: #fff1f3;
+  --medium: #d97706;
+  --medium-soft: #fff8ed;
+  --low: #6366f1;
+  --low-soft: #eef0ff;
+
+  /* ── Status (inspector) ── */
+  --ok: #16a34a;            /* verified / good */
+  --ok-soft: #effaf2;
+  --warn: #d97706;
+  --warn-soft: #fff8ed;
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  /* ── Surfaces & ink (DARK) — deep violet-charcoal, not pure black ── */
+  --canvas: #0d0a16;        /* app background */
+  --surface: #161121;       /* cards / panels */
+  --surface-2: #1d1730;     /* nested / subtle panel tint */
+  --ink: #f3f0fb;           /* primary text */
+  --subtle: #b9b1cf;        /* secondary text */
+  --faint: #877ea0;         /* tertiary / captions */
+  --line: #2a2340;          /* hairline borders */
+  --line-strong: #3a3158;
+
+  /* ── Accent — brighter neon violet so it pops on the dark canvas ── */
+  --accent: #a78bfa;        /* violet-400 */
+  --accent-strong: #c4b5fd; /* violet-300 (hover / pressed) */
+  --accent-fg: #1a1228;
+  --accent-soft: #241a3c;   /* soft violet wash on dark */
+  --accent-ring: #5b3fa0;
+  --accent-glow: 167 139 250;
+
+  /* ── Urgency (dark-tuned) ── */
+  --high: #fb7185;
+  --high-soft: #2a1620;
+  --medium: #fbbf24;
+  --medium-soft: #2a2112;
+  --low: #a5b4fc;
+  --low-soft: #1a1c33;
+
+  /* ── Status (inspector) ── */
+  --ok: #4ade80;
+  --ok-soft: #122a1a;
+  --warn: #fbbf24;
+  --warn-soft: #2a2112;
+
+  color-scheme: dark;
+}
+
+@theme inline {
+  /* ── Map the Tailwind utilities onto the runtime variables above ── */
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-subtle: var(--subtle);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-ring: var(--accent-ring);
+
+  --color-high: var(--high);
+  --color-high-soft: var(--high-soft);
+  --color-medium: var(--medium);
+  --color-medium-soft: var(--medium-soft);
+  --color-low: var(--low);
+  --color-low-soft: var(--low-soft);
+
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
 
   /* ── Fonts ── */
   --font-display: var(--font-display), ui-sans-serif, system-ui, sans-serif;
@@ -43,30 +133,30 @@
   --radius-2xl: 1.125rem;
   --radius-4xl: 2rem;
 
-  /* ── Soft shadows ── */
-  --shadow-soft: 0 1px 2px 0 rgb(10 10 11 / 0.04), 0 1px 3px 0 rgb(10 10 11 / 0.06);
-  --shadow-card: 0 1px 2px 0 rgb(10 10 11 / 0.04), 0 8px 24px -12px rgb(10 10 11 / 0.12);
-  --shadow-lift: 0 2px 4px 0 rgb(10 10 11 / 0.04), 0 18px 40px -16px rgb(10 10 11 / 0.18);
+  /* ── Soft shadows (kept neutral; the neon glow is a separate utility) ── */
+  --shadow-soft: 0 1px 2px 0 rgb(21 16 31 / 0.05), 0 1px 3px 0 rgb(21 16 31 / 0.07);
+  --shadow-card: 0 1px 2px 0 rgb(21 16 31 / 0.05), 0 8px 24px -12px rgb(21 16 31 / 0.14);
+  --shadow-lift: 0 2px 4px 0 rgb(21 16 31 / 0.05), 0 18px 40px -16px rgb(21 16 31 / 0.2);
 
-  /* ── shadcn/ui semantic tokens, mapped onto the Nucleus palette ── */
-  --color-background: var(--color-surface);
-  --color-foreground: var(--color-ink);
-  --color-card: var(--color-surface);
-  --color-card-foreground: var(--color-ink);
-  --color-popover: var(--color-surface);
-  --color-popover-foreground: var(--color-ink);
-  --color-primary: var(--color-accent);
-  --color-primary-foreground: var(--color-accent-fg);
-  --color-secondary: #f5f5f4;
-  --color-secondary-foreground: var(--color-ink);
-  --color-muted: #f5f5f4;                 /* surface tint (bg-muted, hover) */
-  --color-muted-foreground: var(--color-faint);
-  --color-accent-foreground: var(--color-ink);
-  --color-destructive: var(--color-high);
+  /* ── shadcn/ui semantic tokens, mapped onto the purple palette ── */
+  --color-background: var(--surface);
+  --color-foreground: var(--ink);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--surface);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--accent-fg);
+  --color-secondary: var(--surface-2);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--surface-2);
+  --color-muted-foreground: var(--faint);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--high);
   --color-destructive-foreground: #ffffff;
-  --color-border: var(--color-line);
-  --color-input: var(--color-line);
-  --color-ring: var(--color-accent);
+  --color-border: var(--line);
+  --color-input: var(--line);
+  --color-ring: var(--accent);
 }
 
 html {
@@ -74,10 +164,17 @@ html {
 }
 
 body {
-  background: var(--color-canvas);
-  color: var(--color-ink);
+  background: var(--canvas);
+  color: var(--ink);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/* Smooth the light⇄dark flip (but not on the very first paint — see layout's
+   no-flash script, which sets the attribute before React hydrates). */
+body,
+[data-theme] {
+  transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 }
 
 /* Headings default to the display face */
@@ -93,15 +190,24 @@ h1, h2, h3, h4 {
   letter-spacing: -0.01em;
 }
 
+/* Neon-violet glow used on the active accent surfaces (logo, active tab, gauge). */
+.neon-glow {
+  box-shadow: 0 0 0 1px rgb(var(--accent-glow) / 0.25),
+    0 6px 22px -6px rgb(var(--accent-glow) / 0.45);
+}
+.neon-text {
+  text-shadow: 0 0 18px rgb(var(--accent-glow) / 0.35);
+}
+
 /* Subtle dotted grid used on hero / auth backdrops */
 .bg-dotgrid {
-  background-image: radial-gradient(circle, #e7e5e4 1px, transparent 1px);
+  background-image: radial-gradient(circle, var(--line) 1px, transparent 1px);
   background-size: 22px 22px;
 }
 
 ::selection {
-  background: var(--color-accent-ring);
-  color: var(--color-ink);
+  background: var(--accent-ring);
+  color: var(--ink);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -109,7 +215,6 @@ h1, h2, h3, h4 {
    by a `.reveal` → `.reveal.in` class toggle from an IntersectionObserver.
    ───────────────────────────────────────────────────────────────────────── */
 
-/* Scroll-reveal: fade + rise. Honors reduced-motion. */
 .reveal {
   opacity: 0;
   transform: translateY(16px);
@@ -123,7 +228,6 @@ h1, h2, h3, h4 {
   transform: none;
 }
 
-/* Blinking caret for the typing demo */
 @keyframes caret-blink {
   0%, 49% { opacity: 1; }
   50%, 100% { opacity: 0; }
@@ -134,11 +238,10 @@ h1, h2, h3, h4 {
   height: 1.05em;
   vertical-align: text-bottom;
   margin-left: 1px;
-  background: var(--color-accent);
+  background: var(--accent);
   animation: caret-blink 1s steps(1) infinite;
 }
 
-/* Citation chip pop-in */
 @keyframes chip-pop {
   0% { opacity: 0; transform: scale(0.8) translateY(4px); }
   60% { transform: scale(1.04); }
@@ -148,7 +251,6 @@ h1, h2, h3, h4 {
   animation: chip-pop 0.42s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-/* Staggered answer-line reveal */
 @keyframes line-rise {
   0% { opacity: 0; transform: translateY(8px); }
   100% { opacity: 1; transform: none; }
@@ -157,7 +259,6 @@ h1, h2, h3, h4 {
   animation: line-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-/* "How it works" step: dot fill + label brighten, sequenced via delay */
 @keyframes step-in {
   0% { opacity: 0.35; }
   100% { opacity: 1; }
@@ -166,10 +267,10 @@ h1, h2, h3, h4 {
   animation: step-in 0.5s ease-out both;
 }
 
-/* Soft pulse for the live "Grounded · cited · verified" status dot */
+/* Soft neon pulse for the live status dot */
 @keyframes pulse-dot {
-  0%, 100% { box-shadow: 0 0 0 0 rgb(13 148 136 / 0.45); }
-  70% { box-shadow: 0 0 0 6px rgb(13 148 136 / 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgb(var(--accent-glow) / 0.5); }
+  70% { box-shadow: 0 0 0 6px rgb(var(--accent-glow) / 0); }
 }
 .pulse-dot {
   animation: pulse-dot 2s ease-out infinite;
@@ -178,4 +279,5 @@ h1, h2, h3, h4 {
 @media (prefers-reduced-motion: reduce) {
   .reveal { opacity: 1; transform: none; transition: none; }
   .caret, .chip-pop, .line-rise, .step-in, .pulse-dot { animation: none; }
+  body, [data-theme] { transition: none; }
 }

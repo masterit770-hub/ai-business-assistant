@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Wordmark } from "@/components/brand";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 // Centered auth card on a dotgrid backdrop, with a tasteful quote rail on wide
 // screens. Used by both /sign-in and /sign-up.
@@ -7,8 +8,9 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="relative flex min-h-full flex-col">
       <div className="absolute inset-0 bg-dotgrid opacity-50 [mask-image:radial-gradient(ellipse_at_center,black,transparent_80%)]" />
-      <header className="relative mx-auto flex h-16 w-full max-w-6xl items-center px-6">
-        <Wordmark />
+      <header className="relative mx-auto flex h-16 w-full max-w-6xl items-center justify-between px-6">
+        <Wordmark subtitle={false} />
+        <ThemeToggle />
       </header>
       <div className="relative flex flex-1 items-center justify-center px-6 py-12">
         <div className="w-full max-w-md">{children}</div>
@@ -22,7 +24,7 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
           Terms
         </Link>
         <span className="mx-3">·</span>
-        <span>© 2026 Nucleus, Inc.</span>
+        <span>© 2026 AI Business Assistant</span>
       </footer>
     </div>
   );

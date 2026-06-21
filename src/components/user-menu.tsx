@@ -48,7 +48,7 @@ export function UserMenu() {
         >
           {email ?? "Not signed in"}
         </span>
-        <span className="block truncate text-xs text-faint">Nucleus workspace</span>
+        <span className="block truncate text-xs text-faint">AI Business Assistant</span>
       </span>
       <button
         onClick={signOut}

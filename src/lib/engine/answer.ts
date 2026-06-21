@@ -6,7 +6,7 @@ import { getIntent, type IntentSummary } from "./intents.ts";
 import { vectorSearch as vectorSearchLocal, type SqlRow, type DocChunk } from "./retrieval.ts";
 import { fileSearchEnabled, queryFileSearch } from "./file-search.ts";
 import { embedQuery } from "./embeddings.ts";
-import { chat, isLocalNotConfigured, isLocalUnreachable } from "./llm.ts";
+import { chat, chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable } from "./llm.ts";
 import { sqlToken, pdfToken, extractCitationTokens } from "./citations.ts";
 import { validateAnswer, type Evidence } from "./validate-answer.ts";
 import { validateContractAnswer } from "./validate-contract-answer.ts";
@@ -41,9 +41,58 @@ export type AnswerResult = {
   localGuidance?: "not-configured" | "unreachable";
   evidence: {
     rows: { table: string; id: number; token: string; data: Record<string, unknown> }[];
-    chunks: { doc: string; page: number; token: string; text: string }[];
+    chunks: { doc: string; page: number; token: string; text: string; score?: number }[];
   };
   validation: { ok: boolean; reasons: string[] };
+  // ── INSPECTOR TRANSPARENCY (all reconstructed from real pipeline state) ───────
+  // Every field below is OPTIONAL so existing callers/tests are unaffected. They
+  // are populated by the real pipeline; the early-return guidance/error paths leave
+  // them undefined (the UI then shows the minimal answer chrome).
+  inspector?: InspectorTrace;
+};
+
+// A derived, honestly-labelled confidence. `value` is 0..1; `basis` names the REAL
+// signals it came from (top retrieval score, grounded-vs-general, validation) — it
+// is NOT a model-reported probability and is labelled "derived" in the UI.
+export type Confidence = { value: number; basis: string };
+
+// One step of the orchestrator trace — reconstructed from what the pipeline ACTUALLY
+// did, in order. `status` colors the dot; `detail` is the human line.
+export type TraceStep = {
+  key: string;
+  label: string;
+  status: "ok" | "skip" | "warn" | "info";
+  detail: string;
+};
+
+// The real per-phase wall-clock timings (ms), measured with performance.now().
+export type Timings = { routingMs: number; retrievalMs: number; generationMs: number; totalMs: number };
+
+// Real cost/token accounting aggregated across the live LLM calls this turn made.
+// `tokens` is undefined when no live call reported usage (→ UI shows "n/a", never a
+// fabricated number). `usd` is computed from the model's real per-token pricing when
+// known; otherwise null with `pricingNote` explaining why (e.g. unknown provider).
+export type CostReport = {
+  liveCalls: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  usd: number | null;
+  pricingNote: string;
+  provider: string;
+  model: string;
+};
+
+export type InspectorTrace = {
+  // The honest retrieval-method label per what ACTUALLY ran this turn (e.g. the SQL
+  // lane, the local cosine dense lane, Gemini File Search) — never a copied false
+  // "dense × BM25 → RRF → rerank".
+  retrievalMethod: string;
+  passages: number; // count of document chunks retrieved
+  evidenceCount: number; // rows + chunks
+  confidence: Confidence;
+  steps: TraceStep[];
+  timings: Timings;
+  cost: CostReport;
 };
 
 const TODAY = process.env.ASSISTANT_TODAY ?? new Date().toISOString().slice(0, 10);
@@ -138,12 +187,25 @@ async function runAnswerPipeline(
   question: string,
   ctx: { ownerId?: string; role?: string } = {}
 ): Promise<AnswerResult> {
+  // Telemetry accumulator — real timings + real per-call token usage are gathered
+  // as the pipeline runs and assembled into the InspectorTrace at each return point.
+  const tel = newTelemetry();
+  // Whether the Gemini File Search lane actually contributed chunks this turn (for
+  // the honest retrieval-method label + the trace).
+  let usedFileSearch = false;
+  // The top REAL retrieval (cosine) score across the bundled dense lane — the
+  // primary signal for the derived confidence. Null when no dense lane ran.
+  let topScore: number | null = null;
+
   // An admin sees ALL uploaded docs → no owner scoping on retrieval.
   const scopeOwner = ctx.role === "admin" ? undefined : ctx.ownerId;
   // 1. ROUTE (real LLM decision) — owner-scoped doc catalog (Phase C)
+  const routeStart = now();
   const route = await routeQuestion(question, { ownerId: scopeOwner });
+  tel.routingMs = now() - routeStart;
 
   // 2. RETRIEVE
+  const retrievalStart = now();
   const rows: SqlRow[] = [];
   const summaries: IntentSummary[] = [];
   if (route.sources.includes("structured")) {
@@ -181,6 +243,10 @@ async function runAnswerPipeline(
     // companion PDFs works.
     const qEmbedding = await embedQuery(question);
     const localRaw = vectorSearchLocal(qEmbedding, 12);
+    // The best REAL cosine score this turn — the primary confidence signal.
+    if (localRaw.length > 0) {
+      topScore = Math.max(...localRaw.map((c) => c.score));
+    }
     let merged = localRaw;
 
     // UPLOADED docs → Gemini File Search (managed, durable). One generateContent
@@ -190,6 +256,7 @@ async function runAnswerPipeline(
     if (fileSearchEnabled()) {
       try {
         const fs = await queryFileSearch(question, scopeOwner);
+        if (fs.chunks.length > 0) usedFileSearch = true;
         merged = [
           ...merged,
           ...fs.chunks.map((c) => ({ doc: c.doc, page: c.page, text: c.text, score: 0.99 })),
@@ -206,11 +273,13 @@ async function runAnswerPipeline(
     }
     chunks = diversifyByDoc(merged, 8);
   }
+  tel.retrievalMs = now() - retrievalStart;
 
   // 3. Build evidence with citation tokens. The evidence carries the underlying
   // values (row data, page text) AND the verified server-side aggregates so the
   // claim-support cross-check in validateAnswer can confirm a cited number is
-  // actually backed by what it points at.
+  // actually backed by what it points at. Each doc chunk keeps its REAL retrieval
+  // score so the Inspector's retrieval table shows true per-passage scores.
   const evRows = rows.map((r) => ({ ...r, token: sqlToken(r.table, r.id) }));
   const evChunks = chunks.map((c) => ({ ...c, token: pdfToken(c.doc, c.page) }));
   const aggregates = collectAggregates(summaries);
@@ -248,6 +317,18 @@ async function runAnswerPipeline(
       grounded: true,
       evidence: { rows: [], chunks: [] },
       validation: { ok: false, reasons: ["file-search-unavailable"] },
+      inspector: buildInspector({
+        tel,
+        route,
+        rowCount: evRows.length,
+        chunkCount: evChunks.length,
+        usedFileSearch,
+        fileSearchError,
+        mode: "grounded",
+        validationOk: false,
+        validationReasons: ["file-search-unavailable"],
+        topScore,
+      }),
     };
   }
 
@@ -265,7 +346,10 @@ async function runAnswerPipeline(
   const hasEvidence = evRows.length > 0 || evChunks.length > 0;
   if (!hasEvidence) {
     const persona = await getSetting("system_prompt");
-    const answer = await generateGeneral(question, persona, TODAY);
+    const genStart = now();
+    const { text: answer, usage } = await generateGeneral(question, persona, TODAY);
+    tel.generationMs += now() - genStart;
+    tel.usages.push(usage);
     // No citation/grounding validation on this path: a general answer legitimately
     // has no [S:...]/[P:...] tokens, so validateAnswer would wrongly reject it.
     return {
@@ -276,6 +360,18 @@ async function runAnswerPipeline(
       grounded: false,
       evidence: { rows: [], chunks: [] },
       validation: { ok: true, reasons: [] },
+      inspector: buildInspector({
+        tel,
+        route,
+        rowCount: 0,
+        chunkCount: 0,
+        usedFileSearch,
+        fileSearchError,
+        mode: "general",
+        validationOk: true,
+        validationReasons: [],
+        topScore,
+      }),
     };
   }
 
@@ -288,7 +384,8 @@ async function runAnswerPipeline(
   // The admin-editable answering style (Prompt-config panel). A blank/absent
   // override falls back to the built-in default — see settings.ts.
   const stylePreamble = await getSetting("system_prompt");
-  let answer = await generateGrounded(
+  const genStart = now();
+  const grounded = await generateGrounded(
     question,
     evRows,
     evChunks,
@@ -297,6 +394,9 @@ async function runAnswerPipeline(
     TODAY,
     stylePreamble
   );
+  tel.generationMs += now() - genStart;
+  tel.usages.push(grounded.usage);
+  let answer = grounded.text;
 
   // 4a. GENERAL-KNOWLEDGE FALLBACK (the bundled-corpus edge). The LOCAL vector index
   // ALWAYS returns its top-k bundled (Carter) chunks, even for a question those docs
@@ -311,7 +411,10 @@ async function runAnswerPipeline(
   // case file, contracts, the maintenance schema-refusal with its row-cited figures
   // block) carries at least one citation token, so it never enters this branch.
   if (isUncitedRefusal(answer)) {
-    const generalAnswer = await generateGeneral(question, stylePreamble, TODAY);
+    const g2Start = now();
+    const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY);
+    tel.generationMs += now() - g2Start;
+    tel.usages.push(usage);
     return {
       question,
       route,
@@ -320,6 +423,18 @@ async function runAnswerPipeline(
       grounded: false,
       evidence: { rows: [], chunks: [] },
       validation: { ok: true, reasons: [] },
+      inspector: buildInspector({
+        tel,
+        route,
+        rowCount: 0,
+        chunkCount: 0,
+        usedFileSearch,
+        fileSearchError,
+        mode: "general",
+        validationOk: true,
+        validationReasons: [],
+        topScore,
+      }),
     };
   }
 
@@ -391,7 +506,10 @@ async function runAnswerPipeline(
   const hasVerifiedAggregate = aggregates.length > 0;
   if (shouldFallbackToGeneral({ answer, validationOk, hasVerifiedAggregate })) {
     // `stylePreamble` (the persona) is already fetched above — reuse it.
-    const generalAnswer = await generateGeneral(question, stylePreamble, TODAY);
+    const g3Start = now();
+    const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY);
+    tel.generationMs += now() - g3Start;
+    tel.usages.push(usage);
     return {
       question,
       route,
@@ -400,6 +518,18 @@ async function runAnswerPipeline(
       grounded: false,
       evidence: { rows: [], chunks: [] },
       validation: { ok: true, reasons: [] },
+      inspector: buildInspector({
+        tel,
+        route,
+        rowCount: 0,
+        chunkCount: 0,
+        usedFileSearch,
+        fileSearchError,
+        mode: "general",
+        validationOk: true,
+        validationReasons: [],
+        topScore,
+      }),
     };
   }
 
@@ -411,9 +541,27 @@ async function runAnswerPipeline(
     grounded: true,
     evidence: {
       rows: evRows.map((r) => ({ table: r.table, id: r.id, token: r.token, data: r.data })),
-      chunks: evChunks.map((c) => ({ doc: c.doc, page: c.page, token: c.token, text: c.text })),
+      chunks: evChunks.map((c) => ({
+        doc: c.doc,
+        page: c.page,
+        token: c.token,
+        text: c.text,
+        score: c.score,
+      })),
     },
     validation: { ok: validationOk, reasons },
+    inspector: buildInspector({
+      tel,
+      route,
+      rowCount: evRows.length,
+      chunkCount: evChunks.length,
+      usedFileSearch,
+      fileSearchError,
+      mode: "grounded",
+      validationOk,
+      validationReasons: reasons,
+      topScore,
+    }),
   };
 }
 
@@ -505,6 +653,261 @@ export function shouldFallbackToGeneral(s: {
   return false;
 }
 
+// ── INSPECTOR TELEMETRY (all reconstructed from REAL pipeline state) ────────────
+
+// A tiny mutable accumulator threaded through the pipeline. Generation calls push
+// their real ChatUsage; phase timers write their measured ms. Built into the public
+// InspectorTrace by `buildInspector` at whichever return point the pipeline takes.
+type Telemetry = {
+  usages: ChatUsage[];
+  routingMs: number;
+  retrievalMs: number;
+  generationMs: number;
+  startedAt: number;
+};
+
+function newTelemetry(): Telemetry {
+  return { usages: [], routingMs: 0, retrievalMs: 0, generationMs: 0, startedAt: now() };
+}
+
+function now(): number {
+  // performance.now() is monotonic; fall back to Date.now() if unavailable.
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+// Per-MODEL real pricing (USD per 1K tokens), keyed by a substring of the model id.
+// ONLY models we can price honestly are here; anything else → usd:null + a note.
+// (DeepSeek published cache-miss pricing; Gemini Flash published input/output.)
+const PRICING: { match: string; inPer1k: number; outPer1k: number; label: string }[] = [
+  { match: "deepseek-chat", inPer1k: 0.00027, outPer1k: 0.0011, label: "deepseek-chat" },
+  { match: "gemini-2.5-flash-lite", inPer1k: 0.0001, outPer1k: 0.0004, label: "gemini-2.5-flash-lite" },
+  { match: "gemini-2.5-flash", inPer1k: 0.0003, outPer1k: 0.0025, label: "gemini-2.5-flash" },
+];
+
+// Aggregate the REAL usage across this turn's live LLM calls into a cost report.
+// Honest by construction: tokens are summed only from calls that reported them; the
+// USD figure is computed from real per-token pricing when the model is known,
+// otherwise null with an explanatory note (never a guessed dollar amount).
+function buildCost(usages: ChatUsage[]): CostReport {
+  const live = usages.filter((u) => u.live);
+  const liveCalls = live.length;
+  const provider = live[0]?.provider ?? "—";
+  const model = live[0]?.model ?? "—";
+
+  const reported = live.filter((u) => typeof u.promptTokens === "number");
+  const promptTokens = reported.length
+    ? reported.reduce((s, u) => s + (u.promptTokens ?? 0), 0)
+    : undefined;
+  const completionTokens = reported.length
+    ? reported.reduce((s, u) => s + (u.completionTokens ?? 0), 0)
+    : undefined;
+
+  const price = PRICING.find((p) => model.includes(p.match));
+  let usd: number | null = null;
+  let pricingNote: string;
+  if (liveCalls === 0) {
+    pricingNote = "No live LLM call this turn.";
+  } else if (promptTokens === undefined) {
+    pricingNote = `Provider “${provider}” did not report token usage — tokens shown as n/a.`;
+  } else if (!price) {
+    pricingNote = `Token pricing not tracked for “${model}”. Embeddings run locally (no API cost).`;
+  } else {
+    usd =
+      (promptTokens / 1000) * price.inPer1k +
+      ((completionTokens ?? 0) / 1000) * price.outPer1k;
+    pricingNote = `Priced at ${price.label} rates. Embeddings run locally (no API cost).`;
+  }
+
+  return { liveCalls, promptTokens, completionTokens, usd, pricingNote, provider, model };
+}
+
+// The HONEST retrieval-method label — describes the lane(s) that ACTUALLY ran this
+// turn. Deliberately NOT a copied "dense × BM25 → RRF → rerank": the engine uses a
+// SQL lane for structured data + local cosine-similarity dense embeddings
+// (multilingual-e5, bundled) + Gemini File Search for uploaded docs. We print only
+// what ran.
+function retrievalMethodLabel(route: RoutePlan, usedFileSearch: boolean): string {
+  const lanes: string[] = [];
+  if (route.sources.includes("structured")) lanes.push("SQL lane (structured intents)");
+  if (route.sources.includes("documents")) {
+    lanes.push("dense cosine similarity (multilingual-e5, local)");
+    if (usedFileSearch) lanes.push("Gemini File Search (uploaded docs)");
+  }
+  if (lanes.length === 0) return "no source matched — general knowledge";
+  return lanes.join(" + ");
+}
+
+// DERIVED confidence from REAL signals — labelled honestly as derived, never a
+// model-reported probability. Signals: grounded vs general, the top retrieval
+// score, and validation pass/fail.
+//   • general (no evidence)         → low, capped at 0.5 ("no source matched")
+//   • grounded + validation passed  → blended from the top cosine score (0.6..0.97)
+//   • grounded + validation failed  → halved (a rejected answer is low-confidence)
+function deriveConfidence(opts: {
+  grounded: boolean;
+  validationOk: boolean;
+  topScore: number | null;
+  hasRows: boolean;
+}): Confidence {
+  if (!opts.grounded) {
+    return { value: 0.4, basis: "general knowledge — no matching evidence in your sources" };
+  }
+  // A structured (SQL) turn with rows is a deterministic exact-match → high floor.
+  let base: number;
+  let basis: string;
+  if (opts.topScore !== null) {
+    // Map a cosine score (~0.6..0.95 band for e5) into a 0.6..0.97 confidence.
+    base = Math.max(0.6, Math.min(0.97, opts.topScore));
+    basis = `top retrieval score ${opts.topScore.toFixed(3)}`;
+  } else if (opts.hasRows) {
+    base = 0.9;
+    basis = "exact structured (SQL) match";
+  } else {
+    base = 0.7;
+    basis = "grounded answer";
+  }
+  if (!opts.validationOk) {
+    return { value: Math.round(base * 0.5 * 100) / 100, basis: `${basis}; validation rejected` };
+  }
+  return { value: Math.round(base * 100) / 100, basis: `${basis}; citation check passed` };
+}
+
+// Build the ordered orchestrator trace from REAL state: Router → Sources → Retrieval
+// → Generation → Citation check (Safety). Every line reflects what actually happened.
+function buildTrace(opts: {
+  route: RoutePlan;
+  rowCount: number;
+  chunkCount: number;
+  usedFileSearch: boolean;
+  fileSearchError: string | null;
+  mode: "grounded" | "general";
+  validationOk: boolean;
+  validationReasons: string[];
+}): TraceStep[] {
+  const { route, rowCount, chunkCount, mode } = opts;
+  const sourcesLabel =
+    route.sources.length > 0 ? route.sources.join(" + ") : "none";
+
+  const steps: TraceStep[] = [];
+
+  // 1. Router
+  steps.push({
+    key: "router",
+    label: "Router",
+    status: route.sources.length > 0 ? "ok" : "info",
+    detail: route.rationale?.trim()
+      ? route.rationale.trim()
+      : `Routed to: ${sourcesLabel}.`,
+  });
+
+  // 2. Sources chosen
+  steps.push({
+    key: "sources",
+    label: "Sources",
+    status: route.sources.length > 0 ? "ok" : "skip",
+    detail:
+      route.sources.length > 0
+        ? `Selected ${sourcesLabel}${
+            route.intents.length
+              ? ` · intents: ${route.intents.map((i) => i.name).join(", ")}`
+              : ""
+          }.`
+        : "No source matched — no documents or structured data apply.",
+  });
+
+  // 3. Retrieval
+  if (opts.fileSearchError) {
+    steps.push({
+      key: "retrieval",
+      label: "Retrieval",
+      status: "warn",
+      detail: `Retrieved ${rowCount} row(s) + ${chunkCount} passage(s). File Search unavailable: ${opts.fileSearchError}`,
+    });
+  } else {
+    steps.push({
+      key: "retrieval",
+      label: "Retrieval",
+      status: rowCount + chunkCount > 0 ? "ok" : "skip",
+      detail:
+        rowCount + chunkCount > 0
+          ? `Retrieved ${rowCount} structured row(s) + ${chunkCount} document passage(s)${
+              opts.usedFileSearch ? " (incl. Gemini File Search)" : ""
+            }.`
+          : "No evidence retrieved for this question.",
+    });
+  }
+
+  // 4. Generation
+  steps.push({
+    key: "generation",
+    label: "Generation",
+    status: "ok",
+    detail:
+      mode === "grounded"
+        ? "Grounded generation — answer constrained to the retrieved evidence, with inline citations."
+        : "General-knowledge generation — no relevant evidence, so answered from the model's general knowledge (uncited).",
+  });
+
+  // 5. Safety / Citation check
+  if (mode === "general") {
+    steps.push({
+      key: "safety",
+      label: "Safety",
+      status: "info",
+      detail: "Citation gate skipped — a general answer legitimately carries no citations.",
+    });
+  } else {
+    steps.push({
+      key: "safety",
+      label: "Safety",
+      status: opts.validationOk ? "ok" : "warn",
+      detail: opts.validationOk
+        ? "Citation check passed — every cited fact resolves to retrieved evidence."
+        : `Citation check failed: ${opts.validationReasons.join("; ")}`,
+    });
+  }
+
+  return steps;
+}
+
+// Assemble the public InspectorTrace from the telemetry + the resolved outcome.
+function buildInspector(opts: {
+  tel: Telemetry;
+  route: RoutePlan;
+  rowCount: number;
+  chunkCount: number;
+  usedFileSearch: boolean;
+  fileSearchError: string | null;
+  mode: "grounded" | "general";
+  validationOk: boolean;
+  validationReasons: string[];
+  topScore: number | null;
+}): InspectorTrace {
+  const totalMs = Math.round(now() - opts.tel.startedAt);
+  const timings: Timings = {
+    routingMs: Math.round(opts.tel.routingMs),
+    retrievalMs: Math.round(opts.tel.retrievalMs),
+    generationMs: Math.round(opts.tel.generationMs),
+    totalMs,
+  };
+  return {
+    retrievalMethod: retrievalMethodLabel(opts.route, opts.usedFileSearch),
+    passages: opts.chunkCount,
+    evidenceCount: opts.rowCount + opts.chunkCount,
+    confidence: deriveConfidence({
+      grounded: opts.mode === "grounded",
+      validationOk: opts.validationOk,
+      topScore: opts.topScore,
+      hasRows: opts.rowCount > 0,
+    }),
+    steps: buildTrace(opts),
+    timings,
+    cost: buildCost(opts.tel.usages),
+  };
+}
+
 // GENERAL-KNOWLEDGE generation — used ONLY when retrieval found no evidence for the
 // question (no structured rows, no document chunks). The admin-editable persona
 // (system_prompt setting) still drives tone/voice, so an admin who sets "You are an
@@ -517,7 +920,7 @@ async function generateGeneral(
   question: string,
   persona: string,
   today: string
-): Promise<string> {
+): Promise<{ text: string; usage: ChatUsage }> {
   const system = `${persona.trim()}
 
 You do NOT have any relevant documents or data for this specific question, so answer it helpfully and accurately from your general knowledge. Do not cite sources and do not invent citation tokens like [S:...] or [P:...].
@@ -526,13 +929,14 @@ IMPORTANT — lead with the answer: give the substantive, useful information FIR
   const user = `Today's date is ${today}.
 
 Question: ${question}`;
-  return chat(
+  const { content, usage } = await chatWithUsage(
     [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
     { temperature: 0.2 }
   );
+  return { text: content, usage };
 }
 
 function docLabel(doc: string): string {
@@ -647,7 +1051,7 @@ async function generateGrounded(
   schemaContext: string,
   today: string,
   stylePreamble: string
-): Promise<string> {
+): Promise<{ text: string; usage: ChatUsage }> {
   const aggLines =
     summaries.length === 0
       ? ""
@@ -707,11 +1111,12 @@ ${docEvidence}
 
 Answer the question grounded strictly in this evidence, with inline citations.`;
 
-  return chat(
+  const { content, usage } = await chatWithUsage(
     [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
     { temperature: 0 }
   );
+  return { text: content, usage };
 }

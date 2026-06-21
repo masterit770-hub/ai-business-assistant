@@ -70,7 +70,7 @@ export default function LandingPage() {
                 Trust every answer.
               </h1>
               <p className="mt-6 max-w-xl text-lg leading-relaxed text-subtle">
-                Nucleus answers questions across your documents and data in plain
+                The AI Business Assistant answers questions across your documents and data in plain
                 language — and puts a citation on every fact, so you can trace it
                 to the exact page or row. Grounded, or it tells you it doesn&rsquo;t
                 know.

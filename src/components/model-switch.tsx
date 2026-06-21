@@ -143,7 +143,7 @@ export function ModelSwitch({
         <Link
           href="/settings?tab=prompts"
           data-testid="model-switch-hint"
-          className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-[11px] font-medium text-amber-700 transition-colors hover:bg-amber-100"
+          className="inline-flex items-center gap-1 rounded-lg border border-medium/40 bg-medium-soft px-2 py-1 text-[11px] font-medium text-medium transition-colors hover:opacity-90"
         >
           Set up Local in Settings → Model
         </Link>

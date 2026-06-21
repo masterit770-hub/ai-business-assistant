@@ -34,7 +34,7 @@ export function CitationMock() {
         <Chip>[S:maintenance#685]</Chip>.
       </p>
       <p className="mt-3 text-xs text-faint">
-        No source for a claim → Nucleus says so, instead of guessing.
+        No source for a claim → the assistant says so, instead of guessing.
       </p>
     </div>
   );

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Space_Grotesk, IBM_Plex_Sans, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
+import { ThemeScript } from "@/components/theme-toggle";
 
 const spaceGrotesk = Space_Grotesk({
   variable: "--font-display",
@@ -21,9 +22,9 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Nucleus — One brain for your entire business",
+  title: "AI Business Assistant — Multi-source retrieval & orchestration",
   description:
-    "Nucleus is one AI that searches and answers across all your documents, spreadsheets, and live tools — with trustworthy numbers you can cite.",
+    "An AI Business Assistant that searches and answers across your documents and structured data — with a routing decision, an orchestrator trace, real retrieval scores, and a citation on every fact.",
 };
 
 export default function RootLayout({
@@ -34,8 +35,14 @@ export default function RootLayout({
   return (
     <html
       lang="en"
+      data-theme="light"
+      suppressHydrationWarning
       className={`${spaceGrotesk.variable} ${ibmPlexSans.variable} ${jetbrainsMono.variable} h-full antialiased`}
     >
+      <head>
+        {/* Sets the saved/OS theme on <html> before paint — no flash of wrong palette. */}
+        <ThemeScript />
+      </head>
       <body className="min-h-full flex flex-col bg-canvas text-ink font-sans">
         {children}
       </body>
