@@ -4,18 +4,26 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { LogOut, Loader2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
+import { resolveDisplayLabel } from "@/lib/account/validate";
 
 // The signed-in user + a real Sign out. Reads the live Supabase session, shows
-// the actual email/initials, and signs the user out (clears the session → the
-// middleware bounces them to /sign-in on the next navigation).
+// the actual display name (set on /account) — or the email if none is set — plus
+// matching initials, and signs the user out (clears the session → the middleware
+// bounces them to /sign-in on the next navigation).
 export function UserMenu() {
   const router = useRouter();
   const [email, setEmail] = useState<string | null>(null);
+  const [displayName, setDisplayName] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     const supabase = createClient();
-    supabase.auth.getUser().then(({ data }) => setEmail(data.user?.email ?? null));
+    supabase.auth.getUser().then(({ data }) => {
+      setEmail(data.user?.email ?? null);
+      setDisplayName(
+        (data.user?.user_metadata?.display_name as string | undefined)?.trim() || null
+      );
+    });
   }, []);
 
   async function signOut() {
@@ -26,10 +34,18 @@ export function UserMenu() {
     window.location.assign("/sign-in");
   }
 
-  const initials = email
-    ? email
-        .split("@")[0]
-        .split(/[.\-_]/)
+  // The label shown for the user: their display name if set, else the email.
+  const label = resolveDisplayLabel(displayName, email);
+  // When a display name is set, surface the email underneath; otherwise keep the
+  // existing subtitle so nothing looks empty.
+  const subtitle = displayName && email ? email : "AI Business Assistant";
+
+  // Initials come from the resolved label (a name's words, or the email local part).
+  const initialsSource = displayName?.trim() || email?.split("@")[0] || "";
+  const initials = initialsSource
+    ? initialsSource
+        .split(/[.\-_\s]+/)
+        .filter(Boolean)
         .map((p) => p[0])
         .slice(0, 2)
         .join("")
@@ -46,9 +62,9 @@ export function UserMenu() {
           data-testid="user-email"
           className="block truncate text-sm font-semibold text-ink"
         >
-          {email ?? "Not signed in"}
+          {label}
         </span>
-        <span className="block truncate text-xs text-faint">AI Business Assistant</span>
+        <span className="block truncate text-xs text-faint">{subtitle}</span>
       </span>
       <button
         onClick={signOut}

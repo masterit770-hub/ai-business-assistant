@@ -8,6 +8,7 @@ import {
 } from "@/lib/engine/ingest";
 import { supabaseEnabled } from "@/lib/engine/supabase";
 import { fileSearchEnabled } from "@/lib/engine/file-search";
+import { storeOriginalFile } from "@/lib/engine/doc-files";
 
 // Runtime ingestion — engine logic IN-PROCESS (no proxy). The dashboard Upload
 // button posts the chosen file here as multipart/form-data; we parse → (PDF →
@@ -87,13 +88,22 @@ export async function POST(req: Request) {
       );
     }
 
+    // Persist the ORIGINAL file so it's downloadable/viewable later (not just a name
+    // in the list). Best-effort: never fails the ingest if storage is off/unprovisioned
+    // — the doc is already indexed + queryable. Path: <owner_id>/<doc_id>.
+    const docId = result.doc ?? result.table;
+    let originalStored = false;
+    if (docId) {
+      originalStored = await storeOriginalFile(buf, ownerId, docId, name);
+    }
+
     const persistence =
       backend === "file-search"
         ? "stored in Gemini File Search — durable + managed (survives restarts, shared across instances). Queries use the Gemini generateContent quota."
         : supabaseEnabled()
           ? "stored in Supabase (Postgres + pgvector) — durable, client-owned."
           : "in-memory on this serverless instance — query-able now; NOT durable across cold starts/instances.";
-    return NextResponse.json({ ok: true, ingested: result, backend, persistence });
+    return NextResponse.json({ ok: true, ingested: result, backend, persistence, originalStored });
   } catch (e) {
     console.error("ingest error:", e);
     const msg = e instanceof Error ? e.message : typeof e === "string" ? e : JSON.stringify(e);

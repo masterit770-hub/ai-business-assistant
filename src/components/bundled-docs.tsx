@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { FileText, Database } from "lucide-react";
+import { FileText, Database, Download, Trash2, Loader2 } from "lucide-react";
 
 type BundledSource = {
   doc: string;
@@ -17,17 +17,41 @@ type BundledSource = {
 // it in the real total.
 export function BundledDocs() {
   const [sources, setSources] = useState<BundledSource[] | null>(null);
+  const [role, setRole] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
 
-  useEffect(() => {
+  function load() {
     fetch("/api/documents")
       .then((r) => r.json())
       .then((d) => {
         const b: BundledSource[] = d.bundled ?? [];
         setSources(b);
+        setRole(d.role ?? null);
         window.dispatchEvent(new CustomEvent("nucleus:bundled", { detail: { count: b.length } }));
       })
       .catch(() => setSources([]));
+  }
+
+  useEffect(() => {
+    load();
   }, []);
+
+  async function remove(s: BundledSource) {
+    if (
+      !confirm(
+        `Remove the built-in source “${s.label}”? It will no longer be used in answers for the whole workspace.`
+      )
+    )
+      return;
+    setRemoving(s.doc);
+    try {
+      const q = new URLSearchParams({ doc: s.doc, scope: "bundled", kind: s.kind });
+      const res = await fetch(`/api/documents?${q.toString()}`, { method: "DELETE" });
+      if (res.ok) load();
+    } finally {
+      setRemoving(null);
+    }
+  }
 
   if (!sources || sources.length === 0) return null;
 
@@ -63,6 +87,35 @@ export function BundledDocs() {
                 </span>
               </td>
               <td className="px-5 py-3 text-right text-xs text-faint">{s.detail}</td>
+              <td className="px-4 py-3 text-right whitespace-nowrap">
+                {s.kind === "document" && (
+                  <a
+                    href={`/api/documents/file?doc=${encodeURIComponent(s.doc)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid={`bundled-download-${s.doc}`}
+                    title="Open / download"
+                    className="mr-1 inline-flex size-7 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                  >
+                    <Download className="size-4" />
+                  </a>
+                )}
+                {role === "admin" && (
+                  <button
+                    onClick={() => remove(s)}
+                    disabled={removing === s.doc}
+                    data-testid={`bundled-remove-${s.doc}`}
+                    title="Remove built-in source (admin)"
+                    className="inline-flex size-7 items-center justify-center rounded-md text-faint transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
+                  >
+                    {removing === s.doc ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="size-4" />
+                    )}
+                  </button>
+                )}
+              </td>
             </tr>
           ))}
         </tbody>

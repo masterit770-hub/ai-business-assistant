@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { FileText, RefreshCw, Trash2, Loader2 } from "lucide-react";
+import { FileText, RefreshCw, Trash2, Loader2, Download } from "lucide-react";
 import { UrgencyBadge } from "@/components/urgency-badge";
 import type { Urgency } from "@/lib/mock";
 
@@ -126,6 +126,16 @@ export function UploadedDocs({ filter = "" }: { filter?: string }) {
                   )}
                 </td>
                 <td className="px-4 py-3 text-right">
+                  <a
+                    href={`/api/documents/file?doc=${encodeURIComponent(d.doc)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid={`doc-download-${d.doc}`}
+                    title="Open / download"
+                    className="mr-1 inline-flex size-7 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                  >
+                    <Download className="size-4" />
+                  </a>
                   <button
                     onClick={() => remove(d.doc, d.label)}
                     disabled={removing === d.doc}

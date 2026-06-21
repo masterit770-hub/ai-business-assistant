@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { FileText, Clock, Settings } from "lucide-react";
+import { FileText, Clock, User, Settings } from "lucide-react";
 import { AssistantMark } from "@/components/brand";
 import { UserMenu } from "@/components/user-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 const nav = [
   { label: "Documents", href: "/dashboard", icon: FileText, match: "documents" },
   { label: "History", href: "/history", icon: Clock, match: "history" },
+  { label: "Account", href: "/account", icon: User, match: "account" },
   { label: "Settings", href: "/settings", icon: Settings, match: "settings", adminOnly: true },
 ];
 

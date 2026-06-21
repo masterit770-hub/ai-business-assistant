@@ -6,6 +6,7 @@
 import { getVectors, loadReport } from "./retrieval.ts";
 import { DOCUMENTS } from "./documents.ts";
 import { TABLES } from "./schema.ts";
+import { deletedSourceIds } from "./deleted-sources.ts";
 
 // A document's primary language, derived HONESTLY from its real indexed text (not
 // fabricated). "en"/"he" when we can tell; null when unknown → the UI omits the chip.
@@ -41,6 +42,10 @@ export function detectLang(text: string): DocLang {
  */
 export function bundledSources(): BundledSource[] {
   const out: BundledSource[] = [];
+  // Workspace-level soft-delete: a bundled doc/table an admin hid is excluded from
+  // the list (so what the dashboard SHOWS matches what the assistant can ANSWER from).
+  // Empty set (nothing hidden / Supabase off) → the full bundled list, as before.
+  const hidden = deletedSourceIds();
 
   // ── PDF documents (from the actual vector index) ──────────────────────────
   try {
@@ -55,6 +60,7 @@ export function bundledSources(): BundledSource[] {
       texts.get(r.doc)!.push(r.text ?? "");
     }
     for (const [doc, pageSet] of pages) {
+      if (hidden.has(doc)) continue; // admin-hidden bundled doc
       const label = DOCUMENTS.find((d) => d.doc === doc)?.label ?? doc;
       const n = pageSet.size;
       const lang = detectLang((texts.get(doc) ?? []).join(" "));
@@ -69,6 +75,7 @@ export function bundledSources(): BundledSource[] {
     const report = loadReport(); // [{ table, rows, malformed_cells }]
     const rowsOf = new Map(report.map((r) => [r.table, r.rows]));
     for (const t of TABLES) {
+      if (hidden.has(t.table)) continue; // admin-hidden bundled table
       const rows = rowsOf.get(t.table);
       if (!rows) continue; // only tables that actually loaded
       out.push({

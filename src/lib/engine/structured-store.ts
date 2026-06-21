@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { runtimeRows } from "./runtime-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
 import { validateGeneratedSql, type SqlGuardResult } from "./sql-guard.ts";
+import { deletedSourceIds } from "./deleted-sources.ts";
 
 const ROOT = process.cwd();
 const SQLITE = join(ROOT, "data-index", "contracts.sqlite");
@@ -158,13 +159,18 @@ export function introspectSchema(sampleRows = 3): {
   samples: Map<string, Record<string, unknown>[]>;
 } {
   const db = getStore();
+  // Workspace-level soft-delete: a bundled table an admin hid (recorded in
+  // deleted_sources) is dropped from the catalog the planner + SQL guard consume, so
+  // text-to-SQL can neither plan nor query it → it never appears in an answer. Empty
+  // set (nothing hidden / Supabase off) → identical to the prior catalog.
+  const hidden = deletedSourceIds();
   const tables = (
     db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
       .all() as { name: string }[]
   )
     .map((r) => r.name)
-    .filter((t) => !HIDDEN_TABLES.has(t) && !t.startsWith("sqlite_"));
+    .filter((t) => !HIDDEN_TABLES.has(t) && !t.startsWith("sqlite_") && !hidden.has(t));
 
   const catalog: TableSchema[] = [];
   const samples = new Map<string, Record<string, unknown>[]>();

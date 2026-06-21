@@ -20,6 +20,7 @@ import { DOCUMENTS } from "./documents.ts";
 import { runtimeDocs } from "./runtime-store.ts";
 import { getSetting } from "./settings.ts";
 import { buildConversationContext, type Turn } from "./conversation.ts";
+import { refreshDeletedSources } from "./deleted-sources.ts";
 
 export type AnswerResult = {
   question: string;
@@ -256,6 +257,11 @@ async function runAnswerPipeline(
   // The top REAL retrieval (cosine) score across the bundled dense lane — the
   // primary signal for the derived confidence. Null when no dense lane ran.
   let topScore: number | null = null;
+
+  // Workspace-level soft-delete: load the hidden-set ONCE per request so every
+  // synchronous retrieval read this turn (vectorSearch, introspectSchema) excludes an
+  // admin-deleted bundled doc/table. No-op when Supabase is off / nothing is hidden.
+  await refreshDeletedSources();
 
   // An admin sees ALL uploaded docs → no owner scoping on retrieval.
   const scopeOwner = ctx.role === "admin" ? undefined : ctx.ownerId;

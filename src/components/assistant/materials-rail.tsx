@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { FileText, Database, Trash2, Loader2, RefreshCw } from "lucide-react";
+import { FileText, Database, Trash2, Loader2, RefreshCw, Download } from "lucide-react";
 import { UploadButton } from "@/components/upload-button";
 import { UrgencyBadge } from "@/components/urgency-badge";
 import type { Urgency } from "@/lib/mock";
@@ -33,6 +33,7 @@ function labelLang(label: string): DocLang {
 export function MaterialsRail() {
   const [uploaded, setUploaded] = useState<DocMeta[] | null>(null);
   const [bundled, setBundled] = useState<BundledSource[] | null>(null);
+  const [role, setRole] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
 
@@ -45,6 +46,7 @@ export function MaterialsRail() {
       const b: BundledSource[] = d.bundled ?? [];
       setUploaded(docs);
       setBundled(b);
+      setRole(d.role ?? null);
       setError(null);
       window.dispatchEvent(
         new CustomEvent("nucleus:docs", {
@@ -64,11 +66,22 @@ export function MaterialsRail() {
     return () => window.removeEventListener("nucleus:uploaded", onUploaded);
   }, []);
 
-  async function remove(doc: string, label: string) {
-    if (!confirm(`Remove “${label}”? It will no longer be searchable.`)) return;
+  async function remove(
+    doc: string,
+    label: string,
+    scope: "upload" | "bundled" = "upload",
+    kind?: "document" | "structured"
+  ) {
+    const prompt =
+      scope === "bundled"
+        ? `Remove the built-in source “${label}”? It will no longer be used in answers for the whole workspace.`
+        : `Remove “${label}”? It will no longer be searchable.`;
+    if (!confirm(prompt)) return;
     setRemoving(doc);
     try {
-      const res = await fetch(`/api/documents?doc=${encodeURIComponent(doc)}`, { method: "DELETE" });
+      const q = new URLSearchParams({ doc, scope });
+      if (kind) q.set("kind", kind);
+      const res = await fetch(`/api/documents?${q.toString()}`, { method: "DELETE" });
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "remove failed");
       await load();
@@ -77,6 +90,11 @@ export function MaterialsRail() {
     } finally {
       setRemoving(null);
     }
+  }
+
+  // Open the original file in a new tab (PDFs render inline; others download).
+  function openFile(doc: string) {
+    window.open(`/api/documents/file?doc=${encodeURIComponent(doc)}`, "_blank", "noopener");
   }
 
   return (
@@ -140,6 +158,14 @@ export function MaterialsRail() {
                   </span>
                 )}
                 <button
+                  onClick={() => openFile(d.doc)}
+                  data-testid={`doc-download-${d.doc}`}
+                  title="Open / download"
+                  className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                >
+                  <Download className="size-3.5" />
+                </button>
+                <button
                   onClick={() => remove(d.doc, d.label)}
                   disabled={removing === d.doc}
                   data-testid={`doc-remove-${d.doc}`}
@@ -179,6 +205,33 @@ export function MaterialsRail() {
                 {/* Documents carry an honest EN/HE chip from their indexed text; structured tables don't. */}
                 {s.kind === "document" && <LangChip lang={s.lang ?? null} />}
                 <span className="shrink-0 text-[11px] text-faint">{s.detail}</span>
+                {/* Only a PDF/document source has an openable original file. */}
+                {s.kind === "document" && (
+                  <button
+                    onClick={() => openFile(s.doc)}
+                    data-testid={`bundled-download-${s.doc}`}
+                    title="Open / download"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                  >
+                    <Download className="size-3.5" />
+                  </button>
+                )}
+                {/* Built-in data is SHARED → only an admin can remove it (workspace-wide). */}
+                {role === "admin" && (
+                  <button
+                    onClick={() => remove(s.doc, s.label, "bundled", s.kind)}
+                    disabled={removing === s.doc}
+                    data-testid={`bundled-remove-${s.doc}`}
+                    title="Remove built-in source (admin)"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
+                  >
+                    {removing === s.doc ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="size-3.5" />
+                    )}
+                  </button>
+                )}
               </li>
             ))}
           </ul>

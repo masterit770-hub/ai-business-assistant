@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { cosineSim } from "./embeddings.ts";
 import type { VectorIndex } from "./documents.ts";
+import { deletedSourceIds } from "./deleted-sources.ts";
 
 const ROOT = process.cwd();
 const SQLITE = join(ROOT, "data-index", "contracts.sqlite");
@@ -47,7 +48,13 @@ export function getVectors(): VectorIndex {
  *  lib/engine/file-search.ts), not here. */
 export function vectorSearch(queryEmbedding: number[], k = 5, docFilter?: string): DocChunk[] {
   const idx = getVectors();
+  // Workspace-level soft-delete: a bundled doc an admin hid (recorded in
+  // deleted_sources, snapshotted by refreshDeletedSources at the top of the request)
+  // is excluded so it never appears in an answer. Empty set (nothing hidden, or
+  // Supabase off) → identical to the prior behavior.
+  const hidden = deletedSourceIds();
   const scored = idx.records
+    .filter((r) => !hidden.has(r.doc))
     .filter((r) => !docFilter || r.doc === docFilter)
     .map((r) => ({ doc: r.doc, page: r.page, text: r.text, score: cosineSim(queryEmbedding, r.embedding) }))
     .sort((a, b) => b.score - a.score);
