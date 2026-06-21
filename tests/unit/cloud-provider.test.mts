@@ -172,6 +172,28 @@ test("azure override → deployment URL + api-key header (NOT Bearer) + api-vers
   assert.equal(t.provider, "azure");
 });
 
+test("azure cloud target shape is UNCHANGED after the buildAzureTarget refactor", () => {
+  // Regression guard: extracting the shared Azure-target builder must keep the
+  // cloud-azure output byte-for-byte (URL + headers + provider), so the refactor
+  // didn't move the cheese for existing single-key Azure users.
+  const t = resolveCloudTarget({
+    provider: "azure",
+    apiKey: "azure-secret",
+    model: "my-gpt4o-deployment",
+    baseUrl: "",
+    azureEndpoint: "https://my-resource.openai.azure.com/",
+    azureApiVersion: "2024-10-21",
+  });
+  assert.equal(
+    t.url,
+    "https://my-resource.openai.azure.com/openai/deployments/my-gpt4o-deployment/chat/completions?api-version=2024-10-21"
+  );
+  assert.equal(t.headers["api-key"], "azure-secret");
+  assert.equal(t.headers["Authorization"], undefined);
+  assert.equal(t.provider, "azure");
+  assert.equal(t.model, "my-gpt4o-deployment");
+});
+
 test("azure without endpoint → a clear error (never a silently-broken URL)", () => {
   assert.throws(
     () =>

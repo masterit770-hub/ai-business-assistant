@@ -20,7 +20,13 @@
 // shape. NOTE: GCP *Vertex/HIPAA-BAA* uses Google service-account auth (not a static
 // key) and is OUT OF SCOPE here — the consumer Gemini API key covers the simple GCP
 // swap; a follow-up can add Vertex.
-import { getModelConfig, getCloudConfig, type CloudConfig } from "./settings.ts";
+import {
+  getModelConfig,
+  getCloudConfig,
+  getHipaaConfig,
+  type CloudConfig,
+  type HipaaConfig,
+} from "./settings.ts";
 
 const PROVIDER = process.env.LLM_PROVIDER ?? "deepseek";
 const BASE = process.env.LLM_BASE_URL ?? "https://api.deepseek.com";
@@ -141,6 +147,13 @@ export async function backendConfigured(): Promise<boolean> {
   if (process.env.LLM_API_KEY) return true;
   const model = await getModelConfig();
   if (model.mode === "local") return true;
+  if (model.mode === "hipaa") {
+    // HIPAA mode is "configured" only when its own Azure slots are fully set (no env
+    // fallback by design — see resolveHipaaTarget); otherwise the route should 503
+    // rather than route PHI-intent traffic to the non-BAA env backend.
+    const h = await getHipaaConfig();
+    return Boolean(h.apiKey && h.endpoint && h.model);
+  }
   const cloud = await getCloudConfig();
   return cloud.provider !== "" && cloud.apiKey !== "";
 }
@@ -173,6 +186,9 @@ export async function chatWithUsage(
   if (cfg.mode === "local") {
     return chatLocal(messages, opts, cfg.localEndpoint, cfg.localModel);
   }
+  if (cfg.mode === "hipaa") {
+    return chatHipaa(messages, opts);
+  }
   return chatCloud(messages, opts);
 }
 
@@ -187,6 +203,40 @@ const PROVIDER_DEFAULT_BASE: Record<string, string> = {
   deepseek: "https://api.deepseek.com",
   gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
 };
+
+// Shared Azure OpenAI request shape — deployment-scoped URL + `api-key` header (NOT
+// Bearer). Used by BOTH cloud-azure and hipaa-azure so the two stay in lockstep; the
+// existing azure unit test pins this exact URL/header output. NEVER logs the key.
+function buildAzureTarget(
+  endpoint: string,
+  apiVersion: string,
+  model: string,
+  apiKey: string,
+  providerLabel: string
+): CloudTarget {
+  const base = endpoint.replace(/\/+$/, "");
+  const ver = apiVersion || "2024-10-21";
+  return {
+    url: `${base}/openai/deployments/${encodeURIComponent(model)}/chat/completions?api-version=${encodeURIComponent(ver)}`,
+    headers: { "Content-Type": "application/json", "api-key": apiKey },
+    provider: providerLabel,
+    model,
+  };
+}
+
+/**
+ * Decide the HIPAA (Azure OpenAI under a Microsoft BAA) target for THIS request.
+ * Reuses the proven Azure request shape. There is NO env fallback by design: if the
+ * Azure key/endpoint/model isn't saved it throws a clear config error rather than
+ * silently routing PHI-intent traffic to the non-BAA env (DeepSeek) backend.
+ */
+export function resolveHipaaTarget(cfg: HipaaConfig): CloudTarget {
+  const endpoint = cfg.endpoint.replace(/\/+$/, "");
+  if (!endpoint) throw new Error("HIPAA (Azure OpenAI) selected but hipaa_endpoint is not set");
+  if (!cfg.model) throw new Error("HIPAA (Azure OpenAI) selected but hipaa_model (deployment name) is not set");
+  if (!cfg.apiKey) throw new Error("HIPAA mode selected but no Azure key is saved");
+  return buildAzureTarget(endpoint, cfg.apiVersion, cfg.model, cfg.apiKey, "azure-hipaa");
+}
 
 /**
  * Decide the cloud target for THIS request. If the admin has set a runtime override
@@ -211,16 +261,9 @@ export function resolveCloudTarget(cfg: CloudConfig): CloudTarget {
 
   if (cfg.provider === "azure") {
     // Azure OpenAI: deployment-scoped URL + an `api-key` header (NOT Bearer).
-    const endpoint = cfg.azureEndpoint.replace(/\/+$/, "");
-    if (!endpoint) throw new Error("Azure OpenAI selected but azure_endpoint is not set");
+    if (!cfg.azureEndpoint.replace(/\/+$/, "")) throw new Error("Azure OpenAI selected but azure_endpoint is not set");
     if (!cfg.model) throw new Error("Azure OpenAI selected but cloud_model (deployment name) is not set");
-    const apiVersion = cfg.azureApiVersion || "2024-10-21";
-    return {
-      url: `${endpoint}/openai/deployments/${encodeURIComponent(cfg.model)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`,
-      headers: { "Content-Type": "application/json", "api-key": cfg.apiKey },
-      provider: "azure",
-      model: cfg.model,
-    };
+    return buildAzureTarget(cfg.azureEndpoint, cfg.azureApiVersion, cfg.model, cfg.apiKey, "azure");
   }
 
   // openai / gemini / deepseek / custom — all OpenAI-compatible: Bearer + base/chat.
@@ -274,6 +317,47 @@ async function chatCloud(
     // Only retry transient capacity/rate errors; surface real config errors now.
     if (!RETRYABLE.has(res.status) || attempt === MAX_ATTEMPTS) break;
     // Exponential backoff with jitter (the free tier's 503 spikes are brief).
+    await sleep(700 * 2 ** (attempt - 1) + Math.floor(Math.random() * 300));
+  }
+  throw new Error(lastErr);
+}
+
+// HIPAA — Azure OpenAI under a Microsoft BAA. Structurally identical to chatCloud
+// (same retry/backoff, same honest usage), but resolves the INDEPENDENT hipaa_* slot
+// via getHipaaConfig()+resolveHipaaTarget(). No env fallback: an unconfigured HIPAA
+// mode throws a clear config error rather than leaking to the non-BAA env backend.
+// The provider label "azure-hipaa" names the right backend on any billing/auth error;
+// the error string carries provider/model/status/body only — NEVER the key.
+async function chatHipaa(
+  messages: ChatMessage[],
+  opts: { json?: boolean; temperature?: number }
+): Promise<ChatResult> {
+  const cfg = await getHipaaConfig();
+  const target = resolveHipaaTarget(cfg);
+  const payload = JSON.stringify({
+    model: target.model,
+    messages,
+    temperature: opts.temperature ?? 0,
+    ...(opts.json ? { response_format: { type: "json_object" } } : {}),
+  });
+
+  let lastErr = "";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const res = await fetch(target.url, {
+      method: "POST",
+      headers: target.headers,
+      body: payload,
+    });
+    if (res.ok) {
+      const data = (await res.json()) as ChatCompletion;
+      return {
+        content: data.choices?.[0]?.message?.content ?? "",
+        usage: readUsage(data, target.provider, target.model, true),
+      };
+    }
+    const body = await res.text().catch(() => "");
+    lastErr = `${target.provider} (${target.model}) ${res.status}: ${body.slice(0, 300)}`;
+    if (!RETRYABLE.has(res.status) || attempt === MAX_ATTEMPTS) break;
     await sleep(700 * 2 ** (attempt - 1) + Math.floor(Math.random() * 300));
   }
   throw new Error(lastErr);

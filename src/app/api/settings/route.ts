@@ -24,6 +24,11 @@ const KEYS: SettingKey[] = [
   "cloud_base_url",
   "azure_endpoint",
   "azure_api_version",
+  // HIPAA (Azure) NON-SECRET config. `hipaa_api_key` is handled SEPARATELY below
+  // (write-only, like cloud_api_key), so it is NOT in this list.
+  "hipaa_endpoint",
+  "hipaa_api_version",
+  "hipaa_model",
 ];
 
 // The cloud provider values the PUT will accept (besides "" = clear/use env default).
@@ -65,9 +70,9 @@ export async function PUT(req: Request) {
   // a typo can't silently leave the workspace in an undefined state.
   if (typeof body.model_mode === "string") {
     const m = body.model_mode.trim().toLowerCase();
-    if (m !== "cloud" && m !== "local") {
+    if (m !== "cloud" && m !== "hipaa" && m !== "local") {
       return NextResponse.json(
-        { error: 'model_mode must be "cloud" or "local"' },
+        { error: 'model_mode must be "cloud", "hipaa", or "local"' },
         { status: 400 }
       );
     }
@@ -101,6 +106,18 @@ export async function PUT(req: Request) {
         await setSetting("cloud_api_key", k.trim());
       }
       // empty/whitespace → leave the stored key untouched.
+    }
+    // hipaa_api_key is its OWN independent write-only slot (the bug fix): an Azure
+    // (HIPAA) key persists here and NEVER overwrites the cloud key. Same protection:
+    // a blank submit leaves the stored HIPAA key untouched; "__clear__" clears it.
+    if (typeof body.hipaa_api_key === "string") {
+      const k = body.hipaa_api_key as string;
+      if (k === "__clear__") {
+        await setSetting("hipaa_api_key", "");
+      } else if (k.trim()) {
+        await setSetting("hipaa_api_key", k.trim());
+      }
+      // empty/whitespace → leave the stored hipaa key untouched.
     }
     return NextResponse.json(await getSettings());
   } catch (e) {

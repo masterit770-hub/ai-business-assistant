@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Cloud, Server, Loader2 } from "lucide-react";
+import { Cloud, Server, ShieldCheck, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // THE BIG SWITCH — a prominent, segmented Cloud ⇄ Local control. The ACTIVE side is
@@ -14,7 +14,12 @@ import { cn } from "@/lib/utils";
 //
 // `variant="panel"` is the compact form for the top of the Ask panel;
 // `variant="header"` is a slightly larger form for a page header.
-type Mode = "cloud" | "local";
+type Mode = "cloud" | "hipaa" | "local";
+
+// Normalize a stored model_mode string to one of the three modes; anything
+// unknown/blank fails safe to "cloud" (the working default), mirroring the engine.
+const normMode = (v: unknown): Mode =>
+  v === "local" ? "local" : v === "hipaa" ? "hipaa" : "cloud";
 
 export function ModelSwitch({
   variant = "panel",
@@ -40,7 +45,7 @@ export function ModelSwitch({
         if (!admin) return;
         const s = await fetch("/api/settings").then((r) => r.json());
         if (!alive || s?.error) return;
-        const m: Mode = s.model_mode === "local" ? "local" : "cloud";
+        const m: Mode = normMode(s.model_mode);
         setMode(m);
         setEndpointSet(Boolean((s.local_endpoint ?? "").trim()));
         onModeChange?.(m);
@@ -70,7 +75,7 @@ export function ModelSwitch({
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "failed");
-      const confirmed: Mode = d.model_mode === "local" ? "local" : "cloud";
+      const confirmed: Mode = normMode(d.model_mode);
       setMode(confirmed);
       setEndpointSet(Boolean((d.local_endpoint ?? "").trim()));
       onModeChange?.(confirmed);
@@ -132,10 +137,11 @@ export function ModelSwitch({
       </span>
       <div
         role="group"
-        aria-label="Switch the AI model between Cloud and Local"
+        aria-label="Switch the AI model between Cloud, HIPAA, and Local"
         className="inline-flex items-center gap-1 rounded-xl border border-line bg-canvas p-1 shadow-soft"
       >
         {seg("cloud", "Cloud", Cloud)}
+        {seg("hipaa", "HIPAA", ShieldCheck)}
         {seg("local", "Local", Server)}
       </div>
       {/* Inline hint when Local is the active mode but no endpoint is configured. */}

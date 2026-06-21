@@ -35,7 +35,14 @@ export type SettingKey =
   | "cloud_model"
   | "cloud_base_url"
   | "azure_endpoint"
-  | "azure_api_version";
+  | "azure_api_version"
+  // HIPAA-eligible mode (Azure OpenAI under a Microsoft BAA). A SEPARATE, independent
+  // set of slots so a HIPAA (Azure) key NEVER overwrites the cloud key. `hipaa_api_key`
+  // is WRITE-ONLY over the API, exactly like cloud_api_key.
+  | "hipaa_api_key"
+  | "hipaa_endpoint"
+  | "hipaa_api_version"
+  | "hipaa_model";
 
 // The built-in defaults. The system-prompt default is the FULL generation
 // contract (kept in answer.ts historically); here we expose only the
@@ -66,6 +73,12 @@ Answer with exactly one word: high, medium, or low.`,
   cloud_base_url: "",
   azure_endpoint: "",
   azure_api_version: "",
+  // HIPAA mode (Azure OpenAI) override — all blank by default = "not configured".
+  // Independent of the cloud_* slots, so the two keys never collide.
+  hipaa_api_key: "",
+  hipaa_endpoint: "",
+  hipaa_api_version: "",
+  hipaa_model: "",
 };
 
 // In-memory fallback store (used when Supabase isn't configured). On globalThis so
@@ -93,8 +106,9 @@ export async function getSetting(key: SettingKey): Promise<string> {
 // raw `cloud_api_key` — the secret is WRITE-ONLY over the API. Instead the panel
 // gets `cloud_api_key_set` (a boolean) so the UI can show "key saved" without ever
 // echoing the secret back. All other cloud-provider fields are non-secret config.
-export type AdminSettings = Omit<Record<SettingKey, string>, "cloud_api_key"> & {
+export type AdminSettings = Omit<Record<SettingKey, string>, "cloud_api_key" | "hipaa_api_key"> & {
   cloud_api_key_set: boolean;
+  hipaa_api_key_set: boolean;
 };
 
 /** Read all editable settings for the admin panel — the api key is masked to a bool. */
@@ -110,22 +124,30 @@ export async function getSettings(): Promise<AdminSettings> {
     cloud_base_url: await getSetting("cloud_base_url"),
     azure_endpoint: await getSetting("azure_endpoint"),
     azure_api_version: await getSetting("azure_api_version"),
+    // HIPAA (Azure) non-secret config — its own independent slots.
+    hipaa_endpoint: await getSetting("hipaa_endpoint"),
+    hipaa_api_version: await getSetting("hipaa_api_version"),
+    hipaa_model: await getSetting("hipaa_model"),
     // Write-only: never the value, only whether a key is stored.
     cloud_api_key_set: (await getSetting("cloud_api_key")).trim().length > 0,
+    hipaa_api_key_set: (await getSetting("hipaa_api_key")).trim().length > 0,
   };
 }
 
-export type ModelMode = "cloud" | "local";
+export type ModelMode = "cloud" | "hipaa" | "local";
 
 /**
  * The active backend for this request: "cloud" (the env-configured provider —
- * the default, unchanged behavior) or "local" (the owner's own machine). Anything
- * other than the literal "local" resolves to "cloud", so a corrupt/blank value
- * fails safe to the working cloud default rather than to a half-configured local.
+ * the default, unchanged behavior), "hipaa" (Azure OpenAI under a Microsoft BAA),
+ * or "local" (the owner's own machine). Anything other than the literal "local" or
+ * "hipaa" resolves to "cloud", so a corrupt/blank value fails safe to the working
+ * cloud default rather than to a half-configured backend.
  */
 export async function getModelMode(): Promise<ModelMode> {
   const v = (await getSetting("model_mode")).trim().toLowerCase();
-  return v === "local" ? "local" : "cloud";
+  if (v === "local") return "local";
+  if (v === "hipaa") return "hipaa";
+  return "cloud";
 }
 
 export type ModelConfig = {
@@ -189,6 +211,24 @@ export async function getCloudConfig(): Promise<CloudConfig> {
     baseUrl: (await getSetting("cloud_base_url")).trim(),
     azureEndpoint: (await getSetting("azure_endpoint")).trim(),
     azureApiVersion: (await getSetting("azure_api_version")).trim(),
+  };
+}
+
+// ── HIPAA mode (Azure OpenAI under a Microsoft BAA) ────────────────────────────
+// An INDEPENDENT set of slots from cloud_* so a HIPAA (Azure) key never collides
+// with the cloud key. Azure-shaped (api-key header + deployment URL + api-version).
+// There is deliberately NO env fallback for this mode (see llm.ts): if it isn't
+// configured it fails closed with a clear error rather than silently routing
+// PHI-intent traffic to the non-BAA env (DeepSeek) backend.
+export type HipaaConfig = { apiKey: string; endpoint: string; apiVersion: string; model: string };
+
+/** The effective HIPAA (Azure) config, read at REQUEST time. */
+export async function getHipaaConfig(): Promise<HipaaConfig> {
+  return {
+    apiKey: (await getSetting("hipaa_api_key")).trim(),
+    endpoint: (await getSetting("hipaa_endpoint")).trim(),
+    apiVersion: (await getSetting("hipaa_api_version")).trim(),
+    model: (await getSetting("hipaa_model")).trim(),
   };
 }
 

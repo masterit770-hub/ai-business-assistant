@@ -40,6 +40,14 @@ test("settings round-trip: PUT model_mode=local then GET returns local; flip bac
   assert.equal(all.model_mode, "cloud");
 });
 
+test("settings round-trip: model_mode=hipaa persists and GET returns hipaa", async () => {
+  await setSetting("model_mode", "hipaa");
+  assert.equal(await getModelMode(), "hipaa");
+  const all = await getSettings();
+  assert.equal(all.model_mode, "hipaa");
+  await setSetting("model_mode", "cloud"); // reset
+});
+
 test("a corrupt/unknown mode fails safe to cloud (never a half-configured local)", async () => {
   await setSetting("model_mode", "garbage");
   assert.equal(await getModelMode(), "cloud");
