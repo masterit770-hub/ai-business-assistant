@@ -301,7 +301,9 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+              // Enter sends (ChatGPT-style); Shift+Enter inserts a newline. Guard against
+              // IME composition (Hebrew/other input methods) so a composing Enter never sends.
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 ask(question);
               }
@@ -320,7 +322,7 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
           </button>
         </div>
         <p className="mt-1.5 px-1 text-[11px] text-faint">
-          Press ⌘/Ctrl + Enter to send{hasThread ? " · follow-ups use the whole conversation" : ""}
+          Press Enter to send · Shift+Enter for a new line{hasThread ? " · follow-ups use the whole conversation" : ""}
         </p>
       </form>
 
