@@ -1,12 +1,13 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { LayoutGrid, ScanSearch, Play, ArrowUp, Loader2, MessageSquarePlus } from "lucide-react";
+import { LayoutGrid, ScanSearch, Play, ArrowUp, Loader2, MessageSquarePlus, Square, RotateCcw, AlertTriangle } from "lucide-react";
 import { suggestedQuestions } from "@/lib/mock";
 import { ModelSwitch } from "@/components/model-switch";
 import { cn } from "@/lib/utils";
 import type { EngineResult } from "./types";
 import { AnswerView } from "./answer-view";
+import { classifyAskError } from "./answer-helpers";
 import {
   StatusTiles,
   RoutingDecision,
@@ -35,8 +36,13 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(initialSessionId ?? null);
   const [error, setError] = useState<string | null>(null);
+  // The question that just failed (or was nothing) — lets the error card offer a one-click
+  // Retry that re-posts the SAME question through the normal ask flow (same session/history).
+  const [failedQuestion, setFailedQuestion] = useState<string | null>(null);
   const [resuming, setResuming] = useState<boolean>(!!initialSessionId);
   const threadEndRef = useRef<HTMLDivElement>(null);
+  // Per-request AbortController so a Stop button can cancel the in-flight /api/ask fetch.
+  const abortRef = useRef<AbortController | null>(null);
 
   // Warm the document embedder on mount (avoids cold-start on the first question).
   useEffect(() => {
@@ -108,7 +114,11 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
     if (!query || loading) return;
     setLoading(true);
     setError(null);
+    setFailedQuestion(null);
     setTab("workspace");
+    // Fresh AbortController for this turn so Stop can cancel exactly this fetch.
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       // FOLLOW-UP: send the conversation's session_id (so this turn logs into the same
       // thread) AND the prior turns as history (so the engine resolves references like
@@ -119,9 +129,23 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: query, session_id: sessionId, history }),
+        signal: controller.signal,
       });
+      // Check res.ok BEFORE parsing: a gateway/HTML error (502/504, Vercel error page)
+      // isn't JSON, so res.json() would throw "Unexpected token <". Read the body
+      // defensively and surface a friendly, actionable line instead.
+      if (!res.ok) {
+        let serverMsg = "";
+        try {
+          const errBody = await res.json();
+          serverMsg = typeof errBody?.error === "string" ? errBody.error : "";
+        } catch {
+          // non-JSON error body (HTML gateway page) — fall back to status text.
+          serverMsg = `${res.status} ${res.statusText}`.trim();
+        }
+        throw new Error(serverMsg || `request failed (${res.status})`);
+      }
       const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? "request failed");
       // Store the session_id the server assigned (or echoed) so every follow-up stays
       // in the same conversation.
       if (typeof data.session_id === "string" && data.session_id) {
@@ -130,19 +154,35 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
       setTurns((prev) => [...prev, { question: query, result: data as EngineResult }]);
       setQuestion("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "request failed");
+      // An abort is a deliberate CANCEL, not an error: restore the input, show nothing.
+      if (e instanceof DOMException && e.name === "AbortError") {
+        setQuestion(query);
+      } else {
+        // A failed turn renders as a calm error card WITH a Retry button — it does not vanish.
+        setError(classifyAskError(e));
+        setFailedQuestion(query);
+      }
     } finally {
+      abortRef.current = null;
       setLoading(false);
     }
+  }
+
+  // STOP: abort the in-flight ask. The catch above treats the abort as a cancel (restores
+  // the input), so this is non-destructive — the user just stopped waiting.
+  function stop() {
+    abortRef.current?.abort();
   }
 
   // NEW CHAT: clear the thread + the session so the next question starts a fresh
   // conversation (the server will mint a new session_id on that first turn).
   function newChat() {
+    abortRef.current?.abort();
     setTurns([]);
     setSessionId(null);
     setQuestion("");
     setError(null);
+    setFailedQuestion(null);
     setTab("workspace");
   }
 
@@ -241,7 +281,7 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
                 the full pipeline trace for that SAME turn. */}
             <div className="space-y-3">
               <StatusTiles result={t.result} />
-              {tab === "workspace" && <AnswerView result={t.result} />}
+              {tab === "workspace" && <AnswerView result={t.result} onRetry={ask} />}
               {tab === "inspector" && (
                 <div className="space-y-3" data-testid="inspector-view">
                   <RoutingDecision result={t.result} />
@@ -253,7 +293,7 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
                       Answer (full text)
                     </summary>
                     <div className="mt-3">
-                      <AnswerView result={t.result} />
+                      <AnswerView result={t.result} onRetry={ask} />
                     </div>
                   </details>
                 </div>
@@ -278,10 +318,26 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
           </div>
         )}
 
-        {/* error */}
+        {/* error — a calm card that stays in the thread and offers a one-click Retry. */}
         {error && (
-          <div className="rounded-2xl border border-high/30 bg-high-soft px-4 py-3 text-sm text-high" data-testid="ask-error">
-            {error}
+          <div
+            className="flex flex-wrap items-center gap-3 rounded-2xl border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"
+            data-testid="ask-error"
+          >
+            <AlertTriangle className="size-4 shrink-0" />
+            <span className="flex-1">{error}</span>
+            {failedQuestion && (
+              <button
+                type="button"
+                onClick={() => ask(failedQuestion)}
+                disabled={loading}
+                data-testid="retry-failed"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-warn/40 bg-surface px-2.5 py-1 text-[12px] font-semibold text-warn transition-colors hover:bg-warn-soft disabled:opacity-40"
+              >
+                <RotateCcw className="size-3.5" />
+                Retry
+              </button>
+            )}
           </div>
         )}
 
@@ -313,13 +369,28 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
             aria-label={hasThread ? "Ask a follow-up" : "Ask a question"}
             className="flex-1 resize-none bg-transparent text-sm text-ink placeholder:text-faint focus:outline-none"
           />
-          <button
-            type="submit"
-            disabled={loading || !question.trim()}
-            className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent text-accent-fg transition-colors hover:bg-accent-strong disabled:opacity-40"
-          >
-            {loading ? <Loader2 className="size-4 animate-spin" /> : <ArrowUp className="size-4" />}
-          </button>
+          {loading ? (
+            // While a turn is in flight, the action becomes STOP — it aborts the fetch
+            // (treated as a cancel: the input is restored, no error card).
+            <button
+              type="button"
+              onClick={stop}
+              data-testid="stop-ask"
+              title="Stop generating"
+              className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-line bg-surface text-subtle transition-colors hover:border-accent-ring hover:text-ink"
+            >
+              <Square className="size-3.5 fill-current" />
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={!question.trim()}
+              data-testid="send-ask"
+              className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent text-accent-fg transition-colors hover:bg-accent-strong disabled:opacity-40"
+            >
+              <ArrowUp className="size-4" />
+            </button>
+          )}
         </div>
         <p className="mt-1.5 px-1 text-[11px] text-faint">
           Press Enter to send · Shift+Enter for a new line{hasThread ? " · follow-ups use the whole conversation" : ""}

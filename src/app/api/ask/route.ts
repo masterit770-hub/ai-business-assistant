@@ -4,6 +4,7 @@ import { getCurrentUser } from "@/lib/supabase/auth";
 import { answerQuestion } from "@/lib/engine/answer";
 import { backendConfigured } from "@/lib/engine/llm";
 import { logAsk } from "@/lib/engine/ask-history";
+import { friendlyAskError } from "@/lib/engine/error-message";
 
 // Consolidated single app: the retrieval/answer engine runs IN-PROCESS here (no
 // separate engine service, no ENGINE_URL proxy hop). The polished Nucleus UI calls
@@ -82,9 +83,11 @@ export async function POST(req: Request) {
     // Echo the session_id so the client keeps using it for the rest of the conversation.
     return NextResponse.json({ ...result, session_id: sessionId });
   } catch (e) {
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : "internal error" },
-      { status: 500 }
-    );
+    // Keep the REAL detail server-side only (provider/model/status/body that chatCloud
+    // throws) — it's diagnostic, but a raw provider blob must never reach the user. The
+    // client receives a friendly, actionable line classified from the known failure
+    // shapes (rate-limit / bad key / timeout / generic).
+    console.error("[api/ask] generation failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ error: friendlyAskError(e) }, { status: 500 });
   }
 }

@@ -1,12 +1,16 @@
 import { NextResponse } from "next/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { requireAdmin } from "@/lib/supabase/auth";
+import { resolveAppOrigin, inviteRedirectUrl, buildInviteResult } from "@/lib/account/invite";
 
 // Admin Users API — REAL Supabase users via the admin API. ADMIN-GATED: the
 // caller must have role 'admin' (and not be disabled); a plain user gets 403.
 //   GET  → list users (id, email, role, status, created, last sign-in)
 //   POST → { id, action: "deactivate" | "reactivate" } bans/un-bans the user
 //          { action: "create", email, password }        creates an account
+//                → returns { invite: { email, inviteLink, tempPassword } } so the
+//                  admin has a usable link (+ password fallback) to hand the teammate
+//          { action: "invite", email }   re-mints an invite link for an existing user
 //          { id, action: "setRole", role: "user"|"admin" } promote/demote
 //
 // "Kick out" is enforced on two layers so it's immediate AND durable:
@@ -24,6 +28,31 @@ type AdminUser = {
 
 function isBanned(u: AdminUser): boolean {
   return Boolean(u.banned_until && new Date(u.banned_until).getTime() > Date.now());
+}
+
+// Mint a usable invite link for an existing, already-confirmed account using the
+// Supabase admin API (service role). We use the 'recovery' link type: it works on
+// a user that already exists (our create path pre-confirms them), and clicking it
+// lets the teammate set their OWN password before they're in. Returns the link, or
+// null if the project/SDK can't mint one — the caller always still has the temp
+// password as a guaranteed fallback, so the admin is never left with nothing.
+// Never logs the link (it grants account access).
+async function mintInviteLink(
+  admin: ReturnType<typeof createAdminClient>,
+  email: string,
+  redirectTo: string | undefined
+): Promise<string | null> {
+  try {
+    const { data, error } = await admin.auth.admin.generateLink({
+      type: "recovery",
+      email,
+      ...(redirectTo ? { options: { redirectTo } } : {}),
+    });
+    if (error) return null;
+    return data?.properties?.action_link ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export async function GET() {
@@ -88,7 +117,32 @@ export async function POST(req: Request) {
       email_confirm: true,
     });
     if (error) return NextResponse.json({ error: error.message }, { status: 400 });
-    return NextResponse.json({ ok: true, id: data.user?.id, status: "active" });
+
+    // Onboarding deliverable: give the admin a link the teammate can click to set
+    // their own password, plus the temp password as a guaranteed fallback. If
+    // Supabase SMTP is configured the recovery link is also emailed automatically;
+    // we never depend on that — the returned link/credentials is the real handoff.
+    const origin = resolveAppOrigin(req);
+    const inviteLink = await mintInviteLink(admin, email, inviteRedirectUrl(origin));
+    const invite = buildInviteResult({ email, inviteLink, tempPassword: password });
+    return NextResponse.json({ ok: true, id: data.user?.id, status: "active", invite });
+  }
+
+  // ── re-mint an invite link for an existing account ────────────────────────────
+  if (action === "invite") {
+    const email = (body.email ?? "").toString().trim();
+    if (!email) {
+      return NextResponse.json({ error: "email is required" }, { status: 400 });
+    }
+    const origin = resolveAppOrigin(req);
+    const inviteLink = await mintInviteLink(admin, email, inviteRedirectUrl(origin));
+    if (!inviteLink) {
+      return NextResponse.json(
+        { error: "could not generate an invite link for this account" },
+        { status: 400 }
+      );
+    }
+    return NextResponse.json({ ok: true, email, inviteLink });
   }
 
   // ── promote / demote ──────────────────────────────────────────────────────
@@ -96,6 +150,14 @@ export async function POST(req: Request) {
     const role = (body.role ?? "").toString();
     if (!id || !["user", "admin"].includes(role)) {
       return NextResponse.json({ error: "id and a valid role are required" }, { status: 400 });
+    }
+    // Don't let an admin demote THEMSELVES into lockout — they'd lose this very
+    // panel and couldn't undo it. Another admin can still demote them.
+    if (id === caller.id && role !== "admin") {
+      return NextResponse.json(
+        { error: "you cannot remove your own admin access" },
+        { status: 400 }
+      );
     }
     const { error } = await admin.from("profiles").update({ role }).eq("id", id);
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });
@@ -105,7 +167,7 @@ export async function POST(req: Request) {
   // ── kick out (deactivate) / restore (reactivate) ──────────────────────────
   if (action !== "deactivate" && action !== "reactivate") {
     return NextResponse.json(
-      { error: "action must be 'create', 'setRole', 'deactivate', or 'reactivate'" },
+      { error: "action must be 'create', 'invite', 'setRole', 'deactivate', or 'reactivate'" },
       { status: 400 }
     );
   }
