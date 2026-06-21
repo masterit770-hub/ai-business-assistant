@@ -29,6 +29,25 @@ test("golden A-HE: Hebrew honest refusal passes (Hebrew negation markers recogni
   assert.equal(r.ok, true, r.reasons.join("; "));
 });
 
+test("golden A-variant: 'does not contain any payment-status … fields' phrasing passes (the live-DeepSeek wording)", () => {
+  // The EXACT phrasing the cloud model (DeepSeek) produced live for the overdue
+  // question. The HONEST_REFUSAL regex previously required the word "no" ADJACENT to
+  // the field name ("no payment-status field"), so "does not contain ANY payment-
+  // status … fields" slipped through Rule 2b and a correct, honest refusal was wrongly
+  // REJECTED — which then flipped the marquee trust-demo answer to a generic general
+  // reply, DROPPING the deterministic $40,597.00 figure. The widened marker recognizes
+  // the "does not contain / has no / there is no … field" family.
+  const a = `The maintenance data does not contain any payment-status, paid/unpaid, due-date, or service-suspension fields. The table only includes columns for Vendor, Invoice, Labor Cost, Parts Cost, Total Cost, and Completion Date. The vendors are providers the school pays, not customers who owe. Total maintenance spend is $40,597.00 across 750 tickets [S:maintenance#5].`;
+  const r = validateNoFabrication(a);
+  assert.equal(r.ok, true, r.reasons.join("; "));
+});
+
+test("golden A-variant: 'there is no due-date field' / 'cannot determine overdue' passes", () => {
+  const a = `There is no due-date field in this data, so I cannot determine which accounts are overdue. Total maintenance spend is $40,597.00 across 750 tickets [S:maintenance#5].`;
+  const r = validateNoFabrication(a);
+  assert.equal(r.ok, true, r.reasons.join("; "));
+});
+
 // ── TOYS / fabrications MUST fail ───────────────────────────────────────────
 
 test("toy: fabricated overdue list (the catastrophic failure)", () => {

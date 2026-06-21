@@ -410,21 +410,34 @@ async function runAnswerPipeline(
   );
   tel.generationMs += now() - genStart;
   tel.usages.push(grounded.usage);
-  let answer = grounded.text;
 
-  // 4a. GENERAL-KNOWLEDGE FALLBACK (the bundled-corpus edge). The LOCAL vector index
-  // ALWAYS returns its top-k bundled (Carter) chunks, even for a question those docs
-  // have nothing to do with (e.g. "What is the capital of Australia?"). So
-  // `hasEvidence` above can be true on chunk count alone while the retrieved chunks
-  // do NOT actually answer the question — and grounded generation then emits the
-  // "are not available in the provided documents" refusal the client asked us to
-  // stop. We detect that precisely: a grounded answer that cites NOTHING and reads as
-  // a not-available refusal means the retrieved evidence did not in fact answer the
-  // question → answer from general knowledge instead. This is tightly scoped and
-  // CANNOT weaken a real grounded answer: every legitimate grounded reply (the Carter
-  // case file, contracts, the maintenance schema-refusal with its row-cited figures
-  // block) carries at least one citation token, so it never enters this branch.
-  if (isUncitedRefusal(answer)) {
+  // 4a. THE MODEL'S OWN GROUNDED-VS-GENERAL DECISION. The grounded prompt instructs
+  // the model to BEGIN its reply with exactly one flag line — `SOURCE: documents`
+  // (it answered from the retrieved evidence, with citations) or `SOURCE: general`
+  // (the retrieved evidence does NOT contain the answer, so it can't ground it). We
+  // parse that flag, STRIP it from the user-visible answer, and ROUTE on the model's
+  // decision — no regex guessing at the prose. If the model omits the flag we default
+  // to `documents` so a real grounded answer is never lost.
+  const { flag, text: strippedAnswer } = parseSourceFlag(grounded.text);
+  let answer = strippedAnswer;
+
+  // DETERMINISTIC-GROUNDED TURNS override a `general` flag. A STRUCTURED (SQL) turn that
+  // retrieved verified rows — maintenance-spend OR contracts — is, BY ENGINE DESIGN, a
+  // grounded turn: the engine deterministically appends a verified, row-cited figures
+  // block (the $40,597.00 maintenance pivot, or each contract's real value/expiry) and
+  // runs the per-feature no-fabrication gate. A modest model (DeepSeek) can still flag
+  // `general` on such a turn — misreading an "overdue" question as unanswerable, or
+  // answering a contracts-count question conversationally — which would DROP the
+  // deterministic figure. So we never honor a `general` flip on a structured-with-rows
+  // turn. (Document-only turns keep relying on the model's flag + the rescue below.)
+  const isDeterministicGroundedTurn =
+    (route.intents.some((i) => i.name === "maintenance_spend") && summaries.length > 0) ||
+    (route.intents.some((i) => i.name.startsWith("contracts_")) && evRows.length > 0);
+  const effectiveFlag = isDeterministicGroundedTurn ? "documents" : flag;
+
+  if (effectiveFlag === "general") {
+    // The MODEL decided the retrieved evidence doesn't actually contain the answer →
+    // answer from general knowledge instead of surfacing a forced "not in the docs".
     const g2Start = now();
     const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY);
     tel.generationMs += now() - g2Start;
@@ -435,8 +448,9 @@ async function runAnswerPipeline(
       answer: generalAnswer,
       mode: "general",
       grounded: false,
-      // PRESERVE the retrieved docs — never discard good retrieval because the model's
-      // wording tripped a regex. The Inspector still shows what the search found.
+      // PRESERVE the retrieved docs — retrieval is retrieval; the Inspector still
+      // shows what the search found even when the model answered from general
+      // knowledge. (Never return empty evidence on this path.)
       evidence: retrievedEvidence,
       validation: { ok: true, reasons: [] },
       inspector: buildInspector({
@@ -478,14 +492,9 @@ async function runAnswerPipeline(
     if (block) answer = `${answer.trim()}\n\n${block}`;
   }
 
-  // 5. VALIDATE — generic content-fidelity + the per-feature gate (contracts).
-  const validation = validateAnswer(answer, evidence);
-  const reasons = [...validation.reasons];
+  // 5. VALIDATE — generic content-fidelity + the per-feature gates. Extracted so the
+  // grounded RESCUE below can re-validate a regenerated answer with the same gates.
   const isContractTurn = route.intents.some((i) => i.name.startsWith("contracts_"));
-  if (isContractTurn) {
-    const cv = validateContractAnswer(answer);
-    reasons.push(...cv.reasons);
-  }
   // A case-file turn: documents only, no structured intents, AND the cited chunks
   // are the bundled CARTER documents. The case gate's stop-list (alimony / sole
   // custody / filing-date conflict) is specific to the Carter corpus, so it must
@@ -497,30 +506,88 @@ async function runAnswerPipeline(
     !route.sources.includes("structured") &&
     evChunks.length > 0 &&
     evChunks.every((c) => CARTER_DOCS.has(c.doc));
-  if (isCaseTurn) {
-    const cv = validateCaseAnswer(answer);
-    reasons.push(...cv.reasons);
-  }
   const isMaintenanceTurn = route.intents.some((i) => i.name === "maintenance_spend");
-  if (isMaintenanceTurn) {
-    const mv = validateNoFabrication(answer);
-    reasons.push(...mv.reasons);
+  const runGates = (text: string): string[] => {
+    const rs = [...validateAnswer(text, evidence).reasons];
+    if (isContractTurn) rs.push(...validateContractAnswer(text).reasons);
+    if (isCaseTurn) rs.push(...validateCaseAnswer(text).reasons);
+    if (isMaintenanceTurn) rs.push(...validateNoFabrication(text).reasons);
+    return rs;
+  };
+  let reasons = runGates(answer);
+  let validationOk = reasons.length === 0;
+
+  // ── GROUNDED RESCUE (the SOURCE-flag complement) ──────────────────────────
+  // The model flagged `documents` but its grounded answer FAILED a gate — the dominant
+  // real cause (observed live) is a NAMED-case question (Carter) where a modest model
+  // (DeepSeek) writes from prior knowledge (a famous unrelated "Carter" case) instead of
+  // the retrieved pages, tripping validateCaseAnswer's stop-list. Rather than dump that
+  // to a generic general answer (which drops the real, citable case facts), we RESCUE:
+  // ask the model the NARROW, reliable "is this evidence on-topic?" question; if YES,
+  // regenerate with the forced evidence-first grounded prompt (no flag re-decision — it
+  // reliably cites the real docs) and re-run the gates. If the regenerated answer now
+  // passes, keep it grounded. This is still a MODEL decision (the owner's requirement),
+  // on a clean surface, and it CANNOT rescue a genuinely off-topic question (Australia/
+  // alimony classify off-topic → no rescue → they stay general).
+  if (!validationOk && !isDeterministicGroundedTurn && (evRows.length > 0 || evChunks.length > 0)) {
+    const relStart = now();
+    const rel = await classifyEvidenceRelevance(question, evRows, evChunks, summaries);
+    tel.generationMs += now() - relStart;
+    tel.usages.push(rel.usage);
+    if (rel.onTopic) {
+      const forcedStart = now();
+      const forced = await generateGroundedForced(
+        question,
+        evRows,
+        evChunks,
+        summaries,
+        schemaContext,
+        TODAY,
+        stylePreamble
+      );
+      tel.generationMs += now() - forcedStart;
+      tel.usages.push(forced.usage);
+      let forcedAnswer = parseSourceFlag(forced.text).text; // tolerate a stray flag line
+      // Re-append the deterministic contract figures block (the maintenance block is
+      // handled by the deterministic-turn guard, never reached here).
+      if (isContractTurn && evRows.length > 0) {
+        const block = buildContractFiguresBlock(evRows);
+        if (block) forcedAnswer = `${forcedAnswer.trim()}\n\n${block}`;
+      }
+      const forcedReasons = runGates(forcedAnswer);
+      // Adopt the rescued answer only if it now PASSES the gates and actually cites the
+      // evidence — proving it grounded in the real docs, not memory.
+      if (forcedReasons.length === 0 && extractCitationTokens(forcedAnswer).length > 0) {
+        answer = forcedAnswer;
+        reasons = forcedReasons;
+        validationOk = true;
+      }
+    }
   }
 
-  const validationOk = reasons.length === 0;
-
-  // ── GROUNDED → GENERAL FALLBACK (the broadened fix) ───────────────────────
-  // The grounded answer above is a refusal/non-answer EVEN IF it cited docs (the
-  // alimony "I cannot answer … not stated in the case file [P:carter#…]" case), OR a
-  // per-feature gate (e.g. validateCaseAnswer's alimony stop-list) REJECTED it. In
-  // either case surfacing it shows the user a refusal/red error. Instead, re-answer
-  // via the general-knowledge path (grounded=false, "not from your uploaded documents"
-  // label). The HARD EXCEPTION inside shouldFallbackToGeneral keeps every real
-  // grounded reply — including the DESIGNED maintenance honest-refusal, which PASSES
-  // validation and carries its verified $40,597 figure + [S:maintenance#…] tokens —
-  // grounded and untouched.
+  // ── SECONDARY SAFETY NET: validation REJECTION → general ──────────────────
+  // The MODEL already decided documents-vs-general above (the SOURCE flag); this is a
+  // narrow secondary net for the case where the model flagged `documents` but its
+  // grounded answer FAILED a validation gate (e.g. validateCaseAnswer's alimony
+  // stop-list, or a bad/unresolvable citation). Surfacing a rejected grounded answer
+  // shows the user a red error, so we re-answer via the general path instead — while
+  // PRESERVING the retrieved evidence. The HARD EXCEPTION inside shouldFallbackToGeneral
+  // keeps every validation-PASSING grounded reply (the contracts answer, the case-file
+  // answer, the DESIGNED maintenance honest-refusal with its verified $40,597 figure +
+  // [S:maintenance#…] tokens) grounded and untouched.
   const hasVerifiedAggregate = aggregates.length > 0;
-  if (shouldFallbackToGeneral({ answer, validationOk, hasVerifiedAggregate })) {
+  // Defense in depth for the marquee maintenance trust-demo: a maintenance-spend turn
+  // is a DESIGNED grounded honest-refusal — the engine has appended the verified, row-
+  // cited $40,597.00 figures block, so flipping it to a generic "I can't access your
+  // database" general answer would silently DROP that deterministic figure. Never let
+  // the secondary net do that on this designed turn; the no-fabrication gate's reasons
+  // are still recorded in `validation` for transparency. (A genuinely fabricated
+  // overdue list is already blocked by the deterministic figures block + the gate; the
+  // honest, figure-bearing answer is what stays.)
+  if (
+    !isDeterministicGroundedTurn &&
+    shouldFallbackToGeneral({ answer, validationOk, hasVerifiedAggregate })
+  ) {
     // `stylePreamble` (the persona) is already fetched above — reuse it.
     const g3Start = now();
     const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY);
@@ -583,20 +650,48 @@ async function runAnswerPipeline(
   };
 }
 
-// A grounded answer that (a) carries NO citation token at all and (b) reads as a
-// "the evidence doesn't contain this" refusal. This is the signal that the
-// always-returned bundled chunks did not actually answer the question, so we should
-// answer from general knowledge instead of surfacing the refusal. The citation-token
-// guard is the safety: any real grounded answer cites something and is left alone.
-// (The maintenance schema-refusal is a structured turn that gets a row-cited figures
-// block appended, so it carries [S:maintenance#…] tokens and never matches here.)
+// ── SOURCE FLAG PARSING (the model's own grounded-vs-general decision) ───────────
+// The grounded model is instructed to BEGIN its reply with exactly one flag line:
+//   SOURCE: documents  — it answered from the retrieved evidence (with citations)
+//   SOURCE: general    — the retrieved evidence does NOT contain the answer
+// We parse that first line and STRIP it so the user never sees the raw flag, then
+// route on the model's decision. Robust to leading blank lines and to the model
+// wrapping the flag in markdown emphasis (e.g. **SOURCE: general**). If no flag is
+// present we default to `documents` — never lose a real grounded answer.
+//
+// Pure + exported so the parse/strip contract is unit-tested without an LLM.
+export function parseSourceFlag(raw: string): {
+  flag: "documents" | "general";
+  text: string;
+} {
+  const lines = raw.split("\n");
+  // Skip leading blank lines to find the first non-empty line (the flag line).
+  let i = 0;
+  while (i < lines.length && lines[i].trim() === "") i++;
+  const firstLine = i < lines.length ? lines[i] : "";
+  // Tolerate surrounding markdown/punctuation: **SOURCE: general**, `SOURCE: general`,
+  // "Source: Documents.", etc. Anchored to the start of the (trimmed) first line.
+  const m = firstLine
+    .trim()
+    .replace(/^[*`_#>\s-]+/, "")
+    .match(/^source\s*:\s*(documents|general)\b/i);
+  if (!m) {
+    // No recognizable flag → keep the whole answer, default to documents.
+    return { flag: "documents", text: raw.trim() };
+  }
+  const flag = m[1].toLowerCase() === "general" ? "general" : "documents";
+  // Drop the flag line (line i) and any blank lines that immediately followed it,
+  // then keep the rest of the answer verbatim.
+  const rest = lines.slice(i + 1);
+  while (rest.length > 0 && rest[0].trim() === "") rest.shift();
+  return { flag, text: rest.join("\n").trim() };
+}
+
+// A refusal/non-answer detector used ONLY by the secondary validation-rejection net
+// below (shouldFallbackToGeneral). The model's SOURCE flag is the PRIMARY decision;
+// this regex no longer routes grounded-vs-general on its own.
 const REFUSAL_RE =
   /\b(not (present|available|found|stated|provided|included|specified|mentioned|contained)|are not available|is not available|isn't available|aren't available|do(es)? not (contain|include|provide|state|mention)|don't (contain|include|provide)|no (matching|relevant|such) (data|records?|information|documents?|evidence)|cannot (find|answer)|can't (find|answer)|could not find|couldn't find|unable to (find|answer))\b/i;
-
-function isUncitedRefusal(answer: string): boolean {
-  if (extractCitationTokens(answer).length > 0) return false; // any citation → real grounded answer
-  return REFUSAL_RE.test(answer);
-}
 
 // A BROADER refusal/non-answer detector than REFUSAL_RE above — it ALSO matches the
 // phrasing the grounded model uses when it declines a question whose answer the
@@ -1061,6 +1156,54 @@ function diversifyByDoc(chunks: DocChunk[], limit: number): DocChunk[] {
   return chunks.filter((c) => picked.has(c)).slice(0, limit);
 }
 
+// FOCUSED RELEVANCE CLASSIFIER (the rescue decider). A narrow binary call: does the
+// retrieved evidence actually concern the SUBJECT of the question? This is far more
+// reliable than the combined route-and-answer call — a modest model answers it
+// correctly and stably (verified: a named-case file → on-topic; the bundled chunks vs
+// "capital of Australia" or "AZ alimony strategy" → off-topic). It is a MODEL decision
+// (the owner's requirement), just on a clean surface; it is NOT a prose-refusal regex.
+// Returns onTopic + the call's usage (so cost/telemetry stays honest).
+async function classifyEvidenceRelevance(
+  question: string,
+  rows: { token: string; table: string; data: Record<string, unknown> }[],
+  chunks: { token: string; doc: string; page: number; text: string }[],
+  summaries: IntentSummary[]
+): Promise<{ onTopic: boolean; usage: ChatUsage }> {
+  const docEvidence =
+    chunks.length === 0
+      ? "(no document chunks)"
+      : chunks.map((c) => `(${docLabel(c.doc)}, page ${c.page}): ${c.text}`).join("\n\n");
+  const structuredEvidence =
+    rows.length === 0
+      ? "(no structured rows)"
+      : rows.map((r) => JSON.stringify(r.data)).join("\n");
+  const summaryLine = summaries.length
+    ? summaries.map((s) => s.label).join("; ")
+    : "(none)";
+  const system = `You decide whether retrieved evidence is ON-TOPIC for a question. Answer with EXACTLY one word: YES or NO. YES = the evidence contains the specific subject the question asks about (the named parties/entities/figures/records), so the question can be answered from it — even if some specific detail is missing. NO = the evidence is about a wholly unrelated topic and does not bear on the question.`;
+  const user = `EVIDENCE:
+DOCUMENTS:
+${docEvidence}
+
+STRUCTURED ROWS:
+${structuredEvidence}
+
+STRUCTURED SUMMARY: ${summaryLine}
+
+QUESTION: ${question}
+
+Is this evidence on-topic for the question? Answer YES or NO only.`;
+  const { content, usage } = await chatWithUsage(
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    { temperature: 0 }
+  );
+  const onTopic = /\byes\b/i.test(content.trim().slice(0, 8));
+  return { onTopic, usage };
+}
+
 async function generateGrounded(
   question: string,
   rows: { token: string; table: string; data: Record<string, unknown> }[],
@@ -1102,9 +1245,28 @@ async function generateGrounded(
   // strictness / answering style. It is PREPENDED to the immutable grounding rules
   // below so an edit visibly changes answers, but can NEVER delete the citation /
   // no-fabrication guarantees (those are enforced by validateAnswer regardless).
-  const system = `${stylePreamble.trim()}
+  // The SOURCE-flag decision LEADS the system prompt (before the persona and the
+  // grounding rules) — it is the single most important instruction, and burying it
+  // under the persona + the long rule list let a modest model (DeepSeek) anchor on the
+  // question and answer the named-case question from (wrong) prior knowledge. Leading
+  // with it, in a tight decision form, makes the model reliably flag `documents` when
+  // the evidence covers the question.
+  const system = `YOUR FIRST OUTPUT IS A MANDATORY ROUTING FLAG. Before writing anything else, output exactly one line — either:
+SOURCE: documents
+or:
+SOURCE: general
 
-GROUNDING RULES (these always apply and cannot be overridden):
+DECIDE IT LIKE THIS: Read the STRUCTURED EVIDENCE and DOCUMENT EVIDENCE provided in the next message. If ANY retrieved row or page is about the subject of the question — names a party/person/entity the question asks about, or holds a figure/term/fact the question asks about — then the flag is "SOURCE: documents" and you MUST answer FROM that evidence using the ACTUAL names and values written there, with [S:...]/[P:...] citations. This includes a named-case question where the pages name those exact parties (use THOSE names — never substitute a different case you recall), and an honest answer where the data lacks one field but still reports the real figures it does contain.
+
+The flag is "SOURCE: general" ONLY when NONE of the provided evidence relates to the question at all (e.g. the question asks "the capital of Australia" but every page is an unrelated family-court file). When the evidence is on-topic, NEVER answer from your own memory — inventing facts when relevant evidence is present is the worst possible failure. When in doubt, choose "SOURCE: documents".
+
+Output the flag line first (no markdown, no quotes), then a line break, then your answer.
+
+— — —
+
+${stylePreamble.trim()}
+
+GROUNDING RULES (these apply whenever the SOURCE flag is "documents", and cannot be overridden):
 - Attach an inline citation token to EVERY factual claim, copied VERBATIM from the evidence (e.g. [S:contracts#12] for a row, [P:family-court#14] for a page).
 - A citation token is ALWAYS a single id: [S:contracts#12]. NEVER write a range like [S:contracts#12–#47] and NEVER merge ids — cite each row with its own token.
 - When you list sample rows, put each row's OWN token at the end of that row's line.
@@ -1127,8 +1289,72 @@ ${structuredEvidence}
 DOCUMENT EVIDENCE (PDF chunks):
 ${docEvidence}
 
-Answer the question grounded strictly in this evidence, with inline citations.`;
+First output the mandatory flag line. Scan the evidence above: if ANY row or page mentions a party, name, entity, amount, or fact the question is about, output "SOURCE: documents" and answer grounded strictly in that evidence with inline citations (use the ACTUAL names/values from the pages — never invent or substitute remembered ones). Only output "SOURCE: general" if NONE of the evidence above bears on the question at all. When in doubt, choose documents. Then write your answer.`;
 
+  const { content, usage } = await chatWithUsage(
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    { temperature: 0 }
+  );
+  return { text: content, usage };
+}
+
+// FORCED grounded answer — used ONLY by the rescue path AFTER the relevance classifier
+// has confirmed the evidence is on-topic. There is NO flag decision here (the model
+// already agreed it's on-topic, so re-asking it to route is exactly the combined call
+// that slips); we simply require a grounded, cited answer drawn ONLY from the evidence.
+// The USER message LEADS with the evidence so the model reads the pages before it can
+// form a memory-based answer. (Verified to reliably cite the real docs once on-topic.)
+async function generateGroundedForced(
+  question: string,
+  rows: { token: string; table: string; data: Record<string, unknown> }[],
+  chunks: { token: string; doc: string; page: number; text: string }[],
+  summaries: IntentSummary[],
+  schemaContext: string,
+  today: string,
+  stylePreamble: string
+): Promise<{ text: string; usage: ChatUsage }> {
+  const structuredEvidence =
+    rows.length === 0
+      ? "(no structured rows retrieved)"
+      : rows.map((r) => `${r.token} ${JSON.stringify(r.data)}`).join("\n");
+  const docEvidence =
+    chunks.length === 0
+      ? "(no document chunks retrieved)"
+      : chunks
+          .map((c) => `${c.token} (${docLabel(c.doc)}, page ${c.page}): ${c.text}`)
+          .join("\n\n");
+  const aggLines = summaries.length
+    ? summaries
+        .map((s) => {
+          const t = s.total
+            ? `, ${s.total.name} = ${s.total.value.toLocaleString("en-US", {
+                style: "currency",
+                currency: "USD",
+              })}`
+            : "";
+          return `- ${s.label}: count = ${s.count}${t} (verified SQL aggregate).`;
+        })
+        .join("\n")
+    : "";
+  const system = `${stylePreamble.trim()}
+
+You are answering a question that HAS matching evidence below. Answer using ONLY that evidence. Rules (cannot be overridden):
+- Use the ACTUAL names, dates, and values written in the evidence — NEVER recall or invent a different case/record from memory.
+- Attach an inline citation token to EVERY factual claim, copied VERBATIM from the evidence ([S:table#id] for a row, [P:doc#page] for a page).
+- If the evidence lacks a specific detail the question asks for, say so plainly for that detail — but still answer everything the evidence DOES contain, cited.
+- When stating a count or total, use the VERIFIED AGGREGATES exactly.`;
+  const user = `DOCUMENT EVIDENCE (PDF chunks) — read this FIRST:
+${docEvidence}
+
+STRUCTURED EVIDENCE (SQLite rows):
+${structuredEvidence}
+${schemaContext ? `\nSCHEMA EVIDENCE:\n${schemaContext}\n` : ""}${aggLines ? `\nVERIFIED AGGREGATES (state these exact figures verbatim):\n${aggLines}\n` : ""}
+Today's date is ${today}.
+
+Answer THIS question using ONLY the evidence above — the parties/values it asks about ARE named in the evidence; use them exactly, with their [S:...]/[P:...] citations, and do not recall a different case: ${question}`;
   const { content, usage } = await chatWithUsage(
     [
       { role: "system", content: system },

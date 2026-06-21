@@ -2,15 +2,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { shouldFallbackToGeneral } from "../../src/lib/engine/answer.ts";
 
-// THE BUG (client complaint): a grounded REFUSAL that CITES the bundled Carter docs
-// and is REJECTED by validateAnswer (validateCaseAnswer's alimony stop-list) was
-// surfaced to the user as a red error instead of falling back to a general-knowledge
-// answer. dd85eb2's fallback only fired for an UNCITED refusal, so this cited refusal
-// slipped through. shouldFallbackToGeneral() broadens the fallback: it fires when
-// validation REJECTED the grounded answer, OR when the answer is a genuine refusal/
-// non-answer with no real grounded content (even if it cited docs) — while a
-// validation-PASSING answer that carries citations / a verified aggregate figure
-// (the designed maintenance honest-refusal, contracts, case-file) STAYS grounded.
+// NOTE (post-SOURCE-flag refactor): the PRIMARY grounded-vs-general decision is now
+// the MODEL's own explicit `SOURCE:` flag (see parseSourceFlag + source-flag.test.mts),
+// which replaced the old isUncitedRefusal regex routing branch entirely.
+// On a `documents` answer that FAILS a validation gate, the engine first tries a
+// grounded RESCUE (a narrow "is this evidence on-topic?" classification + a forced
+// evidence-first regeneration — this recovers the named-case golden, e.g. Carter, that
+// a modest model occasionally answers from memory). shouldFallbackToGeneral() is the
+// LAST-RESORT net for what the rescue can't fix (a genuinely off-topic question, or a
+// rejection that re-grounding doesn't resolve): we re-answer via general instead of
+// showing the user a red error — while a validation-PASSING answer that carries
+// citations / a verified aggregate figure (the designed maintenance honest-refusal,
+// contracts, case-file) STAYS grounded. These tests pin that last-resort net.
 //
 // These tests drive the real branching with crafted answer strings + the validation
 // outcome — no LLM, fully deterministic.
