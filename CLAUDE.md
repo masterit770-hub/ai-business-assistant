@@ -6,17 +6,19 @@ Nucleus is an **AI Business Assistant** delivered as a real Upwork contract to a
 The client's spec was partly **generated with ChatGPT and she doesn't understand the technical clauses**. Deliver what she *functionally* wants; **drop the boilerplate plumbing she named but doesn't need**:
 - **DROP:** Docker, API/CRM connectors, local-LLM/Ollama, grading/observability dashboards, no-vendor-lock-in ceremony.
 - **DELIVER (functional scope):** upload (PDF / Excel / CSV / scanned) → ask → **cited answers**; hybrid **SQL + document** retrieval with dual citations; **Hebrew** Q&A; real **users / auth / kick-out**; **per-user document isolation**; **urgency** flagging; **editable prompts**.
-- Litmus before building any "requirement": *does the managed API (Gemini) already do this?* If yes, it's a verification step, not a build.
+- Litmus before building any "requirement": *does the existing engine (the self-hosted hybrid RAG + text-to-SQL) already do this?* If yes, it's a verification step, not a build.
 
-## Document lane = Gemini File Search (non-negotiable)
-- The document RAG lane uses **Gemini File Search** (Google's managed ingest/chunk/embed/retrieve-with-citations). This is the client's explicit, repeated choice. **Do not** re-litigate it or swap in a self-hosted / pgvector path.
-- **Gemini is multimodal → it reads scanned/image PDFs natively.** **No separate OCR / Tesseract pipeline.** "Scanned-document support" = push a scan through Gemini and confirm a cited answer.
-- Structured data (contracts/maintenance CSVs) flows through the engine's **SQL lane**; `.xlsx` = light convert to that lane, not an OCR-style build.
+## Document lane = self-hosted Supabase pgvector HYBRID (replaced Gemini)
+- **HISTORY:** the doc lane used to be Gemini File Search. Its free key ran out of quota and the client said "build everything ourselves on Supabase." **Gemini + GCP are now fully removed.** Do not reintroduce them.
+- The document RAG lane is now **self-hosted HYBRID search on Supabase Postgres + pgvector**: dense cosine × BM25 lexical → Reciprocal Rank Fusion (RRF, k=60). Embeddings are **local multilingual-e5** (384-dim). Bundled docs use an in-process hybrid over `data-index/`; uploaded docs persist to `doc_chunks` (migration 006) and retrieve via the `hybrid_match` RPC, owner-scoped (per-user isolation). The inspector shows real dense/BM25/RRF.
+- **Scanned/image PDFs → OCR (Tesseract.js, best-effort)** in `/api/ingest` only. The text layer is the contract; OCR is enrichment that never breaks ingest.
+- Structured data (contracts/maintenance CSVs) flows through the engine's **text-to-SQL lane**; `.xlsx` = light convert to that lane.
+- **Demo data is gated:** the bundled sample corpus is shown/retrieved only for `profiles.is_demo` accounts (migration 009). A real client user starts with a clean bucket. The demo accounts are the admin + the regular-user login in `.secrets/demo-accounts.txt`.
 
 ## Keys & models
-- Working **free-tier** Gemini key lives in `.secrets/gemini.env` (gitignored — **never print/commit**). It's on a **no-billing** GCP project (`future-haiku-481700-q6`), which is what grants the free tier; the billing-attached project 429s ("credits depleted").
-- Free tier **rate-limits** under bursts. `gemini-2.5-flash` is the reliable default.
-- **Anything that is the client's-side config — her own Gemini key, a paid key (to lift rate limits), a stronger model, her own cloud — goes in `docs/HANDOFF.md`. It is a handoff note, NOT a build blocker.**
+- The LLM is **provider-neutral via env**: `LLM_PROVIDER` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`. Three model modes: **Cloud** (default DeepSeek), **HIPAA** (Azure OpenAI, fails closed), **Local** (Ollama via the cloudflared tunnel). See `src/lib/engine/llm.ts` + `docs/HANDOFF.md`.
+- **There is NO Gemini/GCP key anymore.** `.secrets/gemini.env` is dead for this build. Supabase creds live in `.secrets/supabase.env` (gitignored — **never print/commit**).
+- **Anything that is the client's-side config — her own cloud key, a stronger model, her Azure deployment — goes in `docs/HANDOFF.md` / `docs/SETUP.md`. It is a handoff note, NOT a build blocker.**
 
 ## Discipline
 - **No mock passed off as done.** Verify every feature **live** before claiming it works — the polished-shell-over-mocks oversell is what broke trust here.

@@ -46,6 +46,7 @@ export async function GET() {
       label: string;
       urgency: "high" | "medium" | "low" | null;
       lang?: "en" | "he" | null;
+      pages?: number;
     }[];
     if (supabaseEnabled()) {
       const durable = await listUploadedDocs(scopeOwner);

@@ -63,6 +63,10 @@ export async function POST(req: Request) {
   const name = file.name || "upload";
   const lower = name.toLowerCase();
   const buf = new Uint8Array(await file.arrayBuffer());
+  // Keep a PRISTINE copy of the original bytes for storage BEFORE ingest runs: pdf.js
+  // (in ingestPdf) DETACHES the buffer it reads, which would leave storeOriginalFile
+  // with an emptied buffer (the bug that made uploaded PDFs un-downloadable).
+  const originalBytes = buf.slice();
 
   const isXlsx =
     lower.endsWith(".xlsx") ||
@@ -96,7 +100,7 @@ export async function POST(req: Request) {
     const docId = result.doc ?? result.table;
     let originalStored = false;
     if (docId) {
-      originalStored = await storeOriginalFile(buf, ownerId, docId, name);
+      originalStored = await storeOriginalFile(originalBytes, ownerId, docId, name);
     }
 
     const persistence =

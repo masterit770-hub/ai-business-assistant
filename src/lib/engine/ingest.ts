@@ -134,7 +134,7 @@ export async function ingestPdf(
   // Owner-tagged for per-user isolation. Fail-open (storeDocChunks returns 0 on any
   // error, never throws) so a Supabase blip doesn't fail an ingest that still
   // populated the in-memory store below.
-  const stored = await storeDocChunks(ownerId, doc, docLabel, storable);
+  const stored = await storeDocChunks(ownerId, doc, docLabel, storable, urgency);
 
   // Also register in the in-memory document store so the doc is query-able + listed
   // even when Supabase is off (dev/offline), and the router catalog/dashboard see it.

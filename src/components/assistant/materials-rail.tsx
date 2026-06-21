@@ -8,7 +8,7 @@ import { TableViewer } from "@/components/assistant/table-viewer";
 import type { Urgency } from "@/lib/mock";
 
 type DocLang = "en" | "he" | null;
-type DocMeta = { doc: string; label: string; urgency: Urgency | null; lang?: DocLang };
+type DocMeta = { doc: string; label: string; urgency: Urgency | null; lang?: DocLang; pages?: number };
 type BundledSource = {
   doc: string;
   label: string;
@@ -59,9 +59,15 @@ export function MaterialsRail() {
       // Probe each uploaded doc's original-file retrievability (FIX 3) so the rail only
       // offers a download for docs whose original is actually stored — never a dead 404.
       probeRetrievability(docs);
+      // ONE bucket → the dashboard "documents" stat counts EVERYTHING the assistant can
+      // answer from (uploads + the bundled sample corpus), not just uploads. (Urgency is
+      // an UPLOADED-doc badge — the bundled sample corpus isn't urgency-classified.)
       window.dispatchEvent(
         new CustomEvent("nucleus:docs", {
-          detail: { total: docs.length, high: docs.filter((x) => x.urgency === "high").length },
+          detail: {
+            total: docs.length + b.length,
+            high: docs.filter((x) => x.urgency === "high").length,
+          },
         })
       );
       window.dispatchEvent(new CustomEvent("nucleus:bundled", { detail: { count: b.length } }));
@@ -186,6 +192,15 @@ export function MaterialsRail() {
                 <SourceChip kind="document" />
                 <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{d.label}</span>
                 <LangChip lang={d.lang ?? labelLang(d.label)} />
+                {/* page-count detail, consistent with the bundled-doc rows */}
+                {typeof d.pages === "number" && d.pages > 0 && (
+                  <span
+                    data-testid={`doc-pages-${d.doc}`}
+                    className="shrink-0 text-[11px] text-faint"
+                  >
+                    PDF · {d.pages} page{d.pages === 1 ? "" : "s"}
+                  </span>
+                )}
                 {d.urgency && (
                   <span data-testid={`doc-urgency-${d.doc}`}>
                     <UrgencyBadge urgency={d.urgency} />

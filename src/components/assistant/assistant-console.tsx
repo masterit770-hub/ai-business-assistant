@@ -44,6 +44,10 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
   // Retry that re-posts the SAME question through the normal ask flow (same session/history).
   const [failedQuestion, setFailedQuestion] = useState<string | null>(null);
   const [resuming, setResuming] = useState<boolean>(!!initialSessionId);
+  // True when a resume was requested (?session=ID) but came back with zero turns — a
+  // deleted/unknown/foreign session id. We show an honest notice instead of silently
+  // rendering the generic new-chat empty state (which looks like a brand-new chat).
+  const [resumeEmpty, setResumeEmpty] = useState(false);
   const threadEndRef = useRef<HTMLDivElement>(null);
   // Per-request AbortController so a Stop button can cancel the in-flight /api/ask fetch.
   const abortRef = useRef<AbortController | null>(null);
@@ -103,6 +107,9 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
         );
         setTurns(loaded);
         setSessionId(initialSessionId);
+        // A resume that returns no turns = the session is gone, unknown, or not yours.
+        // Flag it so the UI says so rather than masquerading as a fresh conversation.
+        setResumeEmpty(loaded.length === 0);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : "failed to load conversation");
       } finally {
@@ -202,6 +209,7 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
     setQuestion("");
     setError(null);
     setFailedQuestion(null);
+    setResumeEmpty(false);
     setTab("workspace");
   }
 
@@ -282,8 +290,19 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
           </div>
         )}
 
-        {/* empty state (no turns yet, not resuming) */}
-        {!hasThread && !loading && !error && !resuming && (
+        {/* a resume that found nothing — say so honestly (don't look like a fresh chat) */}
+        {resumeEmpty && !hasThread && !loading && !resuming && (
+          <div
+            data-testid="resume-empty"
+            className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700"
+          >
+            This conversation couldn’t be found — it may have been deleted, or the link
+            isn’t yours. Start a new chat below, or pick another from History.
+          </div>
+        )}
+
+        {/* empty state (no turns yet, not resuming, not a failed resume) */}
+        {!hasThread && !loading && !error && !resuming && !resumeEmpty && (
           <EmptyState onPick={(q) => ask(q)} />
         )}
 

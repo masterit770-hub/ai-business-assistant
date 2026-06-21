@@ -68,7 +68,10 @@ export async function storeDocChunks(
   ownerId: string | undefined,
   docId: string,
   docLabel: string,
-  chunks: StorableChunk[]
+  chunks: StorableChunk[],
+  // The doc's LLM-classified urgency, stored on every chunk so the dashboard badge is
+  // DURABLE (survives a serverless cold start). Null when not classified.
+  urgency?: "high" | "medium" | "low" | null
 ): Promise<number> {
   if (!supabaseEnabled()) {
     console.warn(
@@ -93,6 +96,7 @@ export async function storeDocChunks(
       chunk_index: i,
       content: c.text,
       token: c.token,
+      urgency: urgency ?? null,
       embedding: toVectorLiteral(c.embedding),
     }));
     const { error } = await db.from("doc_chunks").insert(rows);
@@ -251,6 +255,7 @@ export type UploadedDocMeta = {
   label: string;
   urgency: "high" | "medium" | "low" | null;
   lang: DocLang;
+  pages: number; // distinct page count (for the "PDF · N pages" detail), 0 if unknown
 };
 
 /**
@@ -267,32 +272,50 @@ export async function listUploadedDocs(ownerId?: string): Promise<UploadedDocMet
   if (!supabaseEnabled()) return [];
   try {
     const db = admin();
-    // Pull `content` too so we can detect each doc's language from its REAL indexed
-    // text (honest), instead of guessing from the filename.
-    let q = db.from("doc_chunks").select("doc_id, doc_label, owner_id, content");
+    // Pull content (for language detection), page (for the page-count detail), and the
+    // durable urgency (the badge) so the rebuilt list is complete without the in-memory
+    // registry.
+    let q = db.from("doc_chunks").select("doc_id, doc_label, owner_id, content, page, urgency");
     if (ownerId) q = q.eq("owner_id", ownerId);
     const { data, error } = await q;
     if (error) {
       console.error("[pgvector-store] listUploadedDocs failed:", error.message);
       return [];
     }
-    const byDoc = new Map<string, { label: string }>();
+    const byDoc = new Map<
+      string,
+      { label: string; pages: Set<number>; urgency: "high" | "medium" | "low" | null }
+    >();
     // Accumulate a BOUNDED sample of each doc's text for language detection (a few KB
     // is plenty; avoids holding a whole corpus in memory).
     const sample = new Map<string, string>();
     const SAMPLE_CAP = 4000;
-    for (const r of (data ?? []) as { doc_id: string; doc_label: string | null; content: string | null }[]) {
-      if (!byDoc.has(r.doc_id)) byDoc.set(r.doc_id, { label: r.doc_label || r.doc_id });
+    type Row = {
+      doc_id: string;
+      doc_label: string | null;
+      content: string | null;
+      page: number | null;
+      urgency: "high" | "medium" | "low" | null;
+    };
+    for (const r of (data ?? []) as Row[]) {
+      let agg = byDoc.get(r.doc_id);
+      if (!agg) {
+        agg = { label: r.doc_label || r.doc_id, pages: new Set(), urgency: null };
+        byDoc.set(r.doc_id, agg);
+      }
+      if (typeof r.page === "number") agg.pages.add(r.page);
+      if (r.urgency && !agg.urgency) agg.urgency = r.urgency;
       const acc = sample.get(r.doc_id) ?? "";
       if (acc.length < SAMPLE_CAP && r.content) {
         sample.set(r.doc_id, (acc + " " + r.content).slice(0, SAMPLE_CAP));
       }
     }
-    return [...byDoc.entries()].map(([doc, { label }]) => ({
+    return [...byDoc.entries()].map(([doc, agg]) => ({
       doc,
-      label,
-      urgency: null,
+      label: agg.label,
+      urgency: agg.urgency,
       lang: detectLang(sample.get(doc) ?? ""),
+      pages: agg.pages.size,
     }));
   } catch (e) {
     console.error("[pgvector-store] listUploadedDocs failed:", e instanceof Error ? e.message : e);
