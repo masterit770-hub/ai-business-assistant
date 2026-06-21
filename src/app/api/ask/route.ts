@@ -12,8 +12,8 @@ import { friendlyAskError } from "@/lib/engine/error-message";
 // generation + validateAnswer → grounded, cited answer. No mock, no fabrication.
 //
 // AUTH: requires a signed-in, enabled user. Per-user doc isolation comes straight
-// from the session — answerQuestion scopes UPLOADED-doc retrieval (Gemini File
-// Search) to this user's own uploads; an ADMIN sees all uploads. The bundled
+// from the session — answerQuestion scopes UPLOADED-doc retrieval (Supabase pgvector
+// hybrid) to this user's own uploads; an ADMIN sees all uploads. The bundled
 // corpus is shared/read-only for everyone.
 export const runtime = "nodejs";
 // Headroom for a cold /api/embed (loads the WASM model on first call); warm is fast.

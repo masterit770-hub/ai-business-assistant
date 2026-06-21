@@ -448,8 +448,8 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
 
       {/* honest pipeline footer strip */}
       <div className="border-t border-line px-5 py-2.5 text-center text-[11px] text-faint">
-        PDF + SQLite · query routing · hybrid retrieval (SQL + local dense embeddings + Gemini
-        File Search) · grounded generation · citation verification
+        PDF + SQLite · query routing · hybrid retrieval (text-to-SQL + self-hosted pgvector:
+        dense × BM25 → RRF) · grounded generation · citation verification
       </div>
     </div>
   );

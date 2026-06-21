@@ -72,7 +72,7 @@ export function UploadButton() {
       const body = new FormData();
       body.append("file", file);
       // Once the request is sent, the bytes are in flight; the server then chunks/embeds
-      // (or hands to Gemini File Search) — reflect that as the "indexing" phase.
+      // into the self-hosted pgvector store — reflect that as the "indexing" phase.
       const req = fetch("/api/ingest", { method: "POST", body });
       setStatus({ state: "working", name: file.name, phase: "indexing" });
       const res = await req;
