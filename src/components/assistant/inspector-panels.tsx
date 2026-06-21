@@ -223,14 +223,6 @@ export function RoutingDecision({ result }: { result: EngineResult }) {
         <span className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-2 py-1 text-[11px] font-medium text-subtle">
           languages: {lang}
         </span>
-        {result.route.intents.map((i) => (
-          <span
-            key={i.name}
-            className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-2 py-1 text-[11px] font-medium text-subtle"
-          >
-            intent: {i.name}
-          </span>
-        ))}
         {result.route.docFilter && (
           <span className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-2 py-1 text-[11px] font-medium text-subtle">
             doc: {result.route.docFilter}

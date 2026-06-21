@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { cosineSim } from "./embeddings.ts";
 import type { VectorIndex } from "./documents.ts";
-import { TABLES } from "./schema.ts";
 
 const ROOT = process.cwd();
 const SQLITE = join(ROOT, "data-index", "contracts.sqlite");
@@ -40,18 +39,6 @@ export function getVectors(): VectorIndex {
   if (!existsSync(VECTORS)) throw new Error("data-index/vectors.json missing — run `npm run build:index`");
   _vectors = JSON.parse(readFileSync(VECTORS, "utf8")) as VectorIndex;
   return _vectors;
-}
-
-const TABLE_NAMES = new Set(TABLES.map((t) => t.table));
-
-/** Run a read-only SELECT and tag each row with its table + id (citation anchor). */
-export function sqlSelect(table: string, sql: string, params: unknown[] = []): SqlRow[] {
-  if (!TABLE_NAMES.has(table)) throw new Error(`unknown table: ${table}`);
-  // Hard guard: only SELECT statements run against the read-only DB.
-  if (!/^\s*select/i.test(sql)) throw new Error("only SELECT is allowed");
-  const stmt = getDb().prepare(sql);
-  const rows = stmt.all(...(params as any[])) as Record<string, unknown>[];
-  return rows.map((r) => ({ table, id: Number(r.id), data: r }));
 }
 
 /** RAG: embed-free cosine search over the BUNDLED vector index (the Carter

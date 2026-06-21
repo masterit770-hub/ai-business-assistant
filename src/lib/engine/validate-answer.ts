@@ -46,9 +46,29 @@ export type ValidationResult = {
 
 // A claim is a sentence asserting a fact. We approximate "makes a factual claim"
 // as: contains a digit, a currency amount, or a quantified/asserting keyword —
-// while excluding explicit not-found disclaimers.
-const NOT_FOUND_RE =
-  /\b(not (present|available|found|in the (available )?sources?)|no (matching|relevant) (data|records?|sources?)|the (available )?sources? do(es)? not|cannot find|could not find)\b/i;
+// while excluding explicit not-found / schema-absence disclaimers.
+//
+// A SCHEMA-ABSENCE disclaimer ("the data does not include/contain/have any column /
+// field for X", "none of which indicate …", "is not available in the evidence") is an
+// honest non-answer, NOT an uncited factual claim — it must not be forced to carry a
+// citation just because it names a column keyword (invoice/total/overdue/…). This is
+// general (it polices ANY honest refusal), not tied to a dataset.
+const NOT_FOUND_RE = new RegExp(
+  [
+    "\\b(not (present|available|found|in the (available )?sources?))",
+    "no (matching|relevant) (data|records?|sources?)",
+    "the (available )?sources? do(es)? not",
+    "cannot find|could not find",
+    // "does not / do not / doesn't / don't / has no / there is no … (include|contain|
+    //  have|indicate|show) … (field|column|information|status|data)"
+    "(does not|do not|doesn'?t|don'?t|did not|didn'?t|has no|have no|there (is|are) no|lacks?|without)[^.]*?(include|contain|have|indicate|show|provide|field|column|information|status)",
+    // "none of (these|which|the) … (indicate|show|contain|include|field)"
+    "none of (these|which|the|them)[^.]*?(indicate|show|contain|include|provide|field|column|payment|status)",
+    // "is/are not available in the (evidence|data|documents|records)"
+    "(is|are) not available in (the )?(evidence|data|documents?|records?)",
+  ].join("|"),
+  "i"
+);
 
 const FACTUAL_SIGNAL_RE =
   /(\$[\d,]+|\b\d+\b|\bexpire|\boverdue|\bcustody|\bsalary|\bcontract|\binvoice|\bpenalt|\bjudg|\bawarded|\btotal\b)/i;
@@ -66,11 +86,18 @@ export function validateAnswer(answer: string, evidence: Evidence): ValidationRe
     );
   }
 
-  // Strip not-found disclaimer sentences before deciding "makes a factual claim".
+  // Strip not-found / schema-absence disclaimer sentences before deciding "makes a
+  // factual claim". A disclaimer is exempt ONLY when it carries NO concrete figure (a
+  // `$` amount or a 2+ digit number) — a sentence stating a real figure is always a
+  // factual claim that must be cited, even if it also hedges. This keeps the broadened
+  // disclaimer recognizer from letting a fabricated "owes $5,000" sentence through.
+  const FIGURE_RE = /\$[\d,]+|\b\d{2,}\b/;
   const sentences = answer.split(/(?<=[.!?])\s+/);
-  const factualSentences = sentences.filter(
-    (s) => FACTUAL_SIGNAL_RE.test(s) && !NOT_FOUND_RE.test(s)
-  );
+  const factualSentences = sentences.filter((s) => {
+    if (!FACTUAL_SIGNAL_RE.test(s)) return false;
+    const isDisclaimer = NOT_FOUND_RE.test(s) && !FIGURE_RE.test(s);
+    return !isDisclaimer;
+  });
 
   // Rule 2 — a factual answer must carry at least one citation
   if (factualSentences.length > 0 && tokens.length === 0) {

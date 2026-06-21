@@ -6,7 +6,6 @@ export type EngineResult = {
   question: string;
   route: {
     sources: string[];
-    intents: { name: string; params: Record<string, unknown> }[];
     docFilter: string | null;
     rationale: string;
   };

@@ -17,7 +17,6 @@ export const CASE_FILE_RESULT: EngineResult = {
   question: "Who are the parties in the Carter family court case, and what was decided?",
   route: {
     sources: ["documents"],
-    intents: [],
     docFilter: null,
     rationale:
       "The question is narrative/legal and about the Carter case file, so it routes to the document (PDF) lane and is answered from the retrieved case-file passages.",
@@ -94,10 +93,9 @@ export const CONTRACTS_RESULT: EngineResult = {
   question: "Which contracts expire in the next 90 days?",
   route: {
     sources: ["structured"],
-    intents: [{ name: "contracts_expiring", params: { days: 90 } }],
     docFilter: null,
     rationale:
-      "A business-operations question about contract expiry dates routes to the structured (SQL) lane and runs the contracts_expiring intent.",
+      "A business-operations question about contract expiry dates routes to the structured (text-to-SQL) lane, which generates a SELECT over the contracts table.",
   },
   answer:
     "38 vendor contracts expire in the next 90 days, with a combined annual value of $18,924,883.79 [S:contracts#12]. Representative rows include the Project Manager role contract [S:contracts#12] and the Data Coordinator role contract [S:contracts#47].",
@@ -113,7 +111,7 @@ export const CONTRACTS_RESULT: EngineResult = {
   },
   validation: { ok: true, reasons: [] },
   inspector: {
-    retrievalMethod: "SQL lane (structured intents)",
+    retrievalMethod: "text-to-SQL lane (generated SELECT over the live schema)",
     passages: 0,
     evidenceCount: 3,
     confidence: { value: 0.9, basis: "exact structured (SQL) match; citation check passed" },
@@ -129,7 +127,8 @@ export const CONTRACTS_RESULT: EngineResult = {
         key: "sources",
         label: "Sources",
         status: "ok",
-        detail: "Selected structured · intents: contracts_expiring.",
+        detail:
+          "Selected structured · generated SQL: SELECT COUNT(*), SUM(annual_cost) FROM contracts WHERE end_date_iso BETWEEN '2026-06-17' AND '2026-09-15'.",
       },
       {
         key: "retrieval",
@@ -170,7 +169,6 @@ export const GENERAL_RESULT: EngineResult = {
   question: "What is the general approach to alimony in Arizona divorce law?",
   route: {
     sources: [],
-    intents: [],
     docFilter: null,
     rationale:
       "The question is about legal practice and strategy, which is not covered by the available sources.",

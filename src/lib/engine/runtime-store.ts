@@ -98,7 +98,31 @@ export function removeRuntimeDoc(docId: string): void {
   delete s.fileIds[docId];
 }
 
-/** Register ingested structured rows (CSV/XLSX local fallback). */
+/** Register ingested structured rows (CSV/XLSX). These are materialized into the
+ *  queryable structured store so the text-to-SQL lane can query uploaded tables. A
+ *  re-upload of the same table REPLACES its prior rows (mirrors the doc upsert), so a
+ *  re-ingest doesn't double-count. */
 export function addRuntimeRows(rows: RuntimeSqlRow[]): void {
-  store().sqlRows.push(...rows);
+  const s = store();
+  const tables = new Set(rows.map((r) => r.table));
+  if (tables.size) s.sqlRows = s.sqlRows.filter((r) => !tables.has(r.table));
+  s.sqlRows.push(...rows);
+}
+
+/** Uploaded structured rows grouped by their table name — the input the structured
+ *  store materializes into real, queryable SQLite tables. Returns a fresh Map each
+ *  call (the store keys its rebuild off the row counts here). */
+export function runtimeRows(): Map<string, RuntimeSqlRow[]> {
+  const byTable = new Map<string, RuntimeSqlRow[]>();
+  for (const r of store().sqlRows) {
+    const list = byTable.get(r.table) ?? [];
+    list.push(r);
+    byTable.set(r.table, list);
+  }
+  return byTable;
+}
+
+/** Test/hot-reload helper: drop all registered uploaded rows. */
+export function clearRuntimeRows(): void {
+  store().sqlRows = [];
 }
