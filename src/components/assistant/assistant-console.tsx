@@ -76,6 +76,7 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
             route?: EngineResult["route"] | null;
             inspector?: EngineResult["inspector"] | null;
             evidence?: EngineResult["evidence"] | null;
+            validation?: EngineResult["validation"] | null;
           }) => ({
             question: t.question,
             // Replay the turn from its PERSISTED trace (migration 008) so the inspector
@@ -91,7 +92,11 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
               grounded: t.mode ? t.mode === "grounded" : undefined,
               route: t.route ?? { sources: [], docFilter: null, rationale: "" },
               evidence: t.evidence ?? { rows: [], chunks: [] },
-              validation: { ok: true, reasons: [] },
+              // Replay the REAL grounding verdict (migration 010). A turn that was
+              // REJECTED by validateAnswer must replay as rejected, not as a fabricated
+              // green "passed". Only a pre-010 row (no recorded verdict) falls back to
+              // ok — and those already carry the "trace not recorded" notice.
+              validation: t.validation ?? { ok: true, reasons: [] },
               inspector: t.inspector ?? undefined,
             } as EngineResult,
           })

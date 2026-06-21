@@ -159,9 +159,14 @@ Write the single SELECT query now (SQL only).`;
  * run a SELECT (one retry on failure) → collect cited rows. Pure-ish: the only
  * external effects are the LLM calls and a read-only DB query.
  */
-export async function answerStructured(question: string): Promise<StructuredResult> {
+export async function answerStructured(
+  question: string,
+  // Demo accounts query the bundled sample tables; a non-demo user (includeBundled=false)
+  // queries only their own uploaded tables — the sample data is invisible to them.
+  includeBundled = true
+): Promise<StructuredResult> {
   const usages: ChatUsage[] = [];
-  const { catalog, samples } = introspectSchema();
+  const { catalog, samples } = introspectSchema(3, includeBundled);
   if (catalog.length === 0) {
     return { table: null, sql: null, rows: [], ok: false, note: "no structured tables loaded", usages };
   }

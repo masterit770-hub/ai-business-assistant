@@ -7,7 +7,6 @@ import {
   rowsToCsv,
   decideAccess,
   csvFilename,
-  MAX_PAGE,
   type TableKind,
 } from "@/lib/engine/table-view";
 
@@ -77,14 +76,13 @@ export async function GET(req: Request) {
   const canonical = entry!.table;
   const columns = entry!.columns.map((c) => c.name);
 
-  // CSV export uses a larger window than a UI page so a one-click download isn't
-  // truncated to 50 rows — still capped (MAX_PAGE) so it can't dump unbounded.
+  // CSV export = the WHOLE table, so a one-click download is never silently truncated
+  // to a UI page (the bug: it capped at 50/100 while the header advertised the true
+  // total). The interactive viewer still pages via clampPaging. A high hard bound still
+  // guards against a pathological unbounded dump.
   const isCsv = params.get("format") === "csv";
-  const { limit, offset } = clampPaging(
-    params.get("limit"),
-    params.get("offset"),
-    isCsv ? MAX_PAGE : undefined
-  );
+  const CSV_MAX_ROWS = 1_000_000;
+  const { limit, offset } = clampPaging(params.get("limit"), params.get("offset"));
 
   let total = 0;
   let rows: Record<string, unknown>[] = [];
@@ -94,9 +92,13 @@ export async function GET(req: Request) {
     // input; values (limit/offset) are bound parameters → no SQL injection surface.
     const colList = columns.map((c) => `"${c}"`).join(", ");
     total = (db.prepare(`SELECT COUNT(*) AS n FROM "${canonical}"`).get() as { n: number }).n;
-    rows = db
-      .prepare(`SELECT ${colList} FROM "${canonical}" LIMIT ? OFFSET ?`)
-      .all(limit, offset) as Record<string, unknown>[];
+    rows = isCsv
+      ? (db
+          .prepare(`SELECT ${colList} FROM "${canonical}" LIMIT ?`)
+          .all(CSV_MAX_ROWS) as Record<string, unknown>[])
+      : (db
+          .prepare(`SELECT ${colList} FROM "${canonical}" LIMIT ? OFFSET ?`)
+          .all(limit, offset) as Record<string, unknown>[]);
   } catch (e) {
     return Response.json(
       { error: e instanceof Error ? e.message : "failed to read table" },

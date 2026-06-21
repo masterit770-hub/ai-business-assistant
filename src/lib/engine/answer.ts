@@ -213,7 +213,7 @@ export async function answerQuestion(
   // recent turns are threaded BEFORE the question into BOTH the router and the
   // generation prompts so a follow-up ("what about Q2?", "summarize that") resolves
   // against the conversation. Retrieval still runs on the current question.
-  ctx: { ownerId?: string; role?: string; history?: Turn[] } = {}
+  ctx: { ownerId?: string; role?: string; isDemo?: boolean; history?: Turn[] } = {}
 ): Promise<AnswerResult> {
   try {
     return await runAnswerPipeline(question, ctx);
@@ -237,7 +237,7 @@ export async function answerQuestion(
 
 async function runAnswerPipeline(
   question: string,
-  ctx: { ownerId?: string; role?: string; history?: Turn[] } = {}
+  ctx: { ownerId?: string; role?: string; isDemo?: boolean; history?: Turn[] } = {}
 ): Promise<AnswerResult> {
   // Telemetry accumulator — real timings + real per-call token usage are gathered
   // as the pipeline runs and assembled into the InspectorTrace at each return point.
@@ -262,11 +262,20 @@ async function runAnswerPipeline(
 
   // An admin sees ALL uploaded docs → no owner scoping on retrieval.
   const scopeOwner = ctx.role === "admin" ? undefined : ctx.ownerId;
+  // The BUNDLED sample corpus (Carter docs + the contracts/maintenance tables) is shown
+  // ONLY to demo accounts. A real client user (ctx.isDemo === false) retrieves nothing
+  // from it — their answers come solely from their own uploads. Undefined (a legacy
+  // direct caller) keeps the prior behavior (bundled included).
+  const includeBundled = ctx.isDemo !== false;
   // 1. ROUTE (real LLM decision) — owner-scoped doc catalog (Phase C). The recent
   // history goes to the router too, so a follow-up like "what about Q2?" routes the
   // resolved intent rather than the bare fragment.
   const routeStart = now();
-  const route = await routeQuestion(question, { ownerId: scopeOwner, history: ctx.history });
+  const route = await routeQuestion(question, {
+    ownerId: scopeOwner,
+    history: ctx.history,
+    isDemo: includeBundled,
+  });
   tel.routingMs = now() - routeStart;
 
   // 2. RETRIEVE
@@ -281,7 +290,7 @@ async function runAnswerPipeline(
   let structuredNote: string | undefined;
   if (route.sources.includes("structured")) {
     try {
-      const structured = await answerStructured(question);
+      const structured = await answerStructured(question, includeBundled);
       for (const u of structured.usages) tel.usages.push(u);
       tel.generationMs += 0; // structured-lane LLM time folds into total; phase timer below
       rows.push(...structured.rows);
@@ -303,7 +312,7 @@ async function runAnswerPipeline(
     // uses). Retrieve across ALL bundled docs (no filter) so corroboration /
     // conflict-surfacing across both companion PDFs works. Each chunk carries its
     // REAL denseRank / bm25Rank / rrfScore for the inspector.
-    const bundled = hybridVectorSearch(qEmbedding, question, 12);
+    const bundled = includeBundled ? hybridVectorSearch(qEmbedding, question, 12) : [];
     // Confidence keys off the top REAL dense COSINE similarity (0..1 scale), not the
     // RRF scale — so the existing confidence mapping is unchanged. We recompute the
     // best cosine from the bundled candidates the dense lane ranked #1.

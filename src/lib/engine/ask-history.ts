@@ -192,6 +192,9 @@ export async function logAsk(
         // few KB and makes the evidence panel + citation count replay faithfully.
         inspector: result.inspector ?? null,
         evidence: result.evidence ?? null,
+        // The real grounding verdict, so a resumed turn replays whether it actually
+        // passed validateAnswer — never a fabricated green "verified".
+        validation: result.validation ?? null,
         session_id: sessionId ?? null,
       });
     if (error) {

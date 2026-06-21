@@ -56,7 +56,9 @@ export async function GET() {
     }
     return NextResponse.json({
       documents: uploaded,
-      bundled: bundledSources(),
+      // The bundled sample corpus is part of the DEMO accounts only. A real client user
+      // (isDemo=false) gets an empty bundled list → a clean bucket of just their uploads.
+      bundled: user.isDemo ? bundledSources() : [],
       role: user.role,
     });
   } catch (e) {

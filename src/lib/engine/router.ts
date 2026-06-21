@@ -54,12 +54,14 @@ Respond with ONLY JSON: {"sources": [...], "docFilter": null, "rationale": "one 
 
 export async function routeQuestion(
   question: string,
-  ctx: { ownerId?: string; history?: Turn[] } = {}
+  ctx: { ownerId?: string; history?: Turn[]; isDemo?: boolean } = {}
 ): Promise<RoutePlan> {
   const uploaded = await listUploadedDocs(ctx.ownerId);
   let tables: TableSchema[] = [];
   try {
-    tables = introspectSchema().catalog;
+    // A non-demo caller never sees the bundled sample tables in the routing catalog,
+    // so it won't route a question to data it can't access.
+    tables = introspectSchema(3, ctx.isDemo !== false).catalog;
   } catch {
     // Structured store not built (dev) — route over documents only.
     tables = [];

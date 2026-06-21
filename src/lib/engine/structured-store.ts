@@ -154,7 +154,15 @@ function materializeUploads(db: Database.Database, uploads: Map<string, SqlRow[]
  *  - Bundled tables expose their real columns (minus the hidden __malformed flag).
  *  - Uploaded tables expose their sanitized columns; `rowid_anchor` is the citation id.
  */
-export function introspectSchema(sampleRows = 3): {
+export function introspectSchema(
+  sampleRows = 3,
+  // The BUNDLED sample tables (contracts/maintenance, baked into contracts.sqlite) are
+  // confined to demo accounts. A non-demo caller passes includeBundled=false → the
+  // catalog the planner + SQL guard + router consume excludes them, so a real client
+  // user can neither see nor query the sample data (clean bucket). Uploaded tables
+  // (materialized from runtime-store) are always kept. Default true = unchanged.
+  includeBundled = true
+): {
   catalog: TableSchema[];
   samples: Map<string, Record<string, unknown>[]>;
 } {
@@ -164,13 +172,17 @@ export function introspectSchema(sampleRows = 3): {
   // text-to-SQL can neither plan nor query it → it never appears in an answer. Empty
   // set (nothing hidden / Supabase off) → identical to the prior catalog.
   const hidden = deletedSourceIds();
+  // A handle table is BUNDLED iff it is not one of the runtime-uploaded tables (whose
+  // names are sanitized into SQLite identifiers when materialized).
+  const uploadedNames = new Set([...runtimeRows().keys()].map(sanitizeIdent));
   const tables = (
     db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
       .all() as { name: string }[]
   )
     .map((r) => r.name)
-    .filter((t) => !HIDDEN_TABLES.has(t) && !t.startsWith("sqlite_") && !hidden.has(t));
+    .filter((t) => !HIDDEN_TABLES.has(t) && !t.startsWith("sqlite_") && !hidden.has(t))
+    .filter((t) => includeBundled || uploadedNames.has(t));
 
   const catalog: TableSchema[] = [];
   const samples = new Map<string, Record<string, unknown>[]>();

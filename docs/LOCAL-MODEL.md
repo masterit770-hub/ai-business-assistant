@@ -59,18 +59,20 @@ curl http://localhost:11434/v1/chat/completions -H 'content-type: application/js
 
 ## A) Self-host the app on your box (no tunnel)
 
-You run the app and the model on the same machine. *(Verified on a real box: `npm run build` exits 0, `npm start` serves, and Local answers cite the right pages.)*
+You run the app and the model on the same machine.
 
 ```bash
-# on the box (needs Node.js 20+):
+# on the box (needs Node.js 20+ and pnpm: `npm install -g pnpm`):
 git clone <your-nucleus-repo-url>
 cd nucleus
-npm install
-npm run build        # verified: builds clean
-npm start            # serves http://localhost:3000  (verified: "Ready" + HTTP 200)
+pnpm install
+pnpm approve-builds --all   # approve native build scripts (sharp, tesseract.js, …) so the
+                            # build/run isn't blocked (ERR_PNPM_IGNORED_BUILDS)
+pnpm build                  # builds the production app
+pnpm start                  # serves http://localhost:3000  ("Ready" + HTTP 200)
 ```
 
-> Logins (Supabase) and uploaded-document search (Gemini) still use their own keys — see **HANDOFF.md**. Switching the **model** to Local changes only *who writes the answer*, not the rest of the app.
+> Logins **and** document search both run on your **Supabase** (Postgres + pgvector — self-hosted document search; no Google/Gemini) — set those up first via **[SETUP.md](SETUP.md)**. Switching the **model** to Local changes only *who writes the answer*, not the rest of the app.
 
 Then in the app (`http://localhost:3000`), signed in as **admin**:
 1. **Settings → Model**.
@@ -159,10 +161,10 @@ Switching the **model** to Local runs **the AI on your hardware**. It does not, 
 |---|---|---|
 | **The AI that writes answers** | **your hardware** | ✅ now local |
 | Login / accounts | Supabase | ⚠️ unless you self-host Supabase |
-| Uploaded-document search | Gemini File Search | ⚠️ unless separately localized |
+| Uploaded-document search | Supabase Postgres + pgvector (self-hosted; the embedding model runs inside your deployment) | ⚠️ on your Supabase, unless you self-host Supabase too |
 | Structured data (contracts/maintenance) | in the app, on your box | ✅ already local |
 
-A full air-gap is a further step (self-host the login + document-search lanes too). The switch gives you the biggest piece: **the AI itself on your machine.**
+A full air-gap is a further step (self-host Supabase too, so logins + document search also run on your hardware). The switch gives you the biggest piece: **the AI itself on your machine.**
 
 ---
 

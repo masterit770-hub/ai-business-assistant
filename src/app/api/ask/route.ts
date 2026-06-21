@@ -72,6 +72,9 @@ export async function POST(req: Request) {
     const result = await answerQuestion(question, {
       ownerId: user.id,
       role: user.role,
+      // Demo accounts see the bundled sample corpus; a real client user (isDemo=false)
+      // retrieves only from their own uploads (clean bucket).
+      isDemo: user.isDemo,
       history,
     });
     // Persist this ask to the user's history under its conversation's session_id.

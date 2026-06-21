@@ -155,19 +155,24 @@ export function MaterialsRail() {
         )}
       </div>
 
-      {/* YOUR MATERIALS — uploads */}
+      {/* YOUR MATERIALS — ONE bucket: your uploads + (for demo accounts) the sample
+          corpus, in a single list. There is no separate "Built-in business data"
+          section: a real client user (non-demo) gets an empty bundled list from the
+          API, so this is purely their own uploads; a demo account sees both together. */}
       <div className="rounded-2xl border border-line bg-surface shadow-soft" data-testid="uploaded-docs">
         <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
           <span className="text-[11px] font-semibold uppercase tracking-wide text-faint">
             Your materials
           </span>
-          <span className="text-[11px] text-faint">{uploaded?.length ?? 0} uploaded</span>
+          <span className="text-[11px] text-faint">
+            {(uploaded?.length ?? 0) + (bundled?.length ?? 0)} sources
+          </span>
         </div>
         {uploaded === null ? (
           <p className="px-4 py-4 text-xs text-faint">Loading…</p>
-        ) : uploaded.length === 0 ? (
+        ) : uploaded.length === 0 && (bundled?.length ?? 0) === 0 ? (
           <p className="px-4 py-4 text-xs text-faint">
-            No uploads yet. Upload a PDF, CSV, or Excel — it appears here with a [P]/[S] chip and
+            No materials yet. Upload a PDF, CSV, or Excel — it appears here with a [P]/[S] chip and
             is answerable instantly.
           </p>
         ) : (
@@ -222,21 +227,9 @@ export function MaterialsRail() {
                 </button>
               </li>
             ))}
-          </ul>
-        )}
-      </div>
-
-      {/* BUILT-IN business data */}
-      {bundled && bundled.length > 0 && (
-        <div className="rounded-2xl border border-line bg-surface shadow-soft" data-testid="bundled-docs">
-          <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-faint">
-              Built-in business data
-            </span>
-            <span className="text-[11px] text-faint">{bundled.length} sources</span>
-          </div>
-          <ul>
-            {bundled.map((s) => (
+            {/* the bundled sample corpus, in the SAME list (demo accounts only; empty
+                for a real client user). data-testid kept so existing checks resolve. */}
+            {(bundled ?? []).map((s) => (
               <li
                 key={s.doc}
                 data-testid={`bundled-row-${s.doc}`}
@@ -305,8 +298,8 @@ export function MaterialsRail() {
               </li>
             ))}
           </ul>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* FIX 1: the structured-table viewer modal (real columns + rows + paging + CSV). */}
       {viewing && (
