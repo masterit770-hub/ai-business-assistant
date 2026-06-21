@@ -21,7 +21,11 @@ type Tab = "workspace" | "inspector" | "demo";
 // One turn of the running conversation: the user's question and the engine's full
 // result for it. The result carries everything the AnswerView/Inspector render, so a
 // turn is rendered exactly like the old single-shot answer — just repeated per turn.
-type ChatTurn = { question: string; result: EngineResult };
+// `traceRecorded` is set only on RESUMED turns: true when the persisted row carried a
+// full inspector trace (migration 008+), false for older rows that didn't. Undefined on
+// a live turn (which always has its real trace). When false, the Inspector tab shows an
+// honest "trace not recorded" notice rather than implying a real zero-passage retrieval.
+type ChatTurn = { question: string; result: EngineResult; traceRecorded?: boolean };
 
 // The full AI Business Assistant console — now a MULTI-TURN chat. It owns the running
 // `turns` thread + the conversation's `sessionId`, the Workspace / Inspector / Demo
@@ -69,16 +73,26 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
             answer: string;
             mode?: "grounded" | "general" | null;
             citations?: { tokens?: string[]; sources?: string[] } | null;
+            route?: EngineResult["route"] | null;
+            inspector?: EngineResult["inspector"] | null;
+            evidence?: EngineResult["evidence"] | null;
           }) => ({
             question: t.question,
+            // Replay the turn from its PERSISTED trace (migration 008) so the inspector
+            // shows what ACTUALLY happened — route, retrieved passages, steps, method —
+            // not a fabricated empty trace. `traceRecorded` is false for rows saved
+            // before 008; the inspector then says so rather than implying a real
+            // zero-passage retrieval next to a grounded, cited answer.
+            traceRecorded: !!t.inspector,
             result: {
               question: t.question,
               answer: t.answer,
               mode: (t.mode as "grounded" | "general" | undefined) ?? undefined,
               grounded: t.mode ? t.mode === "grounded" : undefined,
-              route: { sources: [], docFilter: null, rationale: "" },
-              evidence: { rows: [], chunks: [] },
+              route: t.route ?? { sources: [], docFilter: null, rationale: "" },
+              evidence: t.evidence ?? { rows: [], chunks: [] },
               validation: { ok: true, reasons: [] },
+              inspector: t.inspector ?? undefined,
             } as EngineResult,
           })
         );
@@ -284,6 +298,17 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
               {tab === "workspace" && <AnswerView result={t.result} onRetry={ask} />}
               {tab === "inspector" && (
                 <div className="space-y-3" data-testid="inspector-view">
+                  {t.traceRecorded === false && (
+                    <div
+                      data-testid="trace-not-recorded"
+                      className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-700"
+                    >
+                      The full retrieval trace wasn’t recorded for this earlier answer, so
+                      the passage counts below may read as zero. The answer and its
+                      citations are exactly as given at the time. New answers record their
+                      complete trace.
+                    </div>
+                  )}
                   <RoutingDecision result={t.result} />
                   <OrchestratorTrace result={t.result} />
                   <DocumentRetrieval result={t.result} />

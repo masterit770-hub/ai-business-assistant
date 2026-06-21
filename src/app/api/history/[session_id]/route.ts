@@ -17,6 +17,9 @@ type TurnRow = {
   answer: string;
   mode: string | null;
   citations: unknown;
+  route: unknown;
+  inspector: unknown;
+  evidence: unknown;
   created_at: string;
 };
 
@@ -41,7 +44,7 @@ export async function GET(
   try {
     let query = admin()
       .from("ask_history")
-      .select("owner_id, question, answer, mode, citations, created_at")
+      .select("owner_id, question, answer, mode, citations, route, inspector, evidence, created_at")
       .eq("session_id", sessionId)
       .order("created_at", { ascending: true }) // oldest first → the thread in order
       .limit(ROW_LIMIT);
@@ -64,6 +67,12 @@ export async function GET(
       answer: r.answer,
       mode: r.mode,
       citations: r.citations,
+      // The REAL persisted trace (null for rows written before migration 008) — the
+      // dashboard replays these so a resumed answer shows its true inspector, not a
+      // fabricated "Route NONE / 0 passages".
+      route: r.route ?? null,
+      inspector: r.inspector ?? null,
+      evidence: r.evidence ?? null,
       created_at: r.created_at,
     }));
     return NextResponse.json({ turns });

@@ -186,6 +186,12 @@ export async function logAsk(
         mode: result.mode ?? null,
         citations,
         route: result.route ?? null,
+        // Persist the REAL retrieval trace so a resumed/historical turn replays its true
+        // inspector (route → retrieval → grounding) instead of a fabricated empty one.
+        // The inspector is lightweight (counts + steps); the evidence (rows/chunks) is a
+        // few KB and makes the evidence panel + citation count replay faithfully.
+        inspector: result.inspector ?? null,
+        evidence: result.evidence ?? null,
         session_id: sessionId ?? null,
       });
     if (error) {

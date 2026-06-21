@@ -66,13 +66,18 @@ const listDocs = (page) =>
     // under `documents`. (Earlier versions of this runner read the wrong key.)
     return d?.documents ?? [];
   });
-async function upload(page, path, rx) {
-  const before = new Set((await listDocs(page)).map((d) => d.doc ?? d.id));
+// Upload a fixture and confirm it ingested. The doc id is STABLE (derived from the
+// filename), and these fixtures persist across runs, so we DELETE any prior copy first,
+// then upload, then poll until the doc is PRESENT (not "newly appeared" — that misses a
+// re-upload of an id that already existed, which is exactly how an earlier version of
+// this runner false-failed while ingestion actually worked).
+async function upload(page, path, expectedDocId, rx) {
+  await del(page, expectedDocId).catch(() => {});
   await page.setInputFiles('input[type="file"]', path);
   for (let i = 0; i < 40; i++) {
     await page.waitForTimeout(3000);
     const now = await listDocs(page);
-    const found = now.find((d) => !before.has(d.doc ?? d.id) && rx.test(JSON.stringify(d)));
+    const found = now.find((d) => (d.doc ?? d.id) === expectedDocId || rx.test(JSON.stringify(d)));
     if (found) return found.doc ?? found.id;
   }
   return null;
@@ -96,7 +101,7 @@ async function main() {
 
     // ── CORE-UPLOAD: the flow that was broken on Gemini — now self-hosted hybrid ──
     console.log("\n▶ CORE-UPLOAD (born-digital PDF → hybrid retrieval, no Gemini)");
-    bfId = await upload(p, BF_PDF, /bluefalcon/i);
+    bfId = await upload(p, BF_PDF, "bluefalcon", /bluefalcon/i);
     check("CORE-UPLOAD/ingest", "uploaded memo is ingested + listed", !!bfId, `docId=${bfId}`);
     if (bfId) {
       const r = await ask(
@@ -117,7 +122,7 @@ async function main() {
 
     // ── HEBREW-UPLOAD: real Hebrew doc → Hebrew question → retrieve ₪52,800 ──
     console.log("\n▶ HEBREW-UPLOAD (Hebrew invoice → Hebrew question → hybrid retrieval)");
-    heId = await upload(p, HE_PDF, /hebrew|invoice|חשבונית/i);
+    heId = await upload(p, HE_PDF, "hebrew-invoice", /hebrew|invoice|חשבונית/i);
     check("HEBREW-UPLOAD/ingest", "Hebrew invoice is ingested + listed", !!heId, `docId=${heId}`);
     if (heId) {
       // Hebrew-LABEL fix: language must be detected from the doc's real CONTENT (he),
@@ -196,6 +201,57 @@ async function main() {
       check("TRACE/present", "inspector has routing + retrieval + citations + validation",
         !!r.inspector && /rout|retriev/.test(blob) && /cit/.test(blob) && /valid|confiden/.test(blob),
         Object.keys(insp).join(","));
+    }
+
+    // ── COHERENCE: the trace must be INTERNALLY consistent (the class of bug a human
+    //    caught by eye: "grounded · cited · validateAnswer passed" next to "Route NONE ·
+    //    0 passages"). A grounded, cited answer MUST have a non-empty route, retrieved
+    //    evidence, and a non-skipped retrieval step — and vice-versa. ──
+    console.log("\n▶ COHERENCE (route ↔ retrieval ↔ grounding ↔ citations must agree)");
+    {
+      const r = await ask(p, "What was the final child support amount, and who got primary residence?");
+      const a = r.answer ?? "";
+      const insp = r.inspector ?? {};
+      const sources = r.route?.sources ?? insp.route?.sources ?? [];
+      const passages = typeof insp.passages === "number" ? insp.passages : 0;
+      const evidence = typeof insp.evidenceCount === "number" ? insp.evidenceCount : 0;
+      const grounded = r.mode === "grounded" || r.grounded === true;
+      const hasCites = cites(a).length > 0;
+      const retrievalStep = (insp.steps ?? []).find((s) => s.key === "retrieval");
+      const coherent =
+        grounded && hasCites
+          ? sources.length > 0 && (passages > 0 || evidence > 0) && retrievalStep?.status !== "skip"
+          : true;
+      check("COHERENCE/grounded-implies-retrieval",
+        "a grounded, cited answer has a real route + retrieved evidence (no 'NONE/0 passages' under a cited answer)",
+        coherent, `grounded=${grounded} cites=${hasCites} sources=[${sources}] passages=${passages} evidence=${evidence} retrievalStep=${retrievalStep?.status}`);
+    }
+
+    // ── HISTORY-REPLAY: the persisted trace must survive a round-trip. Ask in a fresh
+    //    session, then read it back from /api/history/<session_id> and assert the stored
+    //    turn carries the REAL route + inspector (this is the exact path that showed a
+    //    fabricated empty trace on resume — migration 008 persists it). ──
+    console.log("\n▶ HISTORY-REPLAY (a resumed answer replays its REAL trace, not an empty one)");
+    {
+      const r = await p.evaluate(async () => {
+        const res = await fetch("/api/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: "What was the final child support amount, and who got primary residence?" }),
+        });
+        return res.json();
+      });
+      const sid = r.session_id;
+      check("HISTORY-REPLAY/session", "the ask returns a session_id to resume", !!sid, `session_id=${sid}`);
+      if (sid) {
+        await p.waitForTimeout(1500); // let the best-effort history write land
+        const hist = await p.evaluate(async (s) => (await fetch(`/api/history/${s}`)).json(), sid);
+        const turn = (hist.turns ?? []).find((t) => /child support/i.test(t.question));
+        const storedSources = turn?.route?.sources ?? [];
+        const storedPassages = typeof turn?.inspector?.passages === "number" ? turn.inspector.passages : 0;
+        check("HISTORY-REPLAY/route", "the stored turn replays its REAL route (documents), not NONE", storedSources.length > 0, `stored sources=[${storedSources}]`);
+        check("HISTORY-REPLAY/trace", "the stored turn replays its REAL retrieval trace (passages > 0)", storedPassages > 0, `stored passages=${storedPassages}`);
+      }
     }
 
     // ── ISO: per-user isolation (member cannot see admin's private upload) ──
