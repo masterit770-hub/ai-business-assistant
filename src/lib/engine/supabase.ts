@@ -14,7 +14,12 @@
 // Supabase code path.
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const URL = process.env.SUPABASE_URL;
+// Accept either the server-only SUPABASE_URL or the public NEXT_PUBLIC_SUPABASE_URL
+// (same project URL). Prod deployments often only set the NEXT_PUBLIC_ one, and
+// without this fallback the engine's persistence (engine_settings, etc.) silently
+// runs in per-instance memory — so admin settings like the persona/model-switch
+// don't persist across serverless instances. The service-role key stays required.
+const URL = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 let _admin: SupabaseClient | null = null;
