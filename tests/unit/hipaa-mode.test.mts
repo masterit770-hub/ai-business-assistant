@@ -97,7 +97,7 @@ test("resolveHipaaTarget fails CLOSED with no env leak (never the DeepSeek env B
     // missing endpoint
     assert.throws(
       () => resolveHipaaTarget({ apiKey: "k", endpoint: "", apiVersion: "", model: "dep" }),
-      /hipaa_endpoint/
+      /not.*configured.*endpoint|endpoint is set/i
     );
     // missing model
     assert.throws(
@@ -108,7 +108,7 @@ test("resolveHipaaTarget fails CLOSED with no env leak (never the DeepSeek env B
           apiVersion: "",
           model: "",
         }),
-      /hipaa_model/
+      /deployment name is set/i
     );
     // missing key
     assert.throws(

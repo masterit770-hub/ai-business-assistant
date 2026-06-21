@@ -13,7 +13,7 @@ import type { SqlRow } from "./structured-store.ts";
 import { vectorSearch as vectorSearchLocal, type DocChunk } from "./retrieval.ts";
 import { fileSearchEnabled, queryFileSearch } from "./file-search.ts";
 import { embedQuery } from "./embeddings.ts";
-import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable } from "./llm.ts";
+import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable, isHipaaNotConfigured } from "./llm.ts";
 import { sqlToken, pdfToken, extractCitationTokens } from "./citations.ts";
 import { validateAnswer, type Evidence } from "./validate-answer.ts";
 import { DOCUMENTS } from "./documents.ts";
@@ -166,6 +166,25 @@ function localGuidanceResult(
   };
 }
 
+// HIPAA mode with no Azure backend configured → friendly setup guidance (a 200),
+// mirroring the Local guidance. NEVER falls back to the shared cloud model.
+function hipaaGuidanceResult(question: string): AnswerResult {
+  return {
+    question,
+    route: {
+      sources: [],
+      docFilter: null,
+      rationale: "HIPAA mode — the Azure backend isn't configured, so this is setup guidance.",
+    },
+    answer:
+      "HIPAA mode is on, but it isn't set up yet. Add your Azure OpenAI key, resource endpoint, and deployment name in Settings → Model (HIPAA). For your protection, HIPAA mode never falls back to the shared cloud model — it stays off until you point it at your own BAA-covered Azure resource.",
+    mode: "general",
+    grounded: false,
+    evidence: { rows: [], chunks: [] },
+    validation: { ok: true, reasons: [] },
+  };
+}
+
 // PUBLIC entry. Runs the real pipeline, but if the active backend is LOCAL and it
 // can't answer (not configured / unreachable), returns the friendly guidance as a
 // normal 200 payload instead of letting the typed error become a 500.
@@ -182,6 +201,9 @@ export async function answerQuestion(
     if (isLocalUnreachable(e)) {
       const endpoint = (e as { endpoint?: string }).endpoint;
       return localGuidanceResult(question, "unreachable", endpoint);
+    }
+    if (isHipaaNotConfigured(e)) {
+      return hipaaGuidanceResult(question);
     }
     throw e; // any other error keeps its existing (cloud) handling.
   }

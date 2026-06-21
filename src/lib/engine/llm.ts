@@ -117,6 +117,16 @@ export class LocalUnreachableError extends Error {
   }
 }
 
+/** HIPAA mode is on but its Azure backend isn't fully configured. Caught by the Ask
+ *  path and turned into friendly setup guidance (a 200), never a 500. */
+export class HipaaNotConfiguredError extends Error {
+  readonly code = "HIPAA_NOT_CONFIGURED" as const;
+  constructor(detail: string) {
+    super(`HIPAA mode is on, but it isn't fully configured: ${detail}.`);
+    this.name = "HipaaNotConfiguredError";
+  }
+}
+
 export function isLocalNotConfigured(e: unknown): e is LocalNotConfiguredError {
   return e instanceof LocalNotConfiguredError ||
     (e instanceof Error && (e as { code?: string }).code === "LOCAL_NOT_CONFIGURED");
@@ -124,6 +134,10 @@ export function isLocalNotConfigured(e: unknown): e is LocalNotConfiguredError {
 export function isLocalUnreachable(e: unknown): e is LocalUnreachableError {
   return e instanceof LocalUnreachableError ||
     (e instanceof Error && (e as { code?: string }).code === "LOCAL_UNREACHABLE");
+}
+export function isHipaaNotConfigured(e: unknown): e is HipaaNotConfiguredError {
+  return e instanceof HipaaNotConfiguredError ||
+    (e instanceof Error && (e as { code?: string }).code === "HIPAA_NOT_CONFIGURED");
 }
 
 // "Configured" means there IS a backend able to answer. Cloud needs an API key in
@@ -232,9 +246,9 @@ function buildAzureTarget(
  */
 export function resolveHipaaTarget(cfg: HipaaConfig): CloudTarget {
   const endpoint = cfg.endpoint.replace(/\/+$/, "");
-  if (!endpoint) throw new Error("HIPAA (Azure OpenAI) selected but hipaa_endpoint is not set");
-  if (!cfg.model) throw new Error("HIPAA (Azure OpenAI) selected but hipaa_model (deployment name) is not set");
-  if (!cfg.apiKey) throw new Error("HIPAA mode selected but no Azure key is saved");
+  if (!endpoint) throw new HipaaNotConfiguredError("no Azure resource endpoint is set");
+  if (!cfg.model) throw new HipaaNotConfiguredError("no Azure deployment name is set");
+  if (!cfg.apiKey) throw new HipaaNotConfiguredError("no Azure key is saved");
   return buildAzureTarget(endpoint, cfg.apiVersion, cfg.model, cfg.apiKey, "azure-hipaa");
 }
 
