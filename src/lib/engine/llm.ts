@@ -33,7 +33,7 @@ const MODEL = process.env.LLM_MODEL ?? "deepseek-chat";
 // + non-streaming generation routinely exceeds 8s and the answer was being dropped
 // for the setup-guidance message. 45s covers a real remote/CPU generation while
 // staying well under the route's 120s budget.
-const LOCAL_TIMEOUT_MS = 45000;
+const LOCAL_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS) || 45000;
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
