@@ -120,14 +120,20 @@ Sign in → ask about your built-in data (you'll get cited answers) → **Upload
 |---|---|
 | **Demo / trying it out** | The **free** Gemini tier is fine. Note: it has a **daily limit** — under heavy use, *uploaded-document* questions may say "try again." That's the free rate limit, not a bug (it costs nothing). Questions about your existing data stay instant. |
 | **Real, regular use** | Turn on **billing** for your Gemini key (pennies per question) so it never throttles, and point the **answer model** at Gemini too. |
-| **Real hospital/legal data (PHI)** | Use **Google Vertex AI** or **Azure OpenAI** with a signed **HIPAA BAA**, your own keys. Switching the answer model is a config change (`LLM_*`), no rebuild. Never run real patient/legal data through a free developer key. |
-| **Run the AI on your OWN hardware** | Flip the big **Cloud ⇄ Local** switch to **Local** and point it at your own model (e.g. Ollama). Only works when you **self-host** Nucleus on the same machine/network. **→ see [LOCAL-MODEL.md](LOCAL-MODEL.md).** |
+| **Real hospital/legal data (PHI)** | Switch the model to **HIPAA** mode (Settings → Model), paste your **Azure OpenAI** key + endpoint — no redeploy. It **fails closed** (never uses the shared cloud key). Requires a signed **HIPAA BAA** with Microsoft + a covered Azure resource. Never run real patient/legal data through a free developer key. |
+| **Run the AI on your OWN hardware** | Switch to **Local** and point it at your own model (Ollama) — works **self-hosted** *or* with the hosted app via a **tunnel**. Click **Detect models** to pick. **→ [LOCAL-MODEL.md](LOCAL-MODEL.md)** (tested, both ways + 24/7). |
 
 ---
 
-## Cloud ⇄ Local — run the AI on your own machine
+## Three model modes — Cloud / HIPAA / Local
 
-Nucleus has a prominent **Cloud ⇄ Local** switch (top of the Ask panel, and in **Settings → Model**). **Cloud** (the default) uses a hosted model; **Local** runs the AI on **your own hardware** (e.g. an Ollama model on your server). The hosted demo can only use **Cloud** — Local works when you **self-host** the app on the same machine/network as your model. Full step-by-step (run the repo on your box → install Ollama → enter your endpoint → flip the switch), the "serve my own clients from my own box" topology, and the honest "local model ≠ fully offline" caveat are in **→ [LOCAL-MODEL.md](LOCAL-MODEL.md)**.
+Nucleus has a **three-way model switch** (top of the Ask panel, and in **Settings → Model**), and **each mode keeps its own saved key**, so you enter them once and flip freely:
+
+- **Cloud** (the default) — a hosted model. Paste **any** OpenAI-compatible key (DeepSeek, OpenAI, Gemini, …); with no key it uses the demo's configured default. Best for everyday use.
+- **HIPAA** — a HIPAA-eligible hosted model. Paste your **Azure OpenAI** key + resource endpoint + deployment name. For your protection this mode **fails closed** — it never falls back to the shared cloud key, so PHI-intent traffic can't leak to a non-BAA provider. *(Labeled "HIPAA-eligible under a Microsoft BAA" — eligibility also requires you to sign a BAA with Microsoft and use a covered Azure resource. Google Vertex under a BAA is also possible but needs service-account auth, not a pasted key — ask your helper if you need Vertex.)*
+- **Local** — the AI runs on **your own machine** (Ollama). Enter your endpoint and click **Detect models on your box** to pick from what you've installed. Works **self-hosted** (app on the box) **or** with the hosted Vercel app via a **tunnel**. Full tested setup (both ways, the 24/7 self-healing tunnel, the model trade-off) → **[LOCAL-MODEL.md](LOCAL-MODEL.md)**.
+
+All of this is in-app (Settings → Model) — **no redeploy**. Keys are write-only (saved, never shown back).
 
 ---
 
@@ -140,7 +146,8 @@ Nucleus has a prominent **Cloud ⇄ Local** switch (top of the Ask panel, and in
 | Add / remove a user | Admin panel → create account / kick out |
 | Add a document | **Upload** on the dashboard |
 | Run the answers on Gemini (not DeepSeek) | Set the `LLM_PROVIDER=gemini` block (billing-enabled key) |
-| Run the AI on my own machine (Local) | Self-host + flip the **Cloud ⇄ Local** switch → [LOCAL-MODEL.md](LOCAL-MODEL.md) |
+| Run the AI on my own machine (Local) | Switch to **Local** (self-host or tunnel), **Detect models** → [LOCAL-MODEL.md](LOCAL-MODEL.md) |
+| Use a HIPAA model (Azure) | Switch to **HIPAA**, paste your Azure key + endpoint (Settings → Model) — fails closed |
 | Stop document questions throttling | Turn on billing for your Gemini key |
 | Go live with real PHI | Vertex/Azure + signed BAA + your own keys |
 
