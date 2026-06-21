@@ -13,7 +13,7 @@ import type { SqlRow } from "./structured-store.ts";
 import { vectorSearch as vectorSearchLocal, type DocChunk } from "./retrieval.ts";
 import { fileSearchEnabled, queryFileSearch } from "./file-search.ts";
 import { embedQuery } from "./embeddings.ts";
-import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable, isHipaaNotConfigured } from "./llm.ts";
+import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable, isHipaaNotConfigured, isCloudProviderNotConfigured } from "./llm.ts";
 import { sqlToken, pdfToken, extractCitationTokens } from "./citations.ts";
 import { validateAnswer, type Evidence } from "./validate-answer.ts";
 import { DOCUMENTS } from "./documents.ts";
@@ -185,6 +185,26 @@ function hipaaGuidanceResult(question: string): AnswerResult {
   };
 }
 
+// A cloud provider was explicitly selected but has no saved key → friendly guidance
+// (a 200) instead of a silent fallback to the env default. NEVER uses another
+// provider's key.
+function cloudProviderGuidanceResult(question: string, provider: string): AnswerResult {
+  return {
+    question,
+    route: {
+      sources: [],
+      docFilter: null,
+      rationale: `Cloud provider "${provider}" is selected but has no saved API key.`,
+    },
+    answer:
+      `You've selected the "${provider}" cloud provider, but no API key is saved for it. Add your ${provider} key in Settings → Model, or switch the provider back to "Default" to use the built-in model. (It will not silently use a different provider's key.)`,
+    mode: "general",
+    grounded: false,
+    evidence: { rows: [], chunks: [] },
+    validation: { ok: true, reasons: [] },
+  };
+}
+
 // PUBLIC entry. Runs the real pipeline, but if the active backend is LOCAL and it
 // can't answer (not configured / unreachable), returns the friendly guidance as a
 // normal 200 payload instead of letting the typed error become a 500.
@@ -204,6 +224,9 @@ export async function answerQuestion(
     }
     if (isHipaaNotConfigured(e)) {
       return hipaaGuidanceResult(question);
+    }
+    if (isCloudProviderNotConfigured(e)) {
+      return cloudProviderGuidanceResult(question, (e as { provider?: string }).provider ?? "the selected");
     }
     throw e; // any other error keeps its existing (cloud) handling.
   }

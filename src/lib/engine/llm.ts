@@ -127,6 +127,19 @@ export class HipaaNotConfiguredError extends Error {
   }
 }
 
+/** An explicit cloud provider was selected but no key was saved for it. Fails closed
+ *  (friendly guidance) rather than silently using the env default — so a keyless
+ *  provider selection can never masquerade as that provider actually working. */
+export class CloudProviderNotConfiguredError extends Error {
+  readonly code = "CLOUD_PROVIDER_NOT_CONFIGURED" as const;
+  readonly provider: string;
+  constructor(provider: string) {
+    super(`Cloud provider "${provider}" is selected but no API key is saved for it.`);
+    this.name = "CloudProviderNotConfiguredError";
+    this.provider = provider;
+  }
+}
+
 export function isLocalNotConfigured(e: unknown): e is LocalNotConfiguredError {
   return e instanceof LocalNotConfiguredError ||
     (e instanceof Error && (e as { code?: string }).code === "LOCAL_NOT_CONFIGURED");
@@ -138,6 +151,10 @@ export function isLocalUnreachable(e: unknown): e is LocalUnreachableError {
 export function isHipaaNotConfigured(e: unknown): e is HipaaNotConfiguredError {
   return e instanceof HipaaNotConfiguredError ||
     (e instanceof Error && (e as { code?: string }).code === "HIPAA_NOT_CONFIGURED");
+}
+export function isCloudProviderNotConfigured(e: unknown): e is CloudProviderNotConfiguredError {
+  return e instanceof CloudProviderNotConfiguredError ||
+    (e instanceof Error && (e as { code?: string }).code === "CLOUD_PROVIDER_NOT_CONFIGURED");
 }
 
 // "Configured" means there IS a backend able to answer. Cloud needs an API key in
@@ -260,9 +277,8 @@ export function resolveHipaaTarget(cfg: HipaaConfig): CloudTarget {
  * half-filled form can't break the working cloud default.
  */
 export function resolveCloudTarget(cfg: CloudConfig): CloudTarget {
-  const override = cfg.provider !== "" && cfg.apiKey !== "";
-  if (!override) {
-    // ── ENV DEFAULT (unchanged behavior) ──
+  // Blank provider = use the env-configured default (the demo's working backend).
+  if (cfg.provider === "") {
     const key = process.env.LLM_API_KEY;
     if (!key) throw new Error("LLM_API_KEY not set");
     return {
@@ -271,6 +287,12 @@ export function resolveCloudTarget(cfg: CloudConfig): CloudTarget {
       provider: PROVIDER,
       model: MODEL,
     };
+  }
+  // An EXPLICITLY chosen provider with NO saved key must NOT silently fall back to the
+  // env key — that masquerades the wrong provider as working (the reported bug). Fail
+  // closed with a clear message, exactly like HIPAA mode.
+  if (cfg.apiKey === "") {
+    throw new CloudProviderNotConfiguredError(cfg.provider);
   }
 
   if (cfg.provider === "azure") {

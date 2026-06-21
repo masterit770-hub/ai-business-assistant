@@ -89,19 +89,42 @@ test("no override → env default target (Bearer + the env base/chat path)", () 
   }
 });
 
-test("provider set WITHOUT a key → falls back to env (a half-filled form can't break cloud)", () => {
+test("provider set WITHOUT a key → FAILS CLOSED (never silently uses the env key)", () => {
+  // The reported bug: selecting a provider with no key silently fell back to the env
+  // (DeepSeek) key, making it LOOK like the selected provider worked. It must fail closed.
+  const prev = process.env.LLM_API_KEY;
+  process.env.LLM_API_KEY = "env-key";
+  try {
+    assert.throws(
+      () =>
+        resolveCloudTarget({
+          provider: "openai",
+          apiKey: "", // no key saved for the selected provider
+          model: "gpt-4o",
+          baseUrl: "",
+          azureEndpoint: "",
+          azureApiVersion: "",
+        }),
+      /no API key is saved/i
+    );
+  } finally {
+    if (prev === undefined) delete process.env.LLM_API_KEY;
+    else process.env.LLM_API_KEY = prev;
+  }
+});
+
+test("blank provider (Default) → still uses the env-default backend (demo path intact)", () => {
   const prev = process.env.LLM_API_KEY;
   process.env.LLM_API_KEY = "env-key";
   try {
     const t = resolveCloudTarget({
-      provider: "openai",
-      apiKey: "", // no key yet
-      model: "gpt-4o",
+      provider: "",
+      apiKey: "",
+      model: "",
       baseUrl: "",
       azureEndpoint: "",
       azureApiVersion: "",
     });
-    // It used the ENV target, not an OpenAI override.
     assert.equal(t.headers["Authorization"], "Bearer env-key");
   } finally {
     if (prev === undefined) delete process.env.LLM_API_KEY;
