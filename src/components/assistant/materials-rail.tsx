@@ -8,7 +8,7 @@ import { TableViewer } from "@/components/assistant/table-viewer";
 import type { Urgency } from "@/lib/mock";
 
 type DocLang = "en" | "he" | null;
-type DocMeta = { doc: string; label: string; urgency: Urgency | null };
+type DocMeta = { doc: string; label: string; urgency: Urgency | null; lang?: DocLang };
 type BundledSource = {
   doc: string;
   label: string;
@@ -17,9 +17,11 @@ type BundledSource = {
   lang?: DocLang;
 };
 
-// Honest, lightweight language detection for an UPLOADED doc, from the only text we
-// have client-side: its label. Hebrew letters → "he", Latin letters → "en", neither
-// → null (the chip is omitted — we never fabricate a language we can't see).
+// Fallback language guess for an uploaded doc when the server didn't supply a
+// content-detected language (older rows / Supabase off): infer from the label.
+// PREFER the server's `lang` (detected from the doc's REAL indexed text) — a Hebrew
+// invoice named "hebrew-invoice.pdf" must read HE from its content, not EN from its
+// Latin filename. Hebrew letters → "he", Latin → "en", neither → null (chip omitted).
 function labelLang(label: string): DocLang {
   if (/[֐-׿]/.test(label)) return "he";
   if (/[A-Za-z]/.test(label)) return "en";
@@ -178,7 +180,7 @@ export function MaterialsRail() {
               >
                 <SourceChip kind="document" />
                 <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{d.label}</span>
-                <LangChip lang={labelLang(d.label)} />
+                <LangChip lang={d.lang ?? labelLang(d.label)} />
                 {d.urgency && (
                   <span data-testid={`doc-urgency-${d.doc}`}>
                     <UrgencyBadge urgency={d.urgency} />

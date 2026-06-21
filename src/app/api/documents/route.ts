@@ -38,7 +38,15 @@ export async function GET() {
     // when Supabase is configured; otherwise the in-memory dev/offline registry.
     // Urgency lives only in the in-memory registry (classified at ingest), so we
     // overlay it onto the durable list when the same doc id is still in memory.
-    let uploaded: { doc: string; label: string; urgency: "high" | "medium" | "low" | null }[];
+    // `lang` (en/he/null) is the doc's primary language, detected from its REAL indexed
+    // text on the durable path — so the UI tags a Hebrew doc HE even if its filename is
+    // Latin. The in-memory dev path leaves it undefined (UI falls back to a label guess).
+    let uploaded: {
+      doc: string;
+      label: string;
+      urgency: "high" | "medium" | "low" | null;
+      lang?: "en" | "he" | null;
+    }[];
     if (supabaseEnabled()) {
       const durable = await listUploadedDocs(scopeOwner);
       const memMeta = new Map((await listDocsWithMeta()).map((d) => [d.doc, d.urgency]));

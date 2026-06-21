@@ -96,15 +96,26 @@ export async function routeQuestion(
 
 export function normalizePlan(parsed: unknown): RoutePlan {
   const p = (parsed ?? {}) as Record<string, unknown>;
-  const sources: string[] = Array.isArray(p.sources)
-    ? (p.sources as unknown[]).filter(
-        (s): s is string => s === "structured" || s === "documents"
-      )
-    : [];
-  const finalSources = (sources.length ? sources : ["structured", "documents"]) as (
-    | "structured"
-    | "documents"
-  )[];
+  const rawSources = Array.isArray(p.sources) ? (p.sources as unknown[]) : null;
+  const valid = (rawSources ?? []).filter(
+    (s): s is "structured" | "documents" => s === "structured" || s === "documents"
+  );
+  // Decide source selection, distinguishing a DELIBERATE "no source needed" from a
+  // MALFORMED response. The router prompt instructs the model to return an EMPTY
+  // sources array when neither source is relevant (a greeting / pure-general
+  // question) — that is a real decision and we must HONOR it (skip retrieval, answer
+  // from general knowledge), NOT silently override it to query both. Only fall back
+  // to querying BOTH when the response is genuinely unusable: no sources field at
+  // all, or a non-empty array that contained no valid source name.
+  const BOTH: ("structured" | "documents")[] = ["structured", "documents"];
+  const finalSources: ("structured" | "documents")[] =
+    rawSources === null
+      ? BOTH // no usable sources field → malformed → query everything
+      : rawSources.length === 0
+        ? [] // deliberate "no source needed" → honor it (no retrieval)
+        : valid.length
+          ? valid // model picked valid source(s)
+          : BOTH; // non-empty but all-garbage → malformed → query everything
   return {
     sources: finalSources,
     docFilter: typeof p.docFilter === "string" ? (p.docFilter as string) : null,

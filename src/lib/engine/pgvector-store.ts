@@ -16,6 +16,7 @@
 // lane + structured lane still answer), never crashing the request.
 import { admin, supabaseEnabled } from "./supabase.ts";
 import { pdfToken } from "./citations.ts";
+import { detectLang, type DocLang } from "./bundled-sources.ts";
 import type { DocChunk } from "./retrieval.ts";
 
 // One chunk ready to persist: its page, text, citation token, and the local-embedder
@@ -243,7 +244,14 @@ export async function hybridSearch(
 
 // One uploaded document as the dashboard lists it — derived DURABLY from the
 // pgvector store (distinct doc_id), owner-scoped. Mirrors the doc-store DocMeta shape.
-export type UploadedDocMeta = { doc: string; label: string; urgency: "high" | "medium" | "low" | null };
+// `lang` is the doc's PRIMARY language detected from its real indexed text (not its
+// filename) — so a Hebrew invoice named "hebrew-invoice.pdf" is correctly tagged HE.
+export type UploadedDocMeta = {
+  doc: string;
+  label: string;
+  urgency: "high" | "medium" | "low" | null;
+  lang: DocLang;
+};
 
 /**
  * The caller's uploaded documents, rebuilt DURABLY from the pgvector store (one entry
@@ -259,20 +267,33 @@ export async function listUploadedDocs(ownerId?: string): Promise<UploadedDocMet
   if (!supabaseEnabled()) return [];
   try {
     const db = admin();
-    let q = db.from("doc_chunks").select("doc_id, doc_label, owner_id");
+    // Pull `content` too so we can detect each doc's language from its REAL indexed
+    // text (honest), instead of guessing from the filename.
+    let q = db.from("doc_chunks").select("doc_id, doc_label, owner_id, content");
     if (ownerId) q = q.eq("owner_id", ownerId);
     const { data, error } = await q;
     if (error) {
       console.error("[pgvector-store] listUploadedDocs failed:", error.message);
       return [];
     }
-    const byDoc = new Map<string, UploadedDocMeta>();
-    for (const r of (data ?? []) as { doc_id: string; doc_label: string | null }[]) {
-      if (!byDoc.has(r.doc_id)) {
-        byDoc.set(r.doc_id, { doc: r.doc_id, label: r.doc_label || r.doc_id, urgency: null });
+    const byDoc = new Map<string, { label: string }>();
+    // Accumulate a BOUNDED sample of each doc's text for language detection (a few KB
+    // is plenty; avoids holding a whole corpus in memory).
+    const sample = new Map<string, string>();
+    const SAMPLE_CAP = 4000;
+    for (const r of (data ?? []) as { doc_id: string; doc_label: string | null; content: string | null }[]) {
+      if (!byDoc.has(r.doc_id)) byDoc.set(r.doc_id, { label: r.doc_label || r.doc_id });
+      const acc = sample.get(r.doc_id) ?? "";
+      if (acc.length < SAMPLE_CAP && r.content) {
+        sample.set(r.doc_id, (acc + " " + r.content).slice(0, SAMPLE_CAP));
       }
     }
-    return [...byDoc.values()];
+    return [...byDoc.entries()].map(([doc, { label }]) => ({
+      doc,
+      label,
+      urgency: null,
+      lang: detectLang(sample.get(doc) ?? ""),
+    }));
   } catch (e) {
     console.error("[pgvector-store] listUploadedDocs failed:", e instanceof Error ? e.message : e);
     return [];
