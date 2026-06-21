@@ -18,28 +18,24 @@ function ConsoleWithSession() {
 }
 
 export default function DashboardPage() {
-  // Real stats from /api/documents (published by MaterialsRail): uploaded count +
-  // high-urgency (`nucleus:docs`) and the bundled source count (`nucleus:bundled`).
-  // "Sources" = the REAL total (bundled + uploaded).
-  const [uploaded, setUploaded] = useState<{ total: number; high: number } | null>(null);
-  const [bundled, setBundled] = useState<number | null>(null);
+  // Real counts from /api/documents, published by MaterialsRail as RAW counts so every
+  // stat is computed here from the same source — no pre-summed "total" that could
+  // double-count. Sources = uploads + bundled (the whole bucket); Your uploads = uploads
+  // only; High urgency = high-urgency docs across the bucket.
+  const [counts, setCounts] = useState<{ uploaded: number; bundled: number; high: number } | null>(
+    null
+  );
 
   useEffect(() => {
-    const onDocs = (e: Event) => setUploaded((e as CustomEvent).detail);
-    const onBundled = (e: Event) => setBundled((e as CustomEvent).detail.count);
+    const onDocs = (e: Event) => setCounts((e as CustomEvent).detail);
     window.addEventListener("nucleus:docs", onDocs);
-    window.addEventListener("nucleus:bundled", onBundled);
-    return () => {
-      window.removeEventListener("nucleus:docs", onDocs);
-      window.removeEventListener("nucleus:bundled", onBundled);
-    };
+    return () => window.removeEventListener("nucleus:docs", onDocs);
   }, []);
 
-  const total = uploaded !== null && bundled !== null ? uploaded.total + bundled : null;
   const stats = [
-    { label: "Sources", value: total !== null ? String(total) : null },
-    { label: "Your uploads", value: uploaded ? String(uploaded.total) : null },
-    { label: "High urgency", value: uploaded ? String(uploaded.high) : null },
+    { label: "Sources", value: counts ? String(counts.uploaded + counts.bundled) : null },
+    { label: "Your uploads", value: counts ? String(counts.uploaded) : null },
+    { label: "High urgency", value: counts ? String(counts.high) : null },
   ];
 
   return (
@@ -78,7 +74,7 @@ export default function DashboardPage() {
         {/* the workspace: materials rail + the assistant console */}
         <div className="flex flex-1 gap-5 overflow-hidden p-5">
           {/* left: materials */}
-          <div className="hidden w-[340px] shrink-0 lg:block">
+          <div className="hidden w-[420px] shrink-0 lg:block">
             <MaterialsRail />
           </div>
 

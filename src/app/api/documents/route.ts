@@ -3,7 +3,7 @@ import { getCurrentUser } from "@/lib/supabase/auth";
 import { listDocsWithMeta } from "@/lib/engine/doc-store";
 import { listUploadedDocs, deleteUploadedDoc } from "@/lib/engine/pgvector-store";
 import { removeRuntimeDoc } from "@/lib/engine/runtime-store";
-import { bundledSources } from "@/lib/engine/bundled-sources";
+import { bundledSources, enrichBundledUrgency } from "@/lib/engine/bundled-sources";
 import {
   refreshDeletedSources,
   markSourceDeleted,
@@ -59,7 +59,9 @@ export async function GET() {
       documents: uploaded,
       // The bundled sample corpus is part of the DEMO accounts only. A real client user
       // (isDemo=false) gets an empty bundled list → a clean bucket of just their uploads.
-      bundled: user.isDemo ? bundledSources() : [],
+      // Enriched with a (cached) urgency badge so EVERY document shows urgency, not just
+      // uploads.
+      bundled: user.isDemo ? await enrichBundledUrgency(bundledSources()) : [],
       role: user.role,
     });
   } catch (e) {

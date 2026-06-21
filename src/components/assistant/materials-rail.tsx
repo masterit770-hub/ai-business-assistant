@@ -15,6 +15,7 @@ type BundledSource = {
   kind: "document" | "structured";
   detail: string;
   lang?: DocLang;
+  urgency?: Urgency | null; // documents carry an urgency badge too, for a consistent bucket
 };
 
 // Fallback language guess for an uploaded doc when the server didn't supply a
@@ -59,18 +60,17 @@ export function MaterialsRail() {
       // Probe each uploaded doc's original-file retrievability (FIX 3) so the rail only
       // offers a download for docs whose original is actually stored — never a dead 404.
       probeRetrievability(docs);
-      // ONE bucket → the dashboard "documents" stat counts EVERYTHING the assistant can
-      // answer from (uploads + the bundled sample corpus), not just uploads. (Urgency is
-      // an UPLOADED-doc badge — the bundled sample corpus isn't urgency-classified.)
+      // Publish the RAW counts (not a pre-summed "total") so every consumer computes its
+      // own stat consistently and nothing double-counts: uploads, bundled, and the
+      // high-urgency count across the WHOLE bucket (uploads + bundled docs).
+      const high =
+        docs.filter((x) => x.urgency === "high").length +
+        b.filter((x) => x.urgency === "high").length;
       window.dispatchEvent(
         new CustomEvent("nucleus:docs", {
-          detail: {
-            total: docs.length + b.length,
-            high: docs.filter((x) => x.urgency === "high").length,
-          },
+          detail: { uploaded: docs.length, bundled: b.length, high },
         })
       );
-      window.dispatchEvent(new CustomEvent("nucleus:bundled", { detail: { count: b.length } }));
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load");
     }
@@ -187,59 +187,65 @@ export function MaterialsRail() {
               <li
                 key={d.doc}
                 data-testid={`doc-row-${d.doc}`}
-                className="flex items-center gap-2 border-b border-line px-4 py-2.5 last:border-0"
+                className="border-b border-line px-4 py-3 last:border-0"
               >
-                <SourceChip kind="document" />
-                <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{d.label}</span>
-                <LangChip lang={d.lang ?? labelLang(d.label)} />
-                {/* page-count detail, consistent with the bundled-doc rows */}
-                {typeof d.pages === "number" && d.pages > 0 && (
+                {/* line 1: the document NAME gets the full width (no longer crammed by
+                    chips); only the action icons share the line. */}
+                <div className="flex items-center gap-2">
+                  <SourceChip kind="document" />
                   <span
-                    data-testid={`doc-pages-${d.doc}`}
-                    className="shrink-0 text-[11px] text-faint"
+                    data-testid={`doc-name-${d.doc}`}
+                    title={d.label}
+                    className="min-w-0 flex-1 truncate text-sm font-medium text-ink"
                   >
-                    PDF · {d.pages} page{d.pages === 1 ? "" : "s"}
+                    {d.label}
                   </span>
-                )}
-                {d.urgency && (
-                  <span data-testid={`doc-urgency-${d.doc}`}>
-                    <UrgencyBadge urgency={d.urgency} />
-                  </span>
-                )}
-                {/* FIX 3: only offer the download when the original is retrievable.
-                    Unknown (probe pending) → show it (optimistic); explicitly false →
-                    a disabled, clearly-labelled control instead of a dead 404 link. */}
-                {retrievable[d.doc] === false ? (
-                  <span
-                    data-testid={`doc-no-original-${d.doc}`}
-                    title="Original file not stored — this upload was indexed but its source file isn’t kept, so it can’t be downloaded."
-                    className="inline-flex size-6 cursor-default items-center justify-center rounded-md text-faint/40"
-                  >
-                    <Download className="size-3.5" />
-                  </span>
-                ) : (
-                  <button
-                    onClick={() => openFile(d.doc)}
-                    data-testid={`doc-download-${d.doc}`}
-                    title="Open / download"
-                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
-                  >
-                    <Download className="size-3.5" />
-                  </button>
-                )}
-                <button
-                  onClick={() => remove(d.doc, d.label)}
-                  disabled={removing === d.doc}
-                  data-testid={`doc-remove-${d.doc}`}
-                  title="Remove"
-                  className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
-                >
-                  {removing === d.doc ? (
-                    <Loader2 className="size-3.5 animate-spin" />
+                  {retrievable[d.doc] === false ? (
+                    <span
+                      data-testid={`doc-no-original-${d.doc}`}
+                      title="Original file not stored — this upload was indexed but its source file isn’t kept, so it can’t be downloaded."
+                      className="inline-flex size-6 cursor-default items-center justify-center rounded-md text-faint/40"
+                    >
+                      <Download className="size-3.5" />
+                    </span>
                   ) : (
-                    <Trash2 className="size-3.5" />
+                    <button
+                      onClick={() => openFile(d.doc)}
+                      data-testid={`doc-download-${d.doc}`}
+                      title="Open / download"
+                      className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                    >
+                      <Download className="size-3.5" />
+                    </button>
                   )}
-                </button>
+                  <button
+                    onClick={() => remove(d.doc, d.label)}
+                    disabled={removing === d.doc}
+                    data-testid={`doc-remove-${d.doc}`}
+                    title="Remove"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
+                  >
+                    {removing === d.doc ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="size-3.5" />
+                    )}
+                  </button>
+                </div>
+                {/* line 2: the metadata chips, indented under the name. */}
+                <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-7">
+                  <LangChip lang={d.lang ?? labelLang(d.label)} />
+                  {typeof d.pages === "number" && d.pages > 0 && (
+                    <span data-testid={`doc-pages-${d.doc}`} className="text-[11px] text-faint">
+                      PDF · {d.pages} page{d.pages === 1 ? "" : "s"}
+                    </span>
+                  )}
+                  {d.urgency && (
+                    <span data-testid={`doc-urgency-${d.doc}`}>
+                      <UrgencyBadge urgency={d.urgency} />
+                    </span>
+                  )}
+                </div>
               </li>
             ))}
             {/* the bundled sample corpus, in the SAME list (demo accounts only; empty
@@ -248,68 +254,80 @@ export function MaterialsRail() {
               <li
                 key={s.doc}
                 data-testid={`bundled-row-${s.doc}`}
-                className="flex items-center gap-2 border-b border-line px-4 py-2.5 last:border-0"
+                className="border-b border-line px-4 py-3 last:border-0"
               >
-                <SourceChip kind={s.kind} />
-                <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{s.label}</span>
-                {/* Documents carry an honest EN/HE chip from their indexed text; structured tables don't. */}
-                {s.kind === "document" && <LangChip lang={s.lang ?? null} />}
-                <span className="shrink-0 text-[11px] text-faint">{s.detail}</span>
-                {/* Only a PDF/document source has an openable original file. */}
-                {s.kind === "document" && (
-                  <button
-                    onClick={() => openFile(s.doc)}
-                    data-testid={`bundled-download-${s.doc}`}
-                    title="Open / download"
-                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                {/* line 1: full-width name + actions */}
+                <div className="flex items-center gap-2">
+                  <SourceChip kind={s.kind} />
+                  <span
+                    data-testid={`bundled-name-${s.doc}`}
+                    title={s.label}
+                    className="min-w-0 flex-1 truncate text-sm font-medium text-ink"
                   >
-                    <Download className="size-3.5" />
-                  </button>
-                )}
-                {/* FIX 1: a structured table is no longer a black box — View opens the
-                    real columns + rows; Export CSV downloads them (GET /api/table). */}
-                {s.kind === "structured" && (
-                  <>
+                    {s.label}
+                  </span>
+                  {s.kind === "document" && (
                     <button
-                      onClick={() => setViewing({ table: s.doc, label: s.label })}
-                      data-testid={`bundled-view-${s.doc}`}
-                      title="View rows"
-                      className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
-                    >
-                      <Table className="size-3.5" />
-                    </button>
-                    <button
-                      onClick={() =>
-                        window.open(
-                          `/api/table?table=${encodeURIComponent(s.doc)}&format=csv`,
-                          "_blank",
-                          "noopener"
-                        )
-                      }
-                      data-testid={`bundled-export-${s.doc}`}
-                      title="Export CSV"
+                      onClick={() => openFile(s.doc)}
+                      data-testid={`bundled-download-${s.doc}`}
+                      title="Open / download"
                       className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
                     >
                       <Download className="size-3.5" />
                     </button>
-                  </>
-                )}
-                {/* Built-in data is SHARED → only an admin can remove it (workspace-wide). */}
-                {role === "admin" && (
-                  <button
-                    onClick={() => remove(s.doc, s.label, "bundled", s.kind)}
-                    disabled={removing === s.doc}
-                    data-testid={`bundled-remove-${s.doc}`}
-                    title="Remove built-in source (admin)"
-                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
-                  >
-                    {removing === s.doc ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Trash2 className="size-3.5" />
-                    )}
-                  </button>
-                )}
+                  )}
+                  {s.kind === "structured" && (
+                    <>
+                      <button
+                        onClick={() => setViewing({ table: s.doc, label: s.label })}
+                        data-testid={`bundled-view-${s.doc}`}
+                        title="View rows"
+                        className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                      >
+                        <Table className="size-3.5" />
+                      </button>
+                      <button
+                        onClick={() =>
+                          window.open(
+                            `/api/table?table=${encodeURIComponent(s.doc)}&format=csv`,
+                            "_blank",
+                            "noopener"
+                          )
+                        }
+                        data-testid={`bundled-export-${s.doc}`}
+                        title="Export CSV"
+                        className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                      >
+                        <Download className="size-3.5" />
+                      </button>
+                    </>
+                  )}
+                  {role === "admin" && (
+                    <button
+                      onClick={() => remove(s.doc, s.label, "bundled", s.kind)}
+                      disabled={removing === s.doc}
+                      data-testid={`bundled-remove-${s.doc}`}
+                      title="Remove built-in source (admin)"
+                      className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
+                    >
+                      {removing === s.doc ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="size-3.5" />
+                      )}
+                    </button>
+                  )}
+                </div>
+                {/* line 2: metadata — lang (docs only) + detail + urgency badge */}
+                <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-7">
+                  {s.kind === "document" && <LangChip lang={s.lang ?? null} />}
+                  <span className="text-[11px] text-faint">{s.detail}</span>
+                  {s.urgency && (
+                    <span data-testid={`bundled-urgency-${s.doc}`}>
+                      <UrgencyBadge urgency={s.urgency} />
+                    </span>
+                  )}
+                </div>
               </li>
             ))}
           </ul>

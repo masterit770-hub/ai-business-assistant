@@ -1,11 +1,17 @@
-// RENDERED component test for the "Your materials" rail — the layer that API/eval tests
-// never exercise (and where a cluster of one-bucket regressions hid: a wrong count, a
-// missing page detail, a grey/dead download, a vanished urgency badge). This drives the
-// REAL deployed dashboard and asserts what the USER sees in the DOM, then confirms the
-// download actually serves the file. Exit 1 on any failure.
+// RENDERED state+layout test for the documents bucket — written FROM the API data and
+// the USER's standard, NOT from the component's own test-ids. It derives what SHOULD be
+// true from /api/documents and asserts the rendered dashboard matches:
+//   • COUNT CONSISTENCY — every counter (the three stat cards + the rail header) agrees
+//     with each other AND with the data (Sources = uploads + bundled; Your uploads =
+//     uploads). This is the cross-check that catches a double-count / mislabel.
+//   • URGENCY CONSISTENCY — EVERY document row (uploaded + bundled) shows an urgency
+//     badge, not just one. (Tables don't — they aren't documents.)
+//   • READABILITY — NO document name is truncated (scrollWidth <= clientWidth). Catches
+//     the "names crammed into one line" regression that a presence-only test missed.
+//   • DOWNLOAD — an uploaded PDF actually serves its original file.
+// Exit 1 on any failure.
 //
-//   RENDER_BASE   override target (default: production alias)
-//   Creds from .secrets/demo-accounts.txt — parsed in-process, never printed.
+//   RENDER_BASE  override target (default: production alias)
 import { chromium } from "playwright-core";
 import fs from "node:fs";
 
@@ -29,7 +35,8 @@ async function main() {
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
-  const p = await (await b.newContext({ viewport: { width: 1400, height: 1000 } })).newPage();
+  // wide viewport so the lg: rail (and the stat cards) actually render.
+  const p = await (await b.newContext({ viewport: { width: 1500, height: 1000 } })).newPage();
   p.setDefaultTimeout(120000);
   try {
     await p.goto(`${BASE}/sign-in`, { waitUntil: "networkidle" });
@@ -38,52 +45,73 @@ async function main() {
     await p.click('[data-testid="auth-submit"]');
     await p.waitForURL("**/dashboard", { timeout: 90000 });
     await p.waitForSelector('[data-testid="materials-rail"]', { timeout: 30000 });
-    await p.waitForTimeout(3000);
+    await p.waitForTimeout(3500); // let the rail load + publish counts
 
-    // What the API says is in the bucket (uploads + bundled), to derive the expected count.
-    const api = await p.evaluate(async () => (await (await fetch("/api/documents")).json()));
+    // GROUND TRUTH from the API (independent of any rendered test-id).
+    const api = await p.evaluate(async () => await (await fetch("/api/documents")).json());
     const uploads = api.documents ?? [];
     const bundled = api.bundled ?? [];
-    const expectedCount = uploads.length + bundled.length;
+    const bundledDocs = bundled.filter((s) => s.kind === "document");
+    const expectedSources = uploads.length + bundled.length;
 
-    const dom = await p.evaluate(() => {
+    // What the SCREEN shows.
+    const ui = await p.evaluate(() => {
+      const num = (sel) => {
+        const t = document.querySelector(sel)?.textContent?.trim();
+        return t && /^\d+$/.test(t) ? Number(t) : null;
+      };
       const rail = document.querySelector('[data-testid="materials-rail"]');
-      const railText = rail?.innerText ?? "";
-      const headerN = (railText.match(/(\d+)\s+sources/) || [])[1];
-      // every uploaded doc row that is a PDF should carry: a page detail, an ENABLED
-      // download (not the "no original" greyed span), and (when classified) an urgency badge.
-      const docRows = [...document.querySelectorAll('[data-testid^="doc-row-"]')].map((el) => {
-        const id = el.getAttribute("data-testid").replace("doc-row-", "");
-        return {
-          id,
-          text: el.innerText.replace(/\s+/g, " ").trim(),
-          hasPages: !!el.querySelector(`[data-testid="doc-pages-${id}"]`),
-          downloadEnabled: !!el.querySelector(`[data-testid="doc-download-${id}"]`),
-          downloadGreyed: !!el.querySelector(`[data-testid="doc-no-original-${id}"]`),
-          hasUrgency: !!el.querySelector(`[data-testid="doc-urgency-${id}"]`),
-        };
-      });
-      return { headerN, docRows };
+      const headerSources = Number((rail?.innerText.match(/(\d+)\s+sources/) || [])[1]);
+      // name elements + whether each is truncated (content wider than its box).
+      const names = [...document.querySelectorAll('[data-testid^="doc-name-"],[data-testid^="bundled-name-"]')].map(
+        (el) => ({
+          id: el.getAttribute("data-testid"),
+          text: el.textContent.trim(),
+          truncated: el.scrollWidth > el.clientWidth + 1,
+        })
+      );
+      const hasUrgency = (id) => !!document.querySelector(`[data-testid="${id}"]`);
+      return {
+        statSources: num('[data-testid="stat-Sources"]'),
+        statUploads: num('[data-testid="stat-Your uploads"]'),
+        headerSources,
+        names,
+        hasUrgency: (rowId, prefix) => hasUrgency(`${prefix}-urgency-${rowId}`),
+      };
     });
 
-    check("count-includes-bundled", Number(dom.headerN) === expectedCount, `header=${dom.headerN} expected=${expectedCount} (uploads ${uploads.length} + bundled ${bundled.length})`);
+    // — COUNT CONSISTENCY (derived from the data + cross-checked across counters) —
+    check("count/stat-sources-matches-data", ui.statSources === expectedSources, `stat Sources=${ui.statSources} expected=${expectedSources} (uploads ${uploads.length} + bundled ${bundled.length})`);
+    check("count/stat-uploads-matches-data", ui.statUploads === uploads.length, `stat "Your uploads"=${ui.statUploads} expected=${uploads.length}`);
+    check("count/rail-header-matches-data", ui.headerSources === expectedSources, `rail header=${ui.headerSources} expected=${expectedSources}`);
+    check("count/all-counters-agree", ui.statSources === ui.headerSources && ui.statSources === ui.statUploads + bundled.length, `sources-stat=${ui.statSources} header=${ui.headerSources} uploads-stat=${ui.statUploads}+bundled=${bundled.length}`);
 
-    // The seeded Hebrew invoice is the canonical uploaded PDF — it must render fully.
-    const heb = dom.docRows.find((r) => r.id === "hebrew-invoice");
-    check("hebrew-row-renders", !!heb, heb?.text || "(hebrew-invoice row missing)");
+    // — URGENCY CONSISTENCY: every DOCUMENT (uploaded + bundled) shows a badge —
+    const urgency = await p.evaluate(({ uploadIds, bundledDocIds }) => {
+      const has = (sel) => !!document.querySelector(sel);
+      const missingUploads = uploadIds.filter((id) => !has(`[data-testid="doc-urgency-${id}"]`));
+      const missingBundled = bundledDocIds.filter((id) => !has(`[data-testid="bundled-urgency-${id}"]`));
+      return { missingUploads, missingBundled };
+    }, { uploadIds: uploads.map((d) => d.doc), bundledDocIds: bundledDocs.map((d) => d.doc) });
+    check("urgency/all-uploaded-docs-have-badge", urgency.missingUploads.length === 0, urgency.missingUploads.length ? `missing on: ${urgency.missingUploads.join(", ")}` : `all ${uploads.length} uploads`);
+    check("urgency/all-bundled-docs-have-badge", urgency.missingBundled.length === 0, urgency.missingBundled.length ? `missing on: ${urgency.missingBundled.join(", ")}` : `all ${bundledDocs.length} bundled docs`);
+
+    // — READABILITY: no document name is truncated —
+    const truncated = ui.names.filter((n) => n.truncated);
+    check("layout/no-name-truncated", truncated.length === 0, truncated.length ? `truncated: ${truncated.map((n) => `${n.text}`).join(" | ")}` : `all ${ui.names.length} names fully visible`);
+
+    // — DOWNLOAD: an uploaded PDF serves its original —
+    const heb = uploads.find((d) => d.doc === "hebrew-invoice");
     if (heb) {
-      check("hebrew-lang-HE", /\bHE\b/.test(heb.text), heb.text);
-      check("hebrew-page-detail", heb.hasPages, "shows 'PDF · N pages'");
-      check("hebrew-download-enabled", heb.downloadEnabled && !heb.downloadGreyed, `enabled=${heb.downloadEnabled} greyed=${heb.downloadGreyed}`);
-      check("hebrew-urgency-badge", heb.hasUrgency, "urgency badge present");
-
-      // the download must actually SERVE the original file (not a dead 404).
       const dl = await p.evaluate(async () => {
         const r = await fetch("/api/documents/file?doc=hebrew-invoice");
         return { status: r.status, ctype: r.headers.get("content-type") };
       });
-      check("hebrew-download-serves-pdf", dl.status === 200 && /pdf/i.test(dl.ctype || ""), JSON.stringify(dl));
+      check("download/hebrew-serves-pdf", dl.status === 200 && /pdf/i.test(dl.ctype || ""), JSON.stringify(dl));
     }
+
+    await p.locator('[data-testid="materials-rail"]').screenshot({ path: "/tmp/rail.png" }).catch(() => {});
+    await p.screenshot({ path: "/tmp/dashboard.png" });
   } catch (e) {
     console.error("RAIL-RENDER ERROR:", e instanceof Error ? e.stack : e);
     process.exitCode = 1;

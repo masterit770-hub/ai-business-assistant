@@ -42,7 +42,12 @@ export type SettingKey =
   | "hipaa_api_key"
   | "hipaa_endpoint"
   | "hipaa_api_version"
-  | "hipaa_model";
+  | "hipaa_model"
+  // Cache (JSON map docId→urgency) of the bundled sample docs' classified urgency, so
+  // the dashboard shows a badge on EVERY document (not just uploads) without an LLM call
+  // per request. Derived (classified) once + cleared when urgency_prompt changes (so it
+  // re-derives — the #G behavior for bundled docs).
+  | "bundled_urgency";
 
 // The built-in defaults. The system-prompt default is the FULL generation
 // contract (kept in answer.ts historically); here we expose only the
@@ -76,6 +81,7 @@ Answer with exactly one word: high, medium, or low.`,
   // HIPAA mode (Azure OpenAI) override — all blank by default = "not configured".
   // Independent of the cloud_* slots, so the two keys never collide.
   hipaa_api_key: "",
+  bundled_urgency: "{}",
   hipaa_endpoint: "",
   hipaa_api_version: "",
   hipaa_model: "",
@@ -106,7 +112,10 @@ export async function getSetting(key: SettingKey): Promise<string> {
 // raw `cloud_api_key` — the secret is WRITE-ONLY over the API. Instead the panel
 // gets `cloud_api_key_set` (a boolean) so the UI can show "key saved" without ever
 // echoing the secret back. All other cloud-provider fields are non-secret config.
-export type AdminSettings = Omit<Record<SettingKey, string>, "cloud_api_key" | "hipaa_api_key"> & {
+export type AdminSettings = Omit<
+  Record<SettingKey, string>,
+  "cloud_api_key" | "hipaa_api_key" | "bundled_urgency"
+> & {
   cloud_api_key_set: boolean;
   hipaa_api_key_set: boolean;
 };
@@ -237,10 +246,17 @@ export async function setSetting(key: SettingKey, value: string): Promise<void> 
   if (!supabaseEnabled()) {
     if (value.trim()) mem()[key] = value;
     else delete mem()[key];
+    // Editing the urgency prompt invalidates the cached bundled-doc urgency so it
+    // re-derives on the next documents load (the #G re-derivation, for bundled docs).
+    if (key === "urgency_prompt") delete mem().bundled_urgency;
     return;
   }
   const { error } = await admin()
     .from("engine_settings")
     .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: "key" });
   if (error) throw new Error(`settings write failed: ${error.message}`);
+  // Changing the urgency prompt clears the bundled-urgency cache → re-derivation.
+  if (key === "urgency_prompt") {
+    await admin().from("engine_settings").delete().eq("key", "bundled_urgency");
+  }
 }
