@@ -275,9 +275,10 @@ async function main() {
     console.error("\nEVAL RUNNER ERROR:", e instanceof Error ? e.stack : e);
     process.exitCode = 1;
   } finally {
-    // cleanup uploaded test docs (never leave test state in the shared corpus)
+    // cleanup the throwaway test doc. NOTE: hebrew-invoice is INTENTIONALLY left in place
+    // — it doubles as a SEEDED demo document for the admin + guest accounts (the upload
+    // helper deletes-then-re-uploads it each run, so it stays present, owner-scoped).
     try { if (bfId) { await del(p, bfId); console.log(`\n↩ cleaned up ${bfId}`); } } catch {}
-    try { if (heId) { await del(p, heId); console.log(`↩ cleaned up ${heId}`); } } catch {}
     await b.close();
   }
 
