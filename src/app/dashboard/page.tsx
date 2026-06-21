@@ -18,10 +18,12 @@ function ConsoleWithSession() {
 }
 
 export default function DashboardPage() {
-  // Real counts from /api/documents, published by MaterialsRail as RAW counts so every
-  // stat is computed here from the same source — no pre-summed "total" that could
-  // double-count. Sources = uploads + bundled (the whole bucket); Your uploads = uploads
-  // only; High urgency = high-urgency docs across the bucket.
+  // Real counts from /api/documents, published by MaterialsRail as RAW counts. ONE
+  // bucket → ONE document count: "Sources" is every document the assistant can answer
+  // from (uploads + the bundled sample docs are the same kind of thing — a doc you have).
+  // We deliberately do NOT show a separate "your uploads" number: the uploaded-vs-bundled
+  // split is internal plumbing (demo-data gating + delete permissions), not a user-facing
+  // distinction. "High urgency" is the at-a-glance attention count across the bucket.
   const [counts, setCounts] = useState<{ uploaded: number; bundled: number; high: number } | null>(
     null
   );
@@ -34,7 +36,6 @@ export default function DashboardPage() {
 
   const stats = [
     { label: "Sources", value: counts ? String(counts.uploaded + counts.bundled) : null },
-    { label: "Your uploads", value: counts ? String(counts.uploaded) : null },
     { label: "High urgency", value: counts ? String(counts.high) : null },
   ];
 

@@ -73,18 +73,15 @@ async function main() {
       const hasUrgency = (id) => !!document.querySelector(`[data-testid="${id}"]`);
       return {
         statSources: num('[data-testid="stat-Sources"]'),
-        statUploads: num('[data-testid="stat-Your uploads"]'),
         headerSources,
         names,
-        hasUrgency: (rowId, prefix) => hasUrgency(`${prefix}-urgency-${rowId}`),
       };
     });
 
-    // — COUNT CONSISTENCY (derived from the data + cross-checked across counters) —
+    // — COUNT CONSISTENCY (one bucket → ONE count, cross-checked against the data) —
     check("count/stat-sources-matches-data", ui.statSources === expectedSources, `stat Sources=${ui.statSources} expected=${expectedSources} (uploads ${uploads.length} + bundled ${bundled.length})`);
-    check("count/stat-uploads-matches-data", ui.statUploads === uploads.length, `stat "Your uploads"=${ui.statUploads} expected=${uploads.length}`);
     check("count/rail-header-matches-data", ui.headerSources === expectedSources, `rail header=${ui.headerSources} expected=${expectedSources}`);
-    check("count/all-counters-agree", ui.statSources === ui.headerSources && ui.statSources === ui.statUploads + bundled.length, `sources-stat=${ui.statSources} header=${ui.headerSources} uploads-stat=${ui.statUploads}+bundled=${bundled.length}`);
+    check("count/stat-and-header-agree", ui.statSources === ui.headerSources, `sources-stat=${ui.statSources} header=${ui.headerSources}`);
 
     // — URGENCY CONSISTENCY: every DOCUMENT (uploaded + bundled) shows a badge —
     const urgency = await p.evaluate(({ uploadIds, bundledDocIds }) => {
