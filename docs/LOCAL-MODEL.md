@@ -55,11 +55,16 @@ npm run dev          # opens the app at http://localhost:3000
 
 ```bash
 # install Ollama from https://ollama.com (one click), then:
-ollama pull qwen2.5        # a good, small default — or:
-ollama pull llama3         # another solid choice
-
+ollama pull qwen2.5:3b     # recommended default on a normal CPU box (see note)
 ollama serve               # usually already running after install
 ```
+
+> 🧠 **Which model? (tested guidance — the model is the part you can swap for quality.)** The answer is only as good as the model writing it; the rest of the pipeline (finding the right contract rows, retrieving the right document pages, citing them) is identical no matter which model you pick.
+> - **`qwen2.5:3b` — the sweet spot on a typical CPU.** Fast enough (a few seconds) *and* smart enough to read the evidence and cite it. In our end-to-end test it correctly answered a document question with the right figure **and** the page citation.
+> - **`qwen2.5:1.5b` — only if your box is very slow.** It's quick but **too weak**: in testing it retrieved the right data and then failed to use it. Avoid unless you must.
+> - **`qwen2.5:7b` (or bigger) — best quality, needs a strong box (ideally a GPU).** On a plain CPU it's slow enough that answers can time out. Use it when you have the hardware.
+>
+> Other families work too (`llama3`, `mistral`, …) — pick a size that matches your hardware using the same fast-vs-smart trade-off.
 
 Ollama now serves an **OpenAI-compatible** endpoint at **`http://localhost:11434/v1`**. That's the address Nucleus needs.
 
@@ -68,12 +73,12 @@ Ollama now serves an **OpenAI-compatible** endpoint at **`http://localhost:11434
 1. Open Nucleus (`http://localhost:3000`), sign in as the **admin**.
 2. Go to **Settings → Model & Prompts → Model**.
 3. In **Local model endpoint**, enter: `http://localhost:11434/v1`
-4. In **Local model name**, enter the model you pulled: `qwen2.5` (or `llama3`).
+4. In **Local model name**, enter the model you pulled: `qwen2.5:3b`.
 5. Click **Save prompts** (it saves the Model section too).
 
 ### 4. Flip the big switch to Local and ask
 
-1. At the top of the **Ask panel** (or in the Model section), click **Local** — the **Local** side fills with the teal accent: you're now Local.
+1. At the top of the **Ask panel** (or in the Model section), click **Local** — the **Local** side fills with the accent color: you're now Local.
 2. Ask a question. The answer is now generated **on your hardware**. 🎉
 
 If you flip to Local but **haven't** entered an endpoint yet, a small amber hint appears next to the switch ("Set up Local in Settings → Model"), and asking a question returns the friendly **not-configured** guidance instead of an error.
@@ -124,26 +129,35 @@ You can have **both**: the hosted Vercel app (one shareable link for all your us
    tunnel (public URL)  ──►  YOUR box: Ollama (local model)
 ```
 
+> ✅ **This is tested, not theoretical.** We ran the hosted Vercel demo (`nucleus-woad.vercel.app`) flipped to Local, pointed at a box's Ollama through exactly the tunnel command below, and it answered both a contracts question and a document question — the document answer came back with the **correct figure and the page citation**, generated on the box. The two flags below are *why* it works; without them it silently fails.
+
 On the box that runs your model:
 
 ```bash
 # 1. run your model
 ollama serve
-ollama pull qwen2.5
+ollama pull qwen2.5:3b
 
-# 2. expose it with a tunnel — quickest is a Cloudflare quick tunnel (NO account needed):
+# 2. expose it with a tunnel — a Cloudflare quick tunnel (NO account needed).
 #    install cloudflared (one binary, https://github.com/cloudflare/cloudflared), then:
-cloudflared tunnel --url http://localhost:11434
+cloudflared tunnel --url http://localhost:11434 \
+    --http-host-header localhost:11434 \
+    --protocol http2
 #    → it prints a public URL like https://random-words.trycloudflare.com — leave it running.
-#    (ngrok works too: `ngrok http 11434`.)
 ```
+
+> 🔑 **The two flags are NOT optional** — we hit both failures and these fix them:
+> - **`--http-host-header localhost:11434`** — Ollama refuses requests whose `Host` header isn't localhost (an anti-hijacking safety check) and returns a blank **403**. Without this flag the tunnel works but every answer fails. This flag makes the tunnel send `Host: localhost`, which Ollama accepts.
+> - **`--protocol http2`** — the default QUIC transport drops intermittently on some networks (the tunnel registers, then connections die and answers stop). HTTP/2 is stable.
+>
+> *(Prefer `ngrok`? `ngrok http 11434` also works and needs neither flag — it sends the right `Host` by default.)*
 
 Then in Nucleus → **Settings → Model**:
 - **Local model endpoint**: your tunnel URL **+ `/v1`** → e.g. `https://random-words.trycloudflare.com/v1`
-- **Local model name**: `qwen2.5`
+- **Local model name**: `qwen2.5:3b`
 - **Save**, then flip the switch to **Local**.
 
-Now every user on your Vercel link gets answers generated by the model **on your box**.
+Now every user on your Vercel link gets answers generated by the model **on your box** — and Nucleus still finds and cites the right contract rows and document pages exactly as it does on Cloud (retrieval runs in the app regardless of which model writes the answer).
 
 > ⚠️ **Security & reliability — read this before using it for real:**
 > - A quick-tunnel URL is **public** — anyone who has it can use your model. Treat it like a password. For real use, put **auth in front** (a named Cloudflare tunnel with Access, or an API key) and use a **stable/named tunnel** — the free quick-tunnel URL **changes every restart**.
@@ -173,9 +187,9 @@ So: **"Local model" means the AI answers on your hardware.** A **full air-gap** 
 |---|---|
 | Default mode | **Cloud** (unchanged behavior — the working hosted model) |
 | Where to flip | Top of the **Ask panel**, or **Settings → Model** (admin-only) |
-| Example endpoint | `http://localhost:11434/v1` (Ollama) |
-| Good default models | `qwen2.5`, `llama3` (pull with `ollama pull <name>`) |
-| Demo can use Local? | **No** — the hosted demo can only use Cloud models; Local needs self-host |
+| Example endpoint | `http://localhost:11434/v1` (Ollama, self-host) · `https://<tunnel>.trycloudflare.com/v1` (cloud app + tunnel) |
+| Recommended model | **`qwen2.5:3b`** on a CPU box (fast + cites correctly); `1.5b` too weak; `7b`+ needs a strong box |
+| Hosted demo can use Local? | **Yes — with a tunnel.** Point Settings → Model at your tunnel URL (tested end-to-end). Without a tunnel it can't reach your `localhost`, so it shows the friendly setup message |
 | If Local isn't set up | Friendly setup message (no crash) |
 | If Local is unreachable | Calm, fast message naming the endpoint (no long hang) |
 
