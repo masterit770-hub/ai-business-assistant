@@ -153,27 +153,6 @@ export function UsersPanel() {
     }
   }
 
-  // Re-mint an invite link for an existing user (the row "Copy invite" action) and
-  // drop it into the same copyable card the create flow uses.
-  async function copyInvite(u: AdminUser) {
-    setBusyId(u.id);
-    setError(null);
-    try {
-      const res = await fetch("/api/admin/users", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "invite", email: u.email }),
-      });
-      const d = await res.json();
-      if (!res.ok) throw new Error(d?.error ?? "could not generate invite link");
-      setInvite({ email: u.email, inviteLink: d.inviteLink ?? null, tempPassword: "" });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "could not generate invite link");
-    } finally {
-      setBusyId(null);
-    }
-  }
-
   const activeCount = users?.filter((u) => u.status === "active").length ?? 0;
 
   return (
@@ -262,37 +241,19 @@ export function UsersPanel() {
             </button>
           </div>
           <p className="mb-3 text-xs text-subtle">
-            Send this link to the teammate — they’ll set their own password and get in.
-            {invite.tempPassword
-              ? " The temp password below is a fallback if the link can’t be used."
-              : ""}
+            Share these sign-in details with the teammate. They can change their password
+            from the Account page once they’re signed in.
           </p>
 
-          {invite.inviteLink ? (
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <CopyField label="Email" value={invite.email} testid="invite-email" mono />
             <CopyField
-              label="Invite link"
-              value={invite.inviteLink}
-              testid="invite-link"
-              mono={false}
+              label="Temp password"
+              value={invite.tempPassword}
+              testid="invite-password"
+              mono
             />
-          ) : (
-            <p className="mb-2 text-xs text-faint" data-testid="invite-link-missing">
-              No invite link available (email delivery isn’t configured). Send the email
-              and temp password below instead.
-            </p>
-          )}
-
-          {invite.tempPassword && (
-            <div className="mt-2 grid gap-2 sm:grid-cols-2">
-              <CopyField label="Email" value={invite.email} testid="invite-email" mono />
-              <CopyField
-                label="Temp password"
-                value={invite.tempPassword}
-                testid="invite-password"
-                mono
-              />
-            </div>
-          )}
+          </div>
         </div>
       )}
 
@@ -367,17 +328,6 @@ export function UsersPanel() {
                   <span className={cn("size-1.5 rounded-full", pill.dot)} />
                   {pill.label}
                 </span>
-                {/* re-mint an invite link for this user (e.g. they lost the first one) */}
-                <button
-                  onClick={() => copyInvite(u)}
-                  disabled={busyId === u.id}
-                  data-testid={`user-invite-${u.email}`}
-                  title="Generate an invite link to re-send"
-                  className="inline-flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] font-medium text-subtle transition-colors hover:border-accent-ring hover:text-ink disabled:opacity-50"
-                >
-                  <Link2 className="size-3.5" />
-                  <span className="hidden md:inline">Copy invite</span>
-                </button>
                 {u.isSelf ? (
                   <span className="w-[110px] text-right text-xs text-faint">—</span>
                 ) : (

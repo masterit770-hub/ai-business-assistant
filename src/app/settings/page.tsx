@@ -5,6 +5,7 @@ import { SimpleTabs } from "@/components/simple-tabs";
 import { UsersPanel } from "@/components/users-panel";
 import { PromptsPanel } from "@/components/prompts-panel";
 import { ModelsPanel } from "@/components/models-panel";
+import { IntegrationsPanel } from "@/components/integrations-panel";
 import { getCurrentUser } from "@/lib/supabase/auth";
 
 // Settings is an ADMIN-only surface (user management + answer prompts). The
@@ -40,6 +41,7 @@ export default async function SettingsPage() {
                   tabs={[
                     { value: "prompts", label: "Prompts", content: <PromptsPanel /> },
                     { value: "models", label: "Models", content: <ModelsPanel /> },
+                    { value: "integrations", label: "Integrations", content: <IntegrationsPanel /> },
                     { value: "users", label: "Users", content: <UsersPanel /> },
                   ]}
                 />
