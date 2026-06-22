@@ -77,9 +77,12 @@ function Logo({ slug, name, color }: { slug: string; name: string; color: string
     );
   }
   return (
+    // Self-hosted brand SVGs (served from /public/integrations) — no external CDN, so
+    // they render reliably for the client. Brands without a logo file fall back to the
+    // brand-colored initial tile above.
     // eslint-disable-next-line @next/next/no-img-element
     <img
-      src={`https://cdn.simpleicons.org/${slug}`}
+      src={`/integrations/${slug}.svg`}
       alt=""
       width={36}
       height={36}
