@@ -133,8 +133,8 @@ export function AccountPanel() {
   }
 
   const BRANDS: { value: Brand; label: string; sub: string; swatch: string; soft: string }[] = [
-    { value: "violet", label: "Violet", sub: "Jenny’s brand · default", swatch: "#7c3aed", soft: "#f3effe" },
-    { value: "teal", label: "Teal", sub: "Chris’s portfolio", swatch: "#0d9488", soft: "#f0fdfa" },
+    { value: "violet", label: "Violet", sub: "Default", swatch: "#7c3aed", soft: "#f3effe" },
+    { value: "teal", label: "Teal", sub: "Alternate", swatch: "#0d9488", soft: "#f0fdfa" },
   ];
 
   const nameDirty = identityLoaded && displayName.trim() !== loadedName.trim();

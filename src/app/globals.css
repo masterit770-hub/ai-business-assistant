@@ -92,9 +92,9 @@
 }
 
 /* ── BRAND axis (orthogonal to light/dark) ──────────────────────────────────────
-   `data-brand="teal"` on <html> re-skins the app to Chris's ORIGINAL portfolio TEAL
-   (commit ffd211d) by overriding ONLY the accent tokens + a faint surface tint — the
-   light/dark choice is untouched. No attribute = Jenny's violet (the default above).
+   `data-brand="teal"` on <html> re-skins the app to the TEAL accent by overriding ONLY
+   the accent tokens + a faint surface tint — the light/dark choice is untouched. No
+   attribute = the default violet accent (above).
    The urgency/status colors stay semantic (not re-tinted). */
 html[data-brand="teal"] {
   --accent: #0d9488;        /* teal-600 */
