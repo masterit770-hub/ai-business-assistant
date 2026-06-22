@@ -305,8 +305,27 @@ h1, h2, h3, h4 {
   animation: pulse-dot 2s ease-out infinite;
 }
 
+/* ── Integrations marquee (landing) — two rows of brand logos auto-scrolling ── */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.marquee {
+  display: flex;
+  width: max-content;
+  gap: 0.75rem;
+  animation: marquee 48s linear infinite;
+}
+.marquee:hover { animation-play-state: paused; }
+.marquee-reverse { animation-direction: reverse; }
+.marquee-mask {
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to right, transparent, black 7%, black 93%, transparent);
+  mask-image: linear-gradient(to right, transparent, black 7%, black 93%, transparent);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .reveal { opacity: 1; transform: none; transition: none; }
-  .caret, .chip-pop, .line-rise, .step-in, .pulse-dot { animation: none; }
+  .caret, .chip-pop, .line-rise, .step-in, .pulse-dot, .marquee { animation: none; }
   body, [data-theme] { transition: none; }
 }

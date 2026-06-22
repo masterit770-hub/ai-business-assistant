@@ -50,17 +50,21 @@ export function Wordmark({
   className,
   href = "/",
   subtitle = true,
+  // The product name to display. Defaults to the in-app name; the public landing
+  // passes "Nucleus".
+  name = "AI Business Assistant",
 }: {
   className?: string;
   href?: string;
   subtitle?: boolean;
+  name?: string;
 }) {
   return (
     <Link href={href} className={cn("inline-flex items-center gap-2.5", className)}>
       <AssistantMark />
       <span className="flex flex-col leading-none">
         <span className="font-display text-[1.15rem] font-bold tracking-tight text-ink">
-          AI Business Assistant
+          {name}
         </span>
         {subtitle && (
           <span className="mt-0.5 text-[11px] font-medium text-faint">

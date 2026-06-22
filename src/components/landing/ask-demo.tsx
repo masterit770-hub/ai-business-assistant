@@ -69,7 +69,7 @@ export function AskDemo() {
             <Sparkles className="size-4" />
           </span>
           <span className="font-display text-sm font-semibold text-ink">
-            AI Business Assistant
+            Nucleus
           </span>
           <span className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-accent-ring bg-accent-soft px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-accent">
             <span className="pulse-dot size-1.5 rounded-full bg-accent" />

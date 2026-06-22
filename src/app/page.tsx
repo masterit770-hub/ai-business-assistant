@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Reveal } from "@/components/landing/reveal";
 import { AskDemo } from "@/components/landing/ask-demo";
 import { PipelineStrip } from "@/components/landing/pipeline-strip";
+import { IntegrationsMarquee } from "@/components/landing/integrations-marquee";
 import {
   CitationMock,
   HybridMock,
@@ -70,7 +71,7 @@ export default function LandingPage() {
                 Trust every answer.
               </h1>
               <p className="mt-6 max-w-xl text-lg leading-relaxed text-subtle">
-                The AI Business Assistant answers questions across your documents and data in plain
+                Nucleus answers questions across your documents and data in plain
                 language — and puts a citation on every fact, so you can trace it
                 to the exact page or row. Grounded, or it tells you it doesn&rsquo;t
                 know.
@@ -186,8 +187,30 @@ export default function LandingPage() {
           </div>
         </section>
 
-        {/* ── CTA ── */}
+        {/* ── Integrations ── */}
         <section className="border-t border-line bg-surface">
+          <div className="mx-auto max-w-6xl px-6 py-20">
+            <Reveal className="mb-12 text-center">
+              <span className="inline-flex items-center gap-2 rounded-full border border-line bg-canvas px-3 py-1 text-xs font-medium text-subtle shadow-soft">
+                <span className="size-1.5 rounded-full bg-accent" />
+                Integrations
+              </span>
+              <h2 className="mt-4 font-display text-3xl font-bold tracking-tight text-ink sm:text-4xl">
+                Plugs into the tools you already use
+              </h2>
+              <p className="mx-auto mt-4 max-w-xl text-lg text-subtle">
+                Connect your stack so the assistant can answer across it — 20+ first-class
+                integrations, and 6,000+ more via Zapier.
+              </p>
+            </Reveal>
+            <Reveal delay={120}>
+              <IntegrationsMarquee />
+            </Reveal>
+          </div>
+        </section>
+
+        {/* ── CTA ── */}
+        <section className="border-t border-line bg-canvas">
           <div className="mx-auto max-w-6xl px-6 py-20">
             <Reveal>
               <div className="relative overflow-hidden rounded-3xl border border-accent-strong/30 bg-accent px-8 py-16 text-center shadow-lift">
