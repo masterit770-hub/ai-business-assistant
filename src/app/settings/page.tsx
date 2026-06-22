@@ -4,6 +4,7 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { SimpleTabs } from "@/components/simple-tabs";
 import { UsersPanel } from "@/components/users-panel";
 import { PromptsPanel } from "@/components/prompts-panel";
+import { ModelsPanel } from "@/components/models-panel";
 import { getCurrentUser } from "@/lib/supabase/auth";
 
 // Settings is an ADMIN-only surface (user management + answer prompts). The
@@ -25,7 +26,7 @@ export default async function SettingsPage() {
           </h1>
           <p className="text-sm text-faint">
             {isAdmin
-              ? "Manage users and the assistant’s answer prompts."
+              ? "Manage users, the assistant’s answer prompts, and the AI model."
               : "Workspace settings."}
           </p>
         </header>
@@ -37,8 +38,9 @@ export default async function SettingsPage() {
                 <SimpleTabs
                   defaultValue="users"
                   tabs={[
+                    { value: "prompts", label: "Prompts", content: <PromptsPanel /> },
+                    { value: "models", label: "Models", content: <ModelsPanel /> },
                     { value: "users", label: "Users", content: <UsersPanel /> },
-                    { value: "prompts", label: "Model & Prompts", content: <PromptsPanel /> },
                   ]}
                 />
               </Suspense>
