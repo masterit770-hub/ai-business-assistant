@@ -1,10 +1,10 @@
 "use client";
 
 import { Suspense, useEffect, useState } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { AppSidebar } from "@/components/app-sidebar";
 import { AssistantConsole } from "@/components/assistant/assistant-console";
-import { MaterialsRail } from "@/components/assistant/materials-rail";
 
 // Reads the ?session=<id> param (set when a user resumes a conversation from /history)
 // and hands it to the console so it loads that thread. Wrapped in Suspense because
@@ -17,70 +17,53 @@ function ConsoleWithSession() {
   return <AssistantConsole key={sessionId ?? "new"} initialSessionId={sessionId} />;
 }
 
+// CHAT — the assistant, now its OWN full-width page (Sources moved to /sources). A light
+// context line shows how many documents the assistant can draw on, linking to Sources.
 export default function DashboardPage() {
-  // Real counts from /api/documents, published by MaterialsRail as RAW counts. ONE
-  // bucket → ONE document count: "Sources" is every document the assistant can answer
-  // from (uploads + the bundled sample docs are the same kind of thing — a doc you have).
-  // We deliberately do NOT show a separate "your uploads" number: the uploaded-vs-bundled
-  // split is internal plumbing (demo-data gating + delete permissions), not a user-facing
-  // distinction. "High urgency" is the at-a-glance attention count across the bucket.
-  const [counts, setCounts] = useState<{ uploaded: number; bundled: number; high: number } | null>(
-    null
-  );
+  const [docCount, setDocCount] = useState<number | null>(null);
 
   useEffect(() => {
-    const onDocs = (e: Event) => setCounts((e as CustomEvent).detail);
-    window.addEventListener("nucleus:docs", onDocs);
-    return () => window.removeEventListener("nucleus:docs", onDocs);
+    let alive = true;
+    fetch("/api/documents")
+      .then((r) => r.json())
+      .then((d) => {
+        if (!alive) return;
+        setDocCount((d.documents?.length ?? 0) + (d.bundled?.length ?? 0));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, []);
-
-  const stats = [
-    { label: "Sources", value: counts ? String(counts.uploaded + counts.bundled) : null },
-    { label: "High urgency", value: counts ? String(counts.high) : null },
-  ];
 
   return (
     <div className="flex h-screen overflow-hidden bg-canvas">
-      <AppSidebar active="documents" />
+      <AppSidebar active="chat" />
 
       <main className="flex flex-1 flex-col overflow-hidden">
-        {/* topbar */}
-        <header className="flex items-center justify-between border-b border-line bg-surface px-7 py-4">
-          <div>
-            <h1 className="font-display text-xl font-bold tracking-tight text-ink">Workspace</h1>
-            <p className="text-sm text-faint">
-              Your materials and a transparent, cited AI assistant over them.
-            </p>
-          </div>
-          <div className="hidden items-center gap-3 md:flex">
-            {stats.map((s) => (
-              <div
-                key={s.label}
-                className="rounded-xl border border-line bg-surface px-4 py-2 text-center shadow-soft"
-              >
-                <p
-                  className="tabular text-lg font-semibold text-ink"
-                  data-testid={`stat-${s.label}`}
-                >
-                  {s.value ?? <span className="text-faint">—</span>}
-                </p>
-                <p className="text-[10px] font-medium uppercase tracking-wide text-faint">
-                  {s.label}
-                </p>
-              </div>
-            ))}
-          </div>
+        <header className="border-b border-line bg-surface px-7 py-4">
+          <h1 className="font-display text-xl font-bold tracking-tight text-ink">Chat</h1>
+          <p className="text-sm text-faint">
+            {docCount === null ? (
+              "Your transparent, cited AI assistant."
+            ) : (
+              <>
+                Answering from{" "}
+                <span className="font-medium text-ink" data-testid="chat-source-count">
+                  {docCount} {docCount === 1 ? "source" : "sources"}
+                </span>{" "}
+                in your knowledge base.{" "}
+                <Link href="/sources" className="font-medium text-accent hover:underline">
+                  Manage sources
+                </Link>
+              </>
+            )}
+          </p>
         </header>
 
-        {/* the workspace: materials rail + the assistant console */}
-        <div className="flex flex-1 gap-5 overflow-hidden p-5">
-          {/* left: materials */}
-          <div className="hidden w-[420px] shrink-0 lg:block">
-            <MaterialsRail />
-          </div>
-
-          {/* right: the AI Business Assistant console (resumes ?session=<id> if present) */}
-          <div className="flex flex-1 overflow-hidden rounded-2xl border border-line bg-surface shadow-card">
+        {/* a roomy, single centered column — less dense than the old side-by-side */}
+        <div className="flex flex-1 overflow-hidden p-5">
+          <div className="mx-auto flex w-full max-w-4xl flex-1 overflow-hidden rounded-2xl border border-line bg-surface shadow-card">
             <div className="flex flex-1 flex-col overflow-hidden">
               <Suspense fallback={<AssistantConsole />}>
                 <ConsoleWithSession />

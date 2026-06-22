@@ -3,9 +3,9 @@
 import { useState, useEffect, useRef } from "react";
 import { LayoutGrid, ScanSearch, Play, ArrowUp, Loader2, MessageSquarePlus, Square, RotateCcw, AlertTriangle } from "lucide-react";
 import { suggestedQuestions } from "@/lib/mock";
-import { ModelSwitch } from "@/components/model-switch";
 import { cn } from "@/lib/utils";
 import type { EngineResult } from "./types";
+import { AnswerSetup } from "./answer-setup";
 import { AnswerView } from "./answer-view";
 import { classifyAskError } from "./answer-helpers";
 import {
@@ -275,10 +275,57 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
         </span>
       </div>
 
-      {/* admin-only model switch */}
-      <div className="border-b border-line px-5 py-2.5" data-testid="ask-model-switch">
-        <ModelSwitch variant="panel" />
-      </div>
+      {/* answer setup — style presets + inline prompt editor + model switch */}
+      <AnswerSetup />
+
+      {/* ASK BOX — up top: the latest answer renders right below it (per the reference) */}
+      <form
+        className="border-b border-line px-5 py-3.5"
+        onSubmit={(e) => {
+          e.preventDefault();
+          ask(question);
+        }}
+      >
+        <div className="flex items-start gap-2 rounded-xl border border-line bg-surface px-3.5 py-2.5 focus-within:border-accent-ring focus-within:ring-2 focus-within:ring-accent/15">
+          <textarea
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                ask(question);
+              }
+            }}
+            rows={1}
+            placeholder={hasThread ? "Ask a follow-up…" : "Ask a question about your documents and data…"}
+            aria-label={hasThread ? "Ask a follow-up" : "Ask a question"}
+            className="flex-1 resize-none bg-transparent text-sm text-ink placeholder:text-faint focus:outline-none"
+          />
+          {loading ? (
+            <button
+              type="button"
+              onClick={stop}
+              data-testid="stop-ask"
+              title="Stop generating"
+              className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-line bg-surface text-subtle transition-colors hover:border-accent-ring hover:text-ink"
+            >
+              <Square className="size-3.5 fill-current" />
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={!question.trim()}
+              data-testid="send-ask"
+              className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent text-accent-fg transition-colors hover:bg-accent-strong disabled:opacity-40"
+            >
+              <ArrowUp className="size-4" />
+            </button>
+          )}
+        </div>
+        <p className="mt-1.5 px-1 text-[11px] text-faint">
+          Press Enter to send · Shift+Enter for a new line{hasThread ? " · follow-ups use the whole conversation" : ""}
+        </p>
+      </form>
 
       {/* the conversation thread */}
       <div className="flex-1 space-y-5 overflow-y-auto px-5 py-5" data-testid="ask-result">
@@ -392,59 +439,6 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
 
         <div ref={threadEndRef} />
       </div>
-
-      {/* follow-up input — present on every tab so you can keep the conversation going */}
-      <form
-        className="border-t border-line px-5 py-4"
-        onSubmit={(e) => {
-          e.preventDefault();
-          ask(question);
-        }}
-      >
-        <div className="flex items-start gap-2 rounded-xl border border-line bg-surface px-3.5 py-2.5 focus-within:border-accent-ring focus-within:ring-2 focus-within:ring-accent/15">
-          <textarea
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={(e) => {
-              // Enter sends (ChatGPT-style); Shift+Enter inserts a newline. Guard against
-              // IME composition (Hebrew/other input methods) so a composing Enter never sends.
-              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-                e.preventDefault();
-                ask(question);
-              }
-            }}
-            rows={1}
-            placeholder={hasThread ? "Ask a follow-up…" : "Ask a question about your documents and data…"}
-            aria-label={hasThread ? "Ask a follow-up" : "Ask a question"}
-            className="flex-1 resize-none bg-transparent text-sm text-ink placeholder:text-faint focus:outline-none"
-          />
-          {loading ? (
-            // While a turn is in flight, the action becomes STOP — it aborts the fetch
-            // (treated as a cancel: the input is restored, no error card).
-            <button
-              type="button"
-              onClick={stop}
-              data-testid="stop-ask"
-              title="Stop generating"
-              className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-line bg-surface text-subtle transition-colors hover:border-accent-ring hover:text-ink"
-            >
-              <Square className="size-3.5 fill-current" />
-            </button>
-          ) : (
-            <button
-              type="submit"
-              disabled={!question.trim()}
-              data-testid="send-ask"
-              className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent text-accent-fg transition-colors hover:bg-accent-strong disabled:opacity-40"
-            >
-              <ArrowUp className="size-4" />
-            </button>
-          )}
-        </div>
-        <p className="mt-1.5 px-1 text-[11px] text-faint">
-          Press Enter to send · Shift+Enter for a new line{hasThread ? " · follow-ups use the whole conversation" : ""}
-        </p>
-      </form>
 
       {/* honest pipeline footer strip */}
       <div className="border-t border-line px-5 py-2.5 text-center text-[11px] text-faint">

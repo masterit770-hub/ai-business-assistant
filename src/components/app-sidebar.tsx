@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { FileText, Clock, User, Settings } from "lucide-react";
+import { MessageSquare, FileText, Clock, User, Settings } from "lucide-react";
 import { AssistantMark } from "@/components/brand";
 import { UserMenu } from "@/components/user-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -15,10 +15,11 @@ import { cn } from "@/lib/utils";
 // `adminOnly` items are hidden from non-admins (server access is also gated; this
 // just avoids dead-end links into a forbidden page).
 const nav = [
-  { label: "Documents", href: "/dashboard", icon: FileText, match: "documents" },
+  { label: "Chat", href: "/dashboard", icon: MessageSquare, match: "chat" },
+  { label: "Sources", href: "/sources", icon: FileText, match: "sources" },
   { label: "History", href: "/history", icon: Clock, match: "history" },
-  { label: "Account", href: "/account", icon: User, match: "account" },
   { label: "Settings", href: "/settings", icon: Settings, match: "settings", adminOnly: true },
+  { label: "Account", href: "/account", icon: User, match: "account" },
 ];
 
 export function AppSidebar({ active }: { active: string }) {
