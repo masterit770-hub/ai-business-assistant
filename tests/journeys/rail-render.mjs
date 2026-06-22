@@ -44,6 +44,8 @@ async function main() {
     await p.fill('input[type="password"]', ADMIN.password);
     await p.click('[data-testid="auth-submit"]');
     await p.waitForURL("**/dashboard", { timeout: 90000 });
+    // The materials rail + the stat cards live on the Sources page now (redesign).
+    await p.goto(`${BASE}/sources`, { waitUntil: "networkidle" });
     await p.waitForSelector('[data-testid="materials-rail"]', { timeout: 30000 });
     await p.waitForTimeout(3500); // let the rail load + publish counts
 

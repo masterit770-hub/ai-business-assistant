@@ -73,6 +73,9 @@ const listDocs = (page) =>
 // this runner false-failed while ingestion actually worked).
 async function upload(page, path, expectedDocId, rx) {
   await del(page, expectedDocId).catch(() => {});
+  // The upload control lives on the Sources page (redesign moved it off the chat).
+  await page.goto(`${BASE}/sources`, { waitUntil: "networkidle" });
+  await page.waitForSelector('input[type="file"]', { state: "attached", timeout: 30000 });
   await page.setInputFiles('input[type="file"]', path);
   for (let i = 0; i < 40; i++) {
     await page.waitForTimeout(3000);
