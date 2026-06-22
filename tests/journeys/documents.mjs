@@ -30,7 +30,7 @@ export async function run() {
   const browser = await launch();
   let deleted = false;
   try {
-    const { ctx, page } = await signIn(browser, "admin", "/dashboard");
+    const { ctx, page } = await signIn(browser, "admin", "/sources");
     // Wait for the materials rail + bundled list to load.
     await page.locator('[data-testid="materials-rail"]').waitFor({ state: "visible", timeout: 30000 }).catch(() => {});
     await page.locator(`[data-testid="bundled-row-${FAMILY}"]`).waitFor({ state: "visible", timeout: 30000 }).catch(() => {});

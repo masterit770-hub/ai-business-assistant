@@ -42,16 +42,30 @@ export function AnswerSetup() {
     let alive = true;
     fetch("/api/me")
       .then((r) => r.json())
-      .then((d) => alive && setIsAdmin(d?.user?.role === "admin"))
-      .catch(() => {});
-    fetch("/api/settings")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => alive && d && setPrompt(typeof d.system_prompt === "string" ? d.system_prompt : ""))
+      .then((d) => {
+        if (!alive) return;
+        const admin = d?.user?.role === "admin";
+        setIsAdmin(admin);
+        // /api/settings is admin-only (403 for members). Only fetch the prompt when we
+        // know we're an admin — otherwise a member's 403 leaves prompt="" and the strip
+        // would wrongly show "Custom". (The whole strip is admin-only anyway; see below.)
+        if (admin) {
+          fetch("/api/settings")
+            .then((r) => (r.ok ? r.json() : null))
+            .then((s) => alive && s && setPrompt(typeof s.system_prompt === "string" ? s.system_prompt : ""))
+            .catch(() => {});
+        }
+      })
       .catch(() => {});
     return () => {
       alive = false;
     };
   }, []);
+
+  // Answer Setup (style presets + prompt editor + model switch) is entirely admin-only —
+  // a member can't change any of it — so we hide the whole strip for non-admins rather
+  // than show disabled controls with a misleading "Custom" pill.
+  if (!isAdmin) return null;
 
   const active = presetOf(prompt);
 

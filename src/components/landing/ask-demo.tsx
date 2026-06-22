@@ -80,7 +80,7 @@ export function AskDemo() {
         <div className="space-y-3.5 px-5 py-5">
           {/* question bubble (typing) */}
           <div className="flex justify-end">
-            <div className="max-w-[88%] rounded-2xl rounded-br-sm bg-ink px-3.5 py-2 text-sm text-white">
+            <div className="max-w-[88%] rounded-2xl rounded-br-sm bg-accent px-3.5 py-2 text-sm text-accent-fg">
               {typed}
               {phase === "typing" && <span className="caret" />}
             </div>

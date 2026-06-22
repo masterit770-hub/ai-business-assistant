@@ -9,11 +9,10 @@ import { UserMenu } from "@/components/user-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { cn } from "@/lib/utils";
 
-// Real, reachable destinations only. "Ask" was removed (it rendered the same
-// dashboard; the Ask panel lives on /dashboard). "Sources" was removed (the
-// connectors feature is out of scope — no real connected sources exist).
-// `adminOnly` items are hidden from non-admins (server access is also gated; this
-// just avoids dead-end links into a forbidden page).
+// Real, reachable destinations only. Chat (/dashboard) is the assistant; Sources
+// (/sources) is the documents + data bucket. `adminOnly` items are hidden from
+// non-admins (server access is also gated; this just avoids dead-end links into a
+// forbidden page).
 const nav = [
   { label: "Chat", href: "/dashboard", icon: MessageSquare, match: "chat" },
   { label: "Sources", href: "/sources", icon: FileText, match: "sources" },

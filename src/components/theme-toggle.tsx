@@ -69,7 +69,7 @@ export function ThemeToggle({ className }: { className?: string }) {
 }
 
 // ── The BRAND axis (orthogonal to light/dark) ───────────────────────────────────
-// "violet" (Jenny's, the default) or "teal" (Chris's portfolio). Reflected as the
+// "violet" (the default) or "teal" (the alternate accent). Reflected as the
 // `data-brand` attribute on <html> (absent = violet); the CSS in globals.css overrides
 // just the accent tokens. Persisted under "ab-brand"; applied before paint by the
 // inline script below alongside data-theme.

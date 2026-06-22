@@ -190,13 +190,13 @@ export default function LandingPage() {
         <section className="border-t border-line bg-surface">
           <div className="mx-auto max-w-6xl px-6 py-20">
             <Reveal>
-              <div className="relative overflow-hidden rounded-3xl border border-line bg-ink px-8 py-16 text-center shadow-lift">
+              <div className="relative overflow-hidden rounded-3xl border border-accent-strong/30 bg-accent px-8 py-16 text-center shadow-lift">
                 <div className="absolute inset-0 bg-dotgrid opacity-10" />
                 <div className="relative">
-                  <h2 className="font-display text-3xl font-bold tracking-tight text-white sm:text-4xl">
+                  <h2 className="font-display text-3xl font-bold tracking-tight text-accent-fg sm:text-4xl">
                     Sign in to ask your first question.
                   </h2>
-                  <p className="mx-auto mt-4 max-w-xl text-lg text-white/70">
+                  <p className="mx-auto mt-4 max-w-xl text-lg text-accent-fg/80">
                     Your workspace admin sets up accounts and access. Once
                     you&rsquo;re in, the answer — with its sources — is one
                     question away.
@@ -204,7 +204,7 @@ export default function LandingPage() {
                   <Button
                     asChild
                     size="lg"
-                    className="mt-8 h-12 bg-accent px-6 text-base text-accent-fg hover:bg-accent/90"
+                    className="mt-8 h-12 bg-surface px-6 text-base text-ink hover:bg-surface/90"
                   >
                     <Link href="/sign-in">
                       Sign in

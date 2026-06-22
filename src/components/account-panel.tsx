@@ -323,7 +323,7 @@ export function AccountPanel() {
           </div>
         </div>
 
-        {/* ── Brand color (Jenny's violet ⇄ Chris's teal) ── */}
+        {/* Brand color (violet / teal) */}
         <div className="border-b border-line p-6">
           <span className="mb-3 block text-sm font-semibold text-ink">Brand color</span>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2" data-testid="brand-picker">

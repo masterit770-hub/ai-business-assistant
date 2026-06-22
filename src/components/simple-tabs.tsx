@@ -28,7 +28,6 @@ export function SimpleTabs({
     defaultValue ||
     tabs[0]?.value;
   const [active, setActive] = useState(initial);
-  const current = tabs.find((t) => t.value === active) ?? tabs[0];
 
   return (
     <div>
@@ -48,7 +47,15 @@ export function SimpleTabs({
           </button>
         ))}
       </div>
-      <div className="mt-6">{current?.content}</div>
+      {/* Keep every panel MOUNTED and toggle visibility, so switching tabs never
+          discards a panel's unsaved edits (each panel owns its own load/save state). */}
+      <div className="mt-6">
+        {tabs.map((t) => (
+          <div key={t.value} hidden={t.value !== active}>
+            {t.content}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
