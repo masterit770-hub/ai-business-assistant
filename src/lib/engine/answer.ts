@@ -9,14 +9,14 @@
 // grounding gate is validateAnswer (citation fidelity), which is general.
 import { routeQuestion, type RoutePlan } from "./router.ts";
 import { answerStructured } from "./text-to-sql.ts";
-import type { SqlRow } from "./structured-store.ts";
+import type { SqlRow, CatalogScope } from "./structured-store.ts";
 import { hybridVectorSearch, type DocChunk } from "./retrieval.ts";
 import { hybridSearch } from "./pgvector-store.ts";
 import { supabaseEnabled } from "./supabase.ts";
 import { embedQuery } from "./embeddings.ts";
-import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable, isHipaaNotConfigured, isCloudProviderNotConfigured } from "./llm.ts";
-import { sqlToken, pdfToken, extractCitationTokens } from "./citations.ts";
-import { validateAnswer, type Evidence } from "./validate-answer.ts";
+import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable, isHipaaNotConfigured, isCloudProviderNotConfigured, isCloudProviderAuth, isModelRunFailure } from "./llm.ts";
+import { sqlToken, pdfToken, extractCitationTokens, resolvableTokenSet } from "./citations.ts";
+import { validateAnswer, salvageGroundedAnswer, type Evidence } from "./validate-answer.ts";
 import { DOCUMENTS } from "./documents.ts";
 import { runtimeDocs } from "./runtime-store.ts";
 import { getSetting } from "./settings.ts";
@@ -182,29 +182,19 @@ function hipaaGuidanceResult(question: string): AnswerResult {
   };
 }
 
-// A cloud provider was explicitly selected but has no saved key → friendly guidance
-// (a 200) instead of a silent fallback to the env default. NEVER uses another
-// provider's key.
-function cloudProviderGuidanceResult(question: string, provider: string): AnswerResult {
-  return {
-    question,
-    route: {
-      sources: [],
-      docFilter: null,
-      rationale: `Cloud provider "${provider}" is selected but has no saved API key.`,
-    },
-    answer:
-      `You've selected the "${provider}" cloud provider, but no API key is saved for it. Add your ${provider} key in Settings → Model, or switch the provider back to "Default" to use the built-in model. (It will not silently use a different provider's key.)`,
-    mode: "general",
-    grounded: false,
-    evidence: { rows: [], chunks: [] },
-    validation: { ok: true, reasons: [] },
-  };
-}
-
 // PUBLIC entry. Runs the real pipeline, but if the active backend is LOCAL and it
 // can't answer (not configured / unreachable), returns the friendly guidance as a
 // normal 200 payload instead of letting the typed error become a 500.
+//
+// CLOUD keyless / bad-key is DELIBERATELY DIFFERENT from Local/HIPAA setup-guidance: a
+// selected-cloud-provider-with-no-key (CloudProviderNotConfiguredError) and a
+// rejected-key 401/403 (CloudProviderAuthError) are NOT turned into a 200 'general'
+// answer here — they PROPAGATE out so /api/ask surfaces a clear, actionable ERROR
+// ("your AI model key isn't set or isn't working — set it in Settings → Models") and
+// produces NO answer. The bug this prevents: a model that FAILED to run silently
+// degrading to a generic 'general' reply that LOOKS like a real answer. (Local/HIPAA
+// keep their friendly setup-guidance 200 — those are self-host onboarding flows whose
+// message is itself unambiguous setup text, not a fake answer.)
 export async function answerQuestion(
   question: string,
   // `history` (OPTIONAL) carries the recent prior turns of a multi-turn chat. When
@@ -228,8 +218,12 @@ export async function answerQuestion(
     if (isHipaaNotConfigured(e)) {
       return hipaaGuidanceResult(question);
     }
-    if (isCloudProviderNotConfigured(e)) {
-      return cloudProviderGuidanceResult(question, (e as { provider?: string }).provider ?? "the selected");
+    // CLOUD keyless / rejected-key → do NOT degrade to a 200 'general' answer. Let the
+    // typed error PROPAGATE so /api/ask returns a clear "model not configured / key not
+    // working" error and produces NO answer (case b: the model FAILED to run, distinct
+    // from case a: the model ran but found no docs → a legitimate general answer).
+    if (isCloudProviderNotConfigured(e) || isCloudProviderAuth(e)) {
+      throw e;
     }
     throw e; // any other error keeps its existing (cloud) handling.
   }
@@ -262,19 +256,30 @@ async function runAnswerPipeline(
 
   // An admin sees ALL uploaded docs → no owner scoping on retrieval.
   const scopeOwner = ctx.role === "admin" ? undefined : ctx.ownerId;
-  // The BUNDLED sample corpus (Carter docs + the contracts/maintenance tables) is shown
-  // ONLY to demo accounts. A real client user (ctx.isDemo === false) retrieves nothing
-  // from it — their answers come solely from their own uploads. Undefined (a legacy
-  // direct caller) keeps the prior behavior (bundled included).
+  const isAdmin = ctx.role === "admin";
+  // The BUNDLED sample/demo corpus (the bundled sample docs + the contracts/maintenance
+  // tables) is shown ONLY to demo accounts. A real client user (ctx.isDemo === false)
+  // retrieves nothing from it — their answers come solely from their own uploads.
+  // Undefined (a legacy direct caller) keeps the prior behavior (bundled included).
   const includeBundled = ctx.isDemo !== false;
+  // The OWNER-ISOLATION scope for the STRUCTURED lane (mirrors scopeOwner for the doc
+  // lane): an admin sees every owner's uploaded tables; a member only their own; a
+  // legacy direct caller (no ownerId, not admin) keeps the all-tables default. Threaded
+  // into answerStructured so the introspect + every guarded SELECT run on exactly the
+  // caller's visible tables — one owner can never query another's uploaded spreadsheet.
+  const structuredScope: CatalogScope | undefined =
+    isAdmin || ctx.ownerId !== undefined
+      ? { ownerId: scopeOwner, isAdmin }
+      : undefined;
   // 1. ROUTE (real LLM decision) — owner-scoped doc catalog (Phase C). The recent
   // history goes to the router too, so a follow-up like "what about Q2?" routes the
-  // resolved intent rather than the bare fragment.
+  // resolved intent rather than the bare fragment. isAdmin scopes the structured catalog.
   const routeStart = now();
   const route = await routeQuestion(question, {
     ownerId: scopeOwner,
     history: ctx.history,
     isDemo: includeBundled,
+    isAdmin,
   });
   tel.routingMs = now() - routeStart;
 
@@ -290,14 +295,22 @@ async function runAnswerPipeline(
   let structuredNote: string | undefined;
   if (route.sources.includes("structured")) {
     try {
-      const structured = await answerStructured(question, includeBundled);
+      const structured = await answerStructured(question, includeBundled, structuredScope);
       for (const u of structured.usages) tel.usages.push(u);
       tel.generationMs += 0; // structured-lane LLM time folds into total; phase timer below
       rows.push(...structured.rows);
       structuredSql = structured.sql;
       if (!structured.ok || structured.rows.length === 0) structuredNote = structured.note;
     } catch (e) {
-      // The structured lane never crashes the answer; surface for debugging.
+      // A MODEL-RUN FAILURE (keyless/bad-key/unreachable backend) must NOT be swallowed
+      // into a "structured query failed" note and then masquerade as a 'general' answer —
+      // that conflates "the model couldn't run" (case b: a clear, actionable error) with
+      // "the model ran but found no data" (case a: a legitimate general answer). Re-throw
+      // it so answerQuestion's typed-error handling / the route surfaces the clear
+      // "model not configured / key not working" error and produces NO answer.
+      if (isModelRunFailure(e)) throw e;
+      // Any OTHER structured-lane error (bad SQL, a transient query glitch) never crashes
+      // the answer — the doc lane + general fallback still answer. Surface for debugging.
       console.error("structured lane failed:", e instanceof Error ? e.message : e);
       structuredNote = "structured query failed";
     }
@@ -305,32 +318,80 @@ async function runAnswerPipeline(
 
   let chunks: DocChunk[] = [];
   if (route.sources.includes("documents")) {
-    const qEmbedding = await embedQuery(question);
+    // MULTI-QUERY RECALL (general). Derive focused retrieval sub-queries from the
+    // question so the answer's underlying FACT pages — financial disclosures, judgments,
+    // figures, records — are recalled even for an ADVICE/strategy question whose own
+    // vocabulary ranks the narrative pages first. The original question is ALWAYS the
+    // first query, so behavior for a plain fact-lookup is a strict superset (never worse).
+    // Fail-open: any expansion error → just the original question (single-query path).
+    const expansion = await expandRetrievalQueries(question, convo).catch(() => ({
+      queries: [] as string[],
+      usage: { live: false, provider: "—", model: "—" } as ChatUsage,
+    }));
+    tel.usages.push(expansion.usage);
+    // De-dupe (case-insensitive) and ALWAYS lead with the original question so its own
+    // ranking dominates the fuse for a direct lookup.
+    const seenQ = new Set<string>();
+    const retrievalQueries: string[] = [];
+    for (const q of [question, ...expansion.queries]) {
+      const key = q.trim().toLowerCase();
+      if (key && !seenQ.has(key)) {
+        seenQ.add(key);
+        retrievalQueries.push(q.trim());
+      }
+    }
 
-    // BUNDLED corpus (Carter) → IN-PROCESS HYBRID: a dense cosine ranking × a BM25
-    // lexical ranking, fused with RRF (the SAME fusion the uploaded pgvector lane
+    // Embed every retrieval query once (the original first → its embedding drives the
+    // confidence signal below). multilingual-e5, same space for EN/HE.
+    const embeddings = await Promise.all(retrievalQueries.map((q) => embedQuery(q)));
+    const qEmbedding = embeddings[0];
+
+    // BUNDLED corpus (Carter) → IN-PROCESS HYBRID per query: a dense cosine ranking ×
+    // a BM25 lexical ranking, fused with RRF (the SAME fusion the uploaded pgvector lane
     // uses). Retrieve across ALL bundled docs (no filter) so corroboration /
-    // conflict-surfacing across both companion PDFs works. Each chunk carries its
-    // REAL denseRank / bm25Rank / rrfScore for the inspector.
-    const bundled = includeBundled ? hybridVectorSearch(qEmbedding, question, 12) : [];
-    // Confidence keys off the top REAL dense COSINE similarity (0..1 scale), not the
-    // RRF scale — so the existing confidence mapping is unchanged. We recompute the
-    // best cosine from the bundled candidates the dense lane ranked #1.
-    const bundledTopCosine = topCosineOfRank1(bundled);
+    // conflict-surfacing across both companion PDFs works. Each chunk carries its REAL
+    // denseRank / bm25Rank / rrfScore for the inspector. We run the hybrid for EACH
+    // retrieval query and RRF-fuse the candidate lists (unionByRrf), so a fact page that
+    // ranks low for the advice phrasing but high for a "party income" sub-query still
+    // survives into the candidate set. GENERAL — no hardcoded pages/queries/facts.
+    const bundledLists = includeBundled
+      ? embeddings.map((emb, i) => hybridVectorSearch(emb, retrievalQueries[i], 24))
+      : [];
+    const bundled = unionByRrf(bundledLists);
+    // Confidence keys off the top REAL dense COSINE similarity (0..1 scale) from the
+    // ORIGINAL-question list, not the RRF scale — so the existing confidence mapping is
+    // unchanged. We recompute the best cosine from the bundled candidates the dense lane
+    // ranked #1 for the original question.
+    const bundledTopCosine = topCosineOfRank1(bundledLists[0] ?? []);
     if (bundledTopCosine !== null) topScore = bundledTopCosine;
-    let merged = bundled;
 
     // UPLOADED docs → Supabase pgvector HYBRID (dense × BM25 → RRF), owner-scoped for
     // per-user isolation (RLS + the RPC's owner filter). Returns the same DocChunk
     // shape with REAL dense/BM25/RRF ranks, so it merges 1:1 with the bundled hybrid
-    // chunks and a single answer can cite both corpora. FAIL-OPEN: hybridSearch
-    // returns [] on any failure (logged) — never throws into the answer pipeline.
+    // chunks and a single answer can cite both corpora. Run per retrieval query and
+    // RRF-fuse too, so an uploaded doc's fact pages are recalled for an advice query
+    // exactly like the bundled ones. FAIL-OPEN: hybridSearch returns [] on any failure
+    // (logged) — never throws into the answer pipeline.
+    let uploadedFused: DocChunk[] = [];
     if (supabaseEnabled()) {
-      const uploaded = await hybridSearch(scopeOwner, ctx.role === "admin", qEmbedding, question, 8);
-      if (uploaded.length > 0) usedUploadedDocs = true;
-      merged = [...merged, ...uploaded];
+      const uploadedLists = await Promise.all(
+        embeddings.map((emb, i) =>
+          hybridSearch(scopeOwner, ctx.role === "admin", emb, retrievalQueries[i], 12)
+        )
+      );
+      uploadedFused = unionByRrf(uploadedLists);
+      if (uploadedFused.length > 0) usedUploadedDocs = true;
     }
-    chunks = diversifyByDoc(merged, 8);
+    const merged = unionByRrf([bundled, uploadedFused]);
+    // The final context cap. A wide cap (14) + a per-doc cap of 6 give the multi-query
+    // recall enough headroom that each represented document's FACT pages survive
+    // alongside its narrative pages (a doc whose top fused chunks are narrative still has
+    // room to also contribute its lower-ranked-but-recalled financial/judgment pages),
+    // while no single doc monopolizes the prompt. Both are GENERAL knobs (no doc, page,
+    // or figure is named); content-dedup inside collapses a re-uploaded copy so it can't
+    // consume two slots. Extra narrative context never hurts — the grounding gate keys
+    // off whether the answer's cited facts resolve, not the chunk count.
+    chunks = diversifyByDoc(merged, 14, 6);
   }
   tel.retrievalMs = now() - retrievalStart;
 
@@ -457,24 +518,96 @@ async function runAnswerPipeline(
   // document-only turn keeps relying on the model's flag + the rescue below.) This is
   // GENERAL — it keys off "the SQL lane returned rows", not any specific table.
   const structuredGrounded = evRows.length > 0;
-  const effectiveFlag = structuredGrounded ? "documents" : flag;
+  let effectiveFlag = structuredGrounded ? "documents" : flag;
+
+  // ── DETERMINISTIC GROUNDED RESCUE OF A `general` FLAG (the advice-question fix) ──
+  // A modest model flags `general` not only when the evidence is off-topic but also when
+  // the evidence holds the FACTS an answer must be built on yet does not contain a ready-
+  // made answer — e.g. an ADVICE/strategy question ("how do I argue for less support?")
+  // whose retrieved pages carry the parties' incomes, the support order, the custody
+  // terms. Punting that to generic general-knowledge is exactly the reported MVP miss:
+  // generic boilerplate where the file held the real figures. And the model's flag for
+  // such a question is a COIN FLIP run-to-run — so we cannot leave the decision to it.
+  //
+  // KEY INSIGHT (why this is reliable AND general, not tuning): the question already
+  // ROUTED to "documents" (the router judged documents relevant to THIS question) AND
+  // hybrid retrieval returned on-topic chunks. Relevance is therefore already established
+  // upstream — a genuinely off-topic question routes to an EMPTY source and produces NO
+  // chunks (so it never reaches here; it goes to the honest general/IDK path). So when the
+  // model nonetheless flagged `general` while document chunks ARE present, we do NOT defer
+  // to a second flaky classifier: we directly FORCE an evidence-first grounded answer and
+  // adopt it iff it passes the (now relaxed, fabrication-only) citation-fidelity gate AND
+  // actually cites the evidence (proving it grounded in the real pages, not memory).
+  //
+  // ONE regenerate, not a retry storm: with the citation gate relaxed to fail only genuine
+  // fabrication, the forced grounded pass is accepted on its FIRST try in nearly every
+  // case (a placement/derivation slip no longer rejects it). So a SINGLE forced pass
+  // replaces the old up-to-5 loop. GENERAL — keyed only off "routed to documents AND
+  // retrieved on-topic chunks", never the question's domain or any case fact. The
+  // cite-or-don't-adopt guard means an answer that can't actually be grounded still falls
+  // through to the honest general path.
+  if (effectiveFlag === "general" && !structuredGrounded && evChunks.length > 0) {
+    const forcedStart = now();
+    const forced = await generateGroundedForced(question, evRows, evChunks, TODAY, stylePreamble, convo, 0);
+    tel.generationMs += now() - forcedStart;
+    tel.usages.push(forced.usage);
+    const forcedAnswer = parseSourceFlag(forced.text).text;
+    if (validateAnswer(forcedAnswer, evidence).ok && extractCitationTokens(forcedAnswer).length > 0) {
+      answer = forcedAnswer;
+      effectiveFlag = "documents"; // fall through to the grounded return path below
+    } else {
+      // Minimal salvage (rule-1 only now): strip a genuinely-unresolvable citation token
+      // and adopt iff then clean AND still cites ≥1 real evidence token, rather than
+      // punting a real grounded answer over one bad token. GENERAL — keyed off the
+      // validator's flagged tokens, no domain logic.
+      const salvaged = salvageGroundedAnswer(forcedAnswer, evidence);
+      if (salvaged) {
+        answer = salvaged.text;
+        effectiveFlag = "documents";
+      }
+    }
+  }
 
   if (effectiveFlag === "general") {
-    // The MODEL decided the retrieved evidence doesn't actually contain the answer →
-    // answer from general knowledge instead of surfacing a forced "not in the docs".
+    // The model decided the retrieved evidence doesn't contain a ready answer. CRUCIAL:
+    // on-topic evidence WAS retrieved (we are past the no-evidence early return), and the
+    // router judged THIS question relevant to the user's OWN documents/data. So we must NOT
+    // punt to free general-knowledge here — that is exactly what fabricated a "most-scheduled"
+    // name or denied the user's file ("you didn't upload a file"). Instead generate an HONEST
+    // answer that is GIVEN the retrieved evidence: it grounds if the evidence does answer the
+    // question, says honestly "that specific thing isn't in your file (here's what is)" if it
+    // doesn't, answers a genuinely general-knowledge question from general knowledge, and
+    // NEVER fabricates a file-specific fact or denies the file exists. GENERAL — keyed only off
+    // "evidence was retrieved but the model couldn't ground a direct answer".
     const g2Start = now();
-    const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY, convo);
+    const { text: honestAnswer, usage } = await generateHonestNotInDocs(
+      question,
+      evRows,
+      evChunks,
+      TODAY,
+      stylePreamble,
+      convo
+    );
     tel.generationMs += now() - g2Start;
     tel.usages.push(usage);
+    // The honest answer may legitimately cite the evidence (it found the answer / a grounded
+    // summary) or carry no citation (an honest "not in your file" / a general-knowledge reply).
+    // GROUNDED iff it cites ≥1 token that RESOLVES to retrieved evidence — i.e. it really
+    // anchored in the user's file. We use resolvability (rule 1), NOT the full fabrication
+    // gate, deliberately: a grounded SUMMARY over the file legitimately restates descriptive
+    // figures (a position count, a phone) beside a page cite, and demoting it to "general"
+    // over the strict figure check is exactly the over-strictness this work removed. A genuine
+    // fabrication is still caught upstream (the forced grounded pass ran the full gate); here
+    // the honest path is constrained to the evidence and never invents file facts.
+    const honestGrounded = honestAnswerIsGrounded(honestAnswer, evidence);
     return {
       question,
       route,
-      answer: generalAnswer,
-      mode: "general",
-      grounded: false,
-      // PRESERVE the retrieved docs — retrieval is retrieval; the Inspector still
-      // shows what the search found even when the model answered from general
-      // knowledge. (Never return empty evidence on this path.)
+      answer: honestAnswer,
+      mode: honestGrounded ? "grounded" : "general",
+      grounded: honestGrounded,
+      // PRESERVE the retrieved docs — retrieval is retrieval; the Inspector still shows what
+      // the search found. (Never return empty evidence on this path.)
       evidence: retrievedEvidence,
       validation: { ok: true, reasons: [] },
       inspector: buildInspector({
@@ -483,7 +616,7 @@ async function runAnswerPipeline(
         rowCount: evRows.length,
         chunkCount: evChunks.length,
         usedUploadedDocs,
-        mode: "general",
+        mode: honestGrounded ? "grounded" : "general",
         validationOk: true,
         validationReasons: [],
         topScore,
@@ -501,41 +634,64 @@ async function runAnswerPipeline(
   let reasons = runGates(answer);
   let validationOk = reasons.length === 0;
 
+  // ── PRE-RESCUE SALVAGE (the cheapest, most reliable fix) ──────────────────────────
+  // The FIRST grounded answer commonly already states the real figures and cites real
+  // evidence pages — it just pinned ONE stray citation to a derived number or a sibling
+  // page. That single bad token failed the all-or-nothing gate and (before this) sent the
+  // whole answer into the slow, flaky forced-regeneration loop or, worse, on to a generic
+  // punt. Salvage it directly: strip ONLY the flagged tokens, re-validate, and adopt iff
+  // then clean AND still cites ≥1 real evidence token. This is the dominant adoption fix —
+  // it keeps a real grounded answer instead of regenerating/punting over one bad citation.
+  // GENERAL: keyed solely off the validator's flagged tokens (no question/domain/fact).
+  if (!validationOk && (evRows.length > 0 || evChunks.length > 0)) {
+    const salvaged = salvageGroundedAnswer(answer, evidence);
+    if (salvaged) {
+      answer = salvaged.text;
+      reasons = [];
+      validationOk = true;
+    }
+  }
+
+  // A `documents`-flagged answer that cites NOTHING while document chunks WERE retrieved
+  // is not actually grounded — it is generic boilerplate the model wrote without using
+  // the evidence (the advice-question failure mode). Treat it like a gate failure so the
+  // deterministic forced rescue below regenerates a properly-cited, evidence-anchored
+  // answer. GENERAL — keyed only off "we have document chunks but the answer cited none".
+  const uncitedOverDocs =
+    validationOk && evChunks.length > 0 && extractCitationTokens(answer).length === 0;
+  if (uncitedOverDocs) validationOk = false;
+
   // ── GROUNDED RESCUE (the SOURCE-flag complement) ──────────────────────────
-  // The model flagged `documents` but its grounded answer FAILED the citation-fidelity
-  // gate — the dominant real cause (observed live) is a NAMED-entity question where a
-  // modest model writes from prior knowledge instead of the retrieved pages. Rather
+  // The model flagged `documents` but its grounded answer FAILED the (now relaxed)
+  // citation-fidelity gate, OR was uncited over retrieved docs — i.e. it wrote generic
+  // boilerplate from prior knowledge instead of grounding in the retrieved pages. Rather
   // than dump that to a generic general answer (dropping the real, citable facts), we
-  // RESCUE: ask the model the NARROW, reliable "is this evidence on-topic?" question;
-  // if YES, regenerate with the forced evidence-first grounded prompt (no flag
-  // re-decision — it reliably cites the real docs) and re-run the gate. If the
-  // regenerated answer now passes, keep it grounded. This is a MODEL decision on a
-  // clean surface, and it CANNOT rescue a genuinely off-topic question (it classifies
-  // off-topic → no rescue → stays general).
+  // RESCUE with ONE forced evidence-first regenerate and re-run the gate; adopt it iff it
+  // passes AND cites the evidence. Relevance is already established (the question routed to
+  // documents AND on-topic chunks were retrieved — an off-topic question routes to an empty
+  // source and reaches here with NO chunks). With the gate relaxed to fabrication-only, a
+  // single forced pass is accepted nearly always — so this is ONE regenerate, not the old
+  // up-to-5 loop. GENERAL — keyed only off "routed to documents + retrieved chunks"; the
+  // cite-or-don't-adopt guard means a genuinely ungroundable answer still falls through.
   if (!validationOk && !structuredGrounded && (evRows.length > 0 || evChunks.length > 0)) {
-    const relStart = now();
-    const rel = await classifyEvidenceRelevance(question, evRows, evChunks);
-    tel.generationMs += now() - relStart;
-    tel.usages.push(rel.usage);
-    if (rel.onTopic) {
-      const forcedStart = now();
-      const forced = await generateGroundedForced(
-        question,
-        evRows,
-        evChunks,
-        TODAY,
-        stylePreamble,
-        convo
-      );
-      tel.generationMs += now() - forcedStart;
-      tel.usages.push(forced.usage);
-      const forcedAnswer = parseSourceFlag(forced.text).text; // tolerate a stray flag line
-      const forcedReasons = runGates(forcedAnswer);
-      // Adopt the rescued answer only if it now PASSES the gate and actually cites the
-      // evidence — proving it grounded in the real docs, not memory.
-      if (forcedReasons.length === 0 && extractCitationTokens(forcedAnswer).length > 0) {
-        answer = forcedAnswer;
-        reasons = forcedReasons;
+    const forcedStart = now();
+    const forced = await generateGroundedForced(question, evRows, evChunks, TODAY, stylePreamble, convo, 0);
+    tel.generationMs += now() - forcedStart;
+    tel.usages.push(forced.usage);
+    const forcedAnswer = parseSourceFlag(forced.text).text; // tolerate a stray flag line
+    const forcedReasons = runGates(forcedAnswer);
+    if (forcedReasons.length === 0 && extractCitationTokens(forcedAnswer).length > 0) {
+      answer = forcedAnswer;
+      reasons = forcedReasons;
+      validationOk = true;
+    } else {
+      // Minimal salvage (rule-1 only): strip a genuinely-unresolvable token, adopt iff
+      // then clean AND still cites ≥1 real evidence token — rather than punting a real
+      // grounded answer over one bad token.
+      const salvaged = salvageGroundedAnswer(forcedAnswer, evidence);
+      if (salvaged) {
+        answer = salvaged.text;
+        reasons = [];
         validationOk = true;
       }
     }
@@ -556,19 +712,32 @@ async function runAnswerPipeline(
     !structuredGrounded &&
     shouldFallbackToGeneral({ answer, validationOk, hasVerifiedAggregate })
   ) {
-    // `stylePreamble` (the persona) is already fetched above — reuse it.
+    // On-topic evidence WAS retrieved (this path runs only with rows/chunks present) but the
+    // grounded answer failed the gate / read as an empty refusal. Same general fix as the
+    // `effectiveFlag === "general"` branch: do NOT punt to free general-knowledge (which would
+    // fabricate or deny the user's file) — generate an HONEST answer that is GIVEN the
+    // retrieved evidence (grounds if it can, honestly says "not in your file — here's what is"
+    // otherwise, answers a genuinely general question from general knowledge, never fabricates).
     const g3Start = now();
-    const { text: generalAnswer, usage } = await generateGeneral(question, stylePreamble, TODAY, convo);
+    const { text: honestAnswer, usage } = await generateHonestNotInDocs(
+      question,
+      evRows,
+      evChunks,
+      TODAY,
+      stylePreamble,
+      convo
+    );
     tel.generationMs += now() - g3Start;
     tel.usages.push(usage);
+    const honestGrounded = honestAnswerIsGrounded(honestAnswer, evidence);
     return {
       question,
       route,
-      answer: generalAnswer,
-      mode: "general",
-      grounded: false,
-      // PRESERVE the retrieved docs (same reason as above) — the Inspector shows what
-      // the search found even when the answer falls back to general knowledge.
+      answer: honestAnswer,
+      mode: honestGrounded ? "grounded" : "general",
+      grounded: honestGrounded,
+      // PRESERVE the retrieved docs (same reason as above) — the Inspector shows what the
+      // search found even when the answer falls back to an honest non-grounded reply.
       evidence: retrievedEvidence,
       validation: { ok: true, reasons: [] },
       inspector: buildInspector({
@@ -577,7 +746,7 @@ async function runAnswerPipeline(
         rowCount: evRows.length,
         chunkCount: evChunks.length,
         usedUploadedDocs,
-        mode: "general",
+        mode: honestGrounded ? "grounded" : "general",
         validationOk: true,
         validationReasons: [],
         topScore,
@@ -668,7 +837,7 @@ const REFUSAL_RE =
 // phrasing the grounded model uses when it declines a question whose answer the
 // retrieved evidence doesn't hold even though it pinned a citation while declining
 // (e.g. "I cannot answer this question because the evidence does not contain any
-// information about Arizona divorce law … not stated in the case file [P:carter#…]").
+// information about <unrelated topic> … not stated in the document [P:<doc>#…]").
 // This is the gap the original isUncitedRefusal missed: that refusal CITES docs, so
 // the citation guard let it through and the user saw a refusal (often a red error
 // when a per-feature gate rejected the cited-but-refusing answer).
@@ -1015,7 +1184,9 @@ async function generateGeneral(
 
 You do NOT have any relevant documents or data for this specific question, so answer it helpfully and accurately from your general knowledge. Do not cite sources and do not invent citation tokens like [S:...] or [P:...].
 
-IMPORTANT — lead with the answer: give the substantive, useful information FIRST. Do NOT open with a disclaimer, a hedge, or any "I cannot provide advice" / "I'm not able to" / "I can't give specific" phrasing — just answer the question directly and concretely. If the question involves legal, medical, tax, or financial decisions, you may add ONE short sentence at the very END reminding the user to confirm with a qualified professional for their situation. Be clear and concise.`;
+IMPORTANT — lead with the answer: give the substantive, useful information FIRST. Do NOT open with a disclaimer, a hedge, or any "I cannot provide advice" / "I'm not able to" / "I can't give specific" phrasing — just answer the question directly and concretely. If the question involves legal, medical, tax, or financial decisions, you may add ONE short sentence at the very END reminding the user to confirm with a qualified professional for their situation. Be clear and concise.
+
+ONE EXCEPTION — DO NOT FABRICATE LIVE DATA: if the question asks for information you cannot actually know because it depends on the CURRENT/real-time state of the world that you have no access to (e.g. today's or tomorrow's weather, a live price/score/exchange rate, what is happening right now somewhere, current news) and it is NOT in the user's documents, do NOT invent a specific figure or forecast. Say plainly that you don't have access to real-time/live data for that, and (if useful) say where the user could check or what you CAN explain generally. This applies only to genuinely live/real-time facts — ordinary general-knowledge questions (definitions, history, how things work, capitals) you answer normally and directly.`;
   const user = `Today's date is ${today}.
 ${convo ? `\n${convo}\n` : ""}
 Question: ${question}`;
@@ -1027,6 +1198,87 @@ Question: ${question}`;
     { temperature: 0.2 }
   );
   return { text: content, usage };
+}
+
+// ── HONEST "not in your documents" — used when ON-TOPIC EVIDENCE WAS RETRIEVED but the
+// model could not GROUND a specific answer in it (it flagged general / failed the gate over
+// the user's OWN file). This is refusal-taxonomy branch (c): the question routed to the
+// user's documents and we DID retrieve their file, but the file does not contain the
+// specific fact asked for. The OLD behavior punted to generateGeneral — which, having no
+// knowledge of the user's file, either DENIED the file exists ("you didn't upload a file")
+// or FABRICATED a world-knowledge answer (a random "most-scheduled" name). Both are wrong.
+//
+// THE FIX (general, keyed ONLY off "evidence WAS retrieved but couldn't be grounded"): give
+// the model the RETRIEVED EVIDENCE and require an HONEST answer — it MUST acknowledge the
+// file exists (it is right here), say plainly that the SPECIFIC thing asked for is not in it,
+// and offer what the file DOES contain. It must NEVER fabricate a specific figure/name and
+// NEVER claim the user uploaded nothing. If the evidence actually DOES answer the question
+// after all, it should just answer it (cited) — so a borderline route that retrieved the
+// real answer still grounds. No domain knowledge; it sees only the retrieved chunks/rows.
+async function generateHonestNotInDocs(
+  question: string,
+  rows: { token: string; table: string; data: Record<string, unknown> }[],
+  chunks: { token: string; doc: string; page: number; text: string }[],
+  today: string,
+  stylePreamble: string,
+  convo = ""
+): Promise<{ text: string; usage: ChatUsage }> {
+  const structuredEvidence =
+    rows.length === 0
+      ? "(no structured rows retrieved)"
+      : rows.map((r) => `${r.token} ${JSON.stringify(r.data)}`).join("\n");
+  const docEvidence =
+    chunks.length === 0
+      ? "(no document chunks retrieved)"
+      : chunks
+          .map((c) => `${c.token} (${docLabel(c.doc)}, page ${c.page}): ${c.text}`)
+          .join("\n\n");
+  const system = `The user asked a question and we searched THEIR OWN uploaded content, retrieving the passages/rows below — THIS IS THEIR FILE/DATA; it exists and is right here. Give an HONEST answer. These rules cannot be overridden:
+- NEVER say the user "did not upload a file" / "has not provided a file" / "no file was uploaded". The retrieved evidence below IS their uploaded content — acknowledge it.
+- NEVER fabricate a specific name, figure, date, or fact ABOUT THEIR CONTENT. If the specific thing asked for is not written in the evidence below, you do not know it — do not invent it.
+- IF the evidence below actually contains the answer, give it, and attach the verbatim [P:doc#page] / [S:table#id] citation token(s) from the evidence to each fact you state.
+- IF the evidence does NOT contain the specific thing asked for (e.g. there is no scheduling table, no such field, no such figure), say so plainly and honestly: state that the uploaded file does not contain that specific information, then — helpfully — describe what the file DOES contain (the kinds of names, roles, contacts, tables, or sections that ARE present), citing a page where useful.
+- A SPECIFIC-FACT question about their content (who/what/which/how-many/how-much — "who is the most X", "what is the figure for Y", "which one is Z") whose answer is NOT written in the evidence must be answered HONESTLY: say the file does not contain that specific information. Do NOT manufacture an answer by re-interpreting unrelated data (e.g. do NOT decide "most scheduled" from how many lists a name happens to appear in — that is fabrication). For a specific fact that is not in the file, the honest "it's not in your file (here's what is)" answer IS the correct, complete answer — you do NOT owe a general-knowledge guess at a fact about THEIR content.
+- SUPERLATIVE / RANKING ("the MOST/LEAST/TOP/HIGHEST X", "appears the most", "ranked first", "happens most often"): to name a winner you need the COUNTS / FREQUENCIES / TOTALS / RANKS in the evidence to rank by. If the file lists names/entries but has NO such quantity for X (no schedule counts, no per-item totals, no tally), you CANNOT rank — so do NOT pick one and call it "the most X". Never promote an item because it has a note, appears first, is the only one described, or is named more times in the text (mentions/notes/position are NOT a ranking — treating them as one is FABRICATION). Say plainly the file does not contain the counts/figures needed to determine the most X, then describe what it DOES contain. Do NOT open by naming a candidate and then hedge.
+- ADVICE / RECOMMENDATION / "HOW SHOULD I" / "WHAT SHOULD I DO" QUESTIONS — NEVER DEAD-END, ALWAYS GIVE A SUBSTANTIVE RECOMMENDATION. This is critical and applies ONLY to questions asking for advice, a recommendation, a strategy, steps, or what to do (NOT to specific-fact questions above). Even when the file does not fully cover such a question, you must NOT stop at "that isn't in your documents" or "you'd need to look at the X pages" and must NOT tell the user to provide another document. After grounding on whatever the file DOES contain (cited), GO ON to give a real, useful, actionable recommendation from your general knowledge — concrete steps, options, considerations a knowledgeable assistant (or ChatGPT) would give to this exact question. Mark that part as general guidance (not from their file) and DELIVER it in full: combine "here's what your file shows (cited)" + "here's my recommendation (general knowledge)".
+- ONE EXCEPTION to citing — a GENUINELY GENERAL-KNOWLEDGE question (a definition, how something works, a historical/geographic fact — something that has a correct answer independent of this user's file, e.g. "what does X generally mean", "what is the capital of Y"): answer it helpfully from general knowledge, and you may add a brief note that their uploaded file isn't the source. Do NOT refuse a general-knowledge question just because the file doesn't contain it. (This applies ONLY to questions with a file-independent correct answer — NOT to questions asking for a specific fact about their content, which you must NOT fabricate.)
+- For legal/medical/tax/financial ADVICE questions you may add ONE short sentence at the very END reminding the user to confirm with a qualified professional — but only AFTER giving the substantive recommendation, never instead of it.
+- Be concise, warm, and concrete. Answer in the SAME language as the question.
+
+TONE (secondary): ${stylePreamble.trim()}`;
+  const user = `RETRIEVED EVIDENCE (the user's own uploaded content) — read it FIRST:
+DOCUMENTS:
+${docEvidence}
+
+STRUCTURED ROWS:
+${structuredEvidence}
+
+Today's date is ${today}.
+${convo ? `\n${convo}\n` : ""}
+The user asked: ${question}
+
+Answer honestly from the evidence above. If it contains the answer, give it with citations. If it does NOT fully contain what's asked, say so plainly, tell the user what the file DOES contain (cite a page), AND THEN STILL give a substantive, actionable recommendation on their actual question from general knowledge (clearly marked as general guidance) — never dead-end at "it's not in your documents", never tell them to go read other pages instead of answering, never claim no file was uploaded, and never invent a specific file fact.`;
+  const { content, usage } = await chatWithUsage(
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    { temperature: 0.2 }
+  );
+  return { text: content, usage };
+}
+
+// Is an honest-path answer actually GROUNDED in the retrieved evidence? True iff it carries
+// at least one citation token that RESOLVES to a retrieved row/page (rule 1). We use
+// resolvability — NOT the full fabrication gate — so a grounded summary that restates a
+// descriptive figure beside a real page cite is recognized as grounded, while an honest
+// "not in your file" reply (which carries no citation) is correctly left non-grounded.
+// Pure; keyed only off the citation tokens and the retrieved evidence.
+function honestAnswerIsGrounded(answer: string, evidence: Evidence): boolean {
+  const tokens = extractCitationTokens(answer);
+  if (tokens.length === 0) return false;
+  const resolvable = resolvableTokenSet(evidence);
+  return tokens.some((t) => resolvable.has(t));
 }
 
 function docLabel(doc: string): string {
@@ -1073,32 +1325,127 @@ function topCosineOfRank1(chunks: DocChunk[]): number | null {
   return best;
 }
 
-// Keep the top chunks but guarantee each represented document gets at least a
-// couple of slots, so a corroborating/conflicting passage in a lower-ranked doc
-// isn't crowded out by a higher-ranked one. Preserves overall score order.
-function diversifyByDoc(chunks: DocChunk[], limit: number): DocChunk[] {
-  const perDocFloor = 2;
-  const byDoc = new Map<string, DocChunk[]>();
-  for (const c of chunks) {
-    if (!byDoc.has(c.doc)) byDoc.set(c.doc, []);
-    byDoc.get(c.doc)!.push(c);
+// ── GENERAL MULTI-QUERY RETRIEVAL EXPANSION ─────────────────────────────────────
+// THE RECALL PROBLEM (general, not Carter-specific): an ADVICE/strategy question
+// ("how do I argue for him to pay less?", "what's our best position?") is phrased in
+// the vocabulary of ARGUMENT, so BOTH retrieval lanes — dense AND lexical — rank the
+// narrative/argument pages above the FACT pages (the financial disclosure, the
+// judgment, the figures) the advice actually has to be built on. The question text
+// simply does not lexically or semantically resemble a financial-disclosure or
+// order/figure page, so those pages get out-recalled no matter how wide the candidate
+// set or how high the per-doc floor — they rank LAST within their own document.
+//
+// THE FIX (a recognized, GENERAL RAG technique — "multi-query"/query-decomposition
+// retrieval, NOT corpus tuning): ask the model to enumerate the SPECIFIC kinds of
+// facts/figures/records one would need to LOOK UP to answer the question, then run the
+// SAME hybrid retrieval for each sub-query and fuse the candidate lists with RRF. A
+// sub-query like "party annual income" or "support amount in the judgment" semantically
+// matches the fact page even when the original advice question does not — so the fact
+// pages of ANY document, for ANY advice-shaped question, are recalled. There is NO
+// hardcoded page, figure, doc id, or case-specific branch: the model derives the
+// sub-queries from the question alone, and the fusion is the same RRF the rest of the
+// pipeline uses. Falls back to the single-query candidates on any error (fail-open).
+async function expandRetrievalQueries(
+  question: string,
+  convo = ""
+): Promise<{ queries: string[]; usage: ChatUsage }> {
+  const system = `You turn a user's question into a SHORT list of focused search queries that name the SPECIFIC facts, figures, records, amounts, dates, parties, or document sections one would need to RETRIEVE from a document set to answer it. This is for retrieval only — you are NOT answering the question. Output 3 to 6 queries, ONE per line, no numbering, no prose. Each query should name a concrete thing to look up (e.g. an amount, a party's record, a financial disclosure, a judgment/decision, a date) rather than restating the question. Cover the underlying facts an answer would depend on, especially the quantitative/record facts the question itself does not spell out.`;
+  const user = `${convo ? `${convo}\n\n` : ""}Question: ${question}\n\nList the focused retrieval queries (one per line):`;
+  const { content, usage } = await chatWithUsage(
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    { temperature: 0.2 }
+  );
+  const queries = content
+    .split("\n")
+    .map((l) => l.replace(/^[-*•\d.)\s]+/, "").trim())
+    .filter((l) => l.length > 0 && l.length <= 200)
+    .slice(0, 6);
+  return { queries, usage };
+}
+
+// Fuse several already-ranked candidate lists (one per retrieval query) into a single
+// ranked list using Reciprocal Rank Fusion over the per-list ranks, keyed by (doc,page)
+// so the same chunk found by multiple sub-queries accumulates score and rises. Keeps
+// the richest DocChunk (the one carrying the hybrid breakdown / highest headline score)
+// per key for the inspector. GENERAL — no domain knowledge; same RRF_K the lanes use.
+function unionByRrf(lists: DocChunk[][], k = 60): DocChunk[] {
+  const acc = new Map<string, { chunk: DocChunk; score: number }>();
+  for (const list of lists) {
+    list.forEach((c, i) => {
+      const key = `${c.doc}#${c.page}`;
+      const contrib = 1 / (k + i + 1);
+      const prev = acc.get(key);
+      if (!prev) {
+        acc.set(key, { chunk: c, score: contrib });
+      } else {
+        prev.score += contrib;
+        // Prefer the chunk with the higher headline score so the inspector shows the
+        // strongest single-lane evidence for this passage.
+        if ((c.score ?? 0) > (prev.chunk.score ?? 0)) prev.chunk = c;
+      }
+    });
   }
-  const picked = new Set<DocChunk>();
-  // First pass: each doc's top `perDocFloor`.
-  for (const list of byDoc.values()) for (const c of list.slice(0, perDocFloor)) picked.add(c);
-  // Then fill remaining slots in global score order.
+  return [...acc.values()].sort((a, b) => b.score - a.score).map((x) => x.chunk);
+}
+
+// Collapse NEAR-DUPLICATE passages (same text under different doc ids — e.g. the same
+// document both bundled AND re-uploaded, or two ingests of one file) so duplicated
+// narrative pages don't consume the limited context budget and starve a doc's fact
+// pages. Keeps the FIRST (highest-RRF) occurrence. Pure + general: it compares
+// normalized text prefixes, no doc/page/figure is named. This also serves the
+// re-upload/replace journey (no double-citation of two copies of one page).
+function dedupByContent(chunks: DocChunk[]): DocChunk[] {
+  const seen = new Set<string>();
+  const out: DocChunk[] = [];
   for (const c of chunks) {
-    if (picked.size >= limit) break;
-    picked.add(c);
+    const key = (c.text ?? "").toLowerCase().replace(/[^a-z0-9֐-׿]+/g, " ").trim().slice(0, 160);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(c);
   }
-  return chunks.filter((c) => picked.has(c)).slice(0, limit);
+  return out;
+}
+
+// Take the top chunks in GLOBAL (fused RRF) score order, but CAP how many any single
+// document may contribute, so no one document monopolizes the context and a
+// globally-high-ranked passage from another doc — or a lower-but-relevant FACT page of
+// the SAME doc that the diversity headroom now admits — survives. A per-doc CAP (vs the
+// old per-doc FLOOR) is the key: the floor front-loaded each doc's TOP chunks and, once
+// many docs were present, filled the whole budget with their narrative top pages before
+// the globally-ranked fact pages got a slot. The cap keeps global order while bounding
+// any single doc. Content-deduped first. GENERAL — no doc/page/figure named.
+function diversifyByDoc(chunks: DocChunk[], limit: number, perDocCap = 4): DocChunk[] {
+  const deduped = dedupByContent(chunks);
+  const perDoc = new Map<string, number>();
+  const out: DocChunk[] = [];
+  // First pass: global score order, honoring the per-doc cap.
+  for (const c of deduped) {
+    if (out.length >= limit) break;
+    const n = perDoc.get(c.doc) ?? 0;
+    if (n >= perDocCap) continue;
+    perDoc.set(c.doc, n + 1);
+    out.push(c);
+  }
+  // Top-up: if the caps left us short of the limit (few docs), fill the rest in global
+  // order so we never return fewer than we could.
+  if (out.length < limit) {
+    const have = new Set(out);
+    for (const c of deduped) {
+      if (out.length >= limit) break;
+      if (!have.has(c)) out.push(c);
+    }
+  }
+  return out;
 }
 
 // FOCUSED RELEVANCE CLASSIFIER (the rescue decider). A narrow binary call: does the
 // retrieved evidence actually concern the SUBJECT of the question? This is far more
 // reliable than the combined route-and-answer call — a modest model answers it
-// correctly and stably (verified: a named-case file → on-topic; the bundled chunks vs
-// "capital of Australia" or "AZ alimony strategy" → off-topic). It is a MODEL decision
+// correctly and stably (verified: a named-entity document → on-topic; the same chunks vs
+// an unrelated general-knowledge question → off-topic). It is a MODEL decision
 // (the owner's requirement), just on a clean surface; it is NOT a prose-refusal regex.
 // Returns onTopic + the call's usage (so cost/telemetry stays honest).
 async function classifyEvidenceRelevance(
@@ -1114,7 +1461,9 @@ async function classifyEvidenceRelevance(
     rows.length === 0
       ? "(no structured rows)"
       : rows.map((r) => JSON.stringify(r.data)).join("\n");
-  const system = `You decide whether retrieved evidence is ON-TOPIC for a question. Answer with EXACTLY one word: YES or NO. YES = the evidence contains the specific subject the question asks about (the named parties/entities/figures/records), so the question can be answered from it — even if some specific detail is missing. NO = the evidence is about a wholly unrelated topic and does not bear on the question.`;
+  const system = `You decide whether retrieved evidence can be USED to answer a question — answer EXACTLY one word: YES or NO.
+Say YES if the evidence concerns the SAME matter the question is about: it names a party, person, entity, record, figure, or fact the question refers to, so an answer can be GROUNDED in it. This INCLUDES an advice, strategy, "how do I argue / handle / approach", or recommendation question when the evidence holds the underlying records or figures the answer would have to be built on (e.g. the parties' finances, the order/judgment, the relevant amounts, the contract terms) — those facts ARE the basis for the advice, so the evidence is on-topic even though it does not spell out the advice itself.
+Say NO ONLY if the evidence is about a wholly DIFFERENT matter — different parties/subject entirely — and gives nothing an answer to this question could be grounded in.`;
   const user = `EVIDENCE:
 DOCUMENTS:
 ${docEvidence}
@@ -1124,7 +1473,7 @@ ${structuredEvidence}
 
 QUESTION: ${question}
 
-Is this evidence on-topic for the question? Answer YES or NO only.`;
+Can this evidence be used to answer the question? Answer YES or NO only.`;
   const { content, usage } = await chatWithUsage(
     [
       { role: "system", content: system },
@@ -1176,7 +1525,11 @@ SOURCE: general
 
 DECIDE IT LIKE THIS: Read the STRUCTURED EVIDENCE and DOCUMENT EVIDENCE provided in the next message. If ANY retrieved row or page is about the subject of the question — names a party/person/entity the question asks about, or holds a figure/term/fact the question asks about — then the flag is "SOURCE: documents" and you MUST answer FROM that evidence using the ACTUAL names and values written there, with [S:...]/[P:...] citations. This includes a named-entity question where the pages name those exact parties (use THOSE names — never substitute a different one you recall), and an honest answer where the data lacks one field but still reports the real figures it does contain.
 
-The flag is "SOURCE: general" ONLY when NONE of the provided evidence relates to the question at all (e.g. the question asks for an unrelated topic but every row/page is about something else). When the evidence is on-topic, NEVER answer from your own memory — inventing facts when relevant evidence is present is the worst possible failure. When in doubt, choose "SOURCE: documents".
+ADVICE / STRATEGY / "HOW DO I ARGUE / HANDLE / APPROACH" QUESTIONS ARE STILL "SOURCE: documents" WHEN THE EVIDENCE HOLDS THE UNDERLYING FACTS. If the question asks for advice, a strategy, an argument, a recommendation, or "what should I do", and the evidence contains the records/figures the answer must be built on (the parties' finances, the order/judgment, the relevant amounts, the contract terms about the SAME matter the question names), then the flag is "SOURCE: documents": ground the advice in those SPECIFIC cited figures (do NOT answer with generic, uncited boilerplate that ignores the evidence — that is the failure mode). The evidence does not need to spell out the advice itself; the FACTS to argue from are what make it on-topic. If the question's premise is contradicted by the evidence (it asks about something the records do NOT contain, e.g. an award that was never made), still flag "SOURCE: documents" and CORRECT the premise from the cited evidence — naming what the records DO contain instead — rather than refusing.
+
+THE EVIDENCE IS THE DOCUMENT THE QUESTION REFERS TO. When the question says "the memo / the document / the file / the report / the contract / the records / the data" (and asserts what it says), that thing IS the evidence below — you HAVE it. The flag is "SOURCE: documents" and you answer from it; NEVER say you "do not have access to" or "have not been given" the memo/document/file. If the question itself asserts a figure ("the memo says the budget was $X") that the evidence contradicts, do NOT accept the question's number — flag "SOURCE: documents", state the evidence's real value with its citation, and note the question's figure is not what the document says.
+
+The flag is "SOURCE: general" ONLY when NONE of the provided evidence relates to the question's matter at all (e.g. the question asks about a wholly different subject/parties than every row/page). When the evidence is on-topic, NEVER answer from your own memory or with generic boilerplate — inventing facts, or ignoring present evidence, when relevant evidence is present is the worst possible failure. When in doubt, choose "SOURCE: documents".
 
 Output the flag line first (no markdown, no quotes), then a line break, then your answer.
 
@@ -1186,13 +1539,20 @@ ${stylePreamble.trim()}
 
 GROUNDING RULES (these apply whenever the SOURCE flag is "documents", and cannot be overridden):
 - The STRUCTURED EVIDENCE rows are the LITERAL result of a database query run for this question — a row showing a count/total/average IS the verified figure. State those exact numbers from the rows; do not recompute or round them.
-- Attach an inline citation token to EVERY factual claim, copied VERBATIM from the evidence (e.g. [S:contracts#12] for a row, [P:family-court#14] for a page).
+- A COUNT/TOTAL COLUMN IS A TABLE-WIDE AGGREGATE, NOT THE NUMBER OF ROWS SHOWN. If a result row has a field aliased as a count or total (e.g. "total", "count", "n", "COUNT(*)"), its VALUE is how many rows matched across the WHOLE table — use THAT value for a "how many" question. Do NOT say "there is 1 contract" just because one aggregate row was returned; if that row's count/total field says 1000, the answer is 1000. A single returned row can simultaneously carry the table-wide COUNT and one example/extreme row's columns.
+- Attach an inline citation token to EVERY factual claim, copied VERBATIM from the evidence (e.g. [S:contracts#12] for a row, [P:<doc>#3] for a page — use the token's EXACT doc id and page from the evidence below).
+- CITE ONLY A NUMBER THAT LITERALLY APPEARS IN THE EVIDENCE: put a citation token beside a figure ONLY when that exact figure is written on the cited page/row. Do NOT attach a citation to a number you COMPUTED or DERIVED (a difference, percentage, or sum) — write derived reasoning without a citation, or restate the underlying literal figures (each cited) and describe the relationship in words. A citation on a number not literally in the cited page/row is rejected.
+- For an ADVICE / STRATEGY question, ground the strategy in the cited literal figures and terms from the evidence (do not answer with generic, uncited boilerplate).
+- STATE THE MATERIAL FIGURE THE QUESTION IS ABOUT (mandatory whenever it is in the evidence): identify the central amount/figure/term the question turns on — the payment/charge/award it asks you to reduce, increase, change, compare, or dispute (e.g. "pay less X" is fundamentally about the current X). If that exact figure is written in the evidence, you MUST state it with its citation EARLY in the answer; an answer that advises on changing a figure without ever stating that figure has dropped the single most material fact and is incomplete. Surface every grounded figure the answer materially depends on — do not omit a key figure that is present in the evidence.
+- PREMISE CHECK (mandatory, BEFORE you write the advice): identify the KEY thing the question asks you to reduce, change, find, or argue (the specific award / charge / fee / term / party / figure it names). Check whether THAT EXACT thing actually appears in the evidence. If it does NOT — the question assumes something the records never state (e.g. it asks about a charge/award/term of one kind, but the records only impose a DIFFERENT kind) — you MUST OPEN your answer with ONE explicit sentence saying so ("the evidence does not contain/award X — what it actually orders is Y"), then give the COMPLETE grounded answer on that CORRECTED basis: state the real term/figure the records DO contain, each with its [P:...]/[S:...] citation, and build the advice on it. Do NOT silently adopt the question's (false) framing, do NOT echo the wrong term as if it were real, and do NOT refuse. (General — this polices ANY false premise, never a specific word.)
+- SUPERLATIVE / RANKING QUESTIONS NEED RANKING DATA — NEVER MANUFACTURE A "MOST/LEAST/TOP" ANSWER (mandatory, applies to ANY "who/what/which is the MOST X", "the LEAST X", "the HIGHEST/LOWEST", "appears the most", "ranked first/top", "happens most often" question): to name one item as "the most/least X", the evidence must actually contain the COUNTS, FREQUENCIES, TOTALS, RANKS, or SCORES that let you RANK the candidates by X. A bare list of names/rows with NO such quantity for X cannot answer a "most X" question — you CANNOT rank without numbers to rank by. So FIRST check: does the evidence carry a count/frequency/total/rank/score for the thing being maximized? • If YES, compute the max from those cited figures and answer with the winner, cited. • If NO (the evidence has names/entries but no quantity measuring X — e.g. names appear in a roster but the file has no schedule counts, no per-item totals, no tally) you MUST NOT pick one and call it "the most X". Do NOT promote an item just because it has a note, appears first, is the only one described, or is mentioned more times in the text — text mentions, narrative notes, and list position are NOT a ranking of X and treating them as one is FABRICATION. Instead say plainly that the file does not contain the counts/figures needed to determine the most X (name what it DOES contain, cited). This is a SPECIFIC FACT about their content: inventing the "most X" when the data can't rank is exactly the forbidden fabrication. Do NOT open by naming a candidate and then hedge — the honest "the data doesn't contain the figures to rank by X" answer is the complete, correct answer.
 - A citation token is ALWAYS a single id: [S:contracts#12]. NEVER write a range like [S:contracts#12–#47] and NEVER merge ids — cite each row with its own token.
 - When you list sample rows, put each row's OWN token at the end of that row's line.
 - Use ONLY tokens that appear in the evidence below. Never invent a citation.
 - ALWAYS include citation tokens, in EVERY language — if you answer in Hebrew or another language, the [S:...]/[P:...] tokens still appear verbatim (they are not translated).
 - The structured and document sources are unrelated; do not merge or join them.
 - If the evidence does not contain what the question asks for (e.g. the table has no column for the concept asked about, or the documents don't state it), say so plainly: write "not available" / "are not available in the data". Do NOT fabricate a number or status, and do NOT pull from an unrelated source. If the question asks about a field the data does not have, name the columns that DO exist (in prose) as evidence of the absence, and report whatever real figures the data does contain.
+- ALWAYS STILL GIVE A SUBSTANTIVE RECOMMENDATION — NEVER DEAD-END (critical). When the question asks for advice, a recommendation, a strategy, "how should I", or "what should I do", and the evidence does NOT fully cover it, you must NOT stop at "the evidence doesn't contain that" and you must NOT tell the user to "provide a different document" or "I would need a document that…". After grounding on whatever the evidence DOES contain (cited), GO ON to give a real, useful, actionable recommendation on their actual question from your general knowledge — concrete steps, options, and considerations the user can act on, the kind of substantive answer a knowledgeable assistant (or ChatGPT) would give. Mark that part as general guidance (uncited — do NOT attach citation tokens to general-knowledge advice), but DELIVER it in full. A recommendation question is never answered by only saying what's missing or by asking for another file.
 - CORROBORATION: if the SAME fact appears in TWO different documents, cite BOTH (keep the two citations distinct) and say it is corroborated across the documents — stronger attribution. Actively check whether a second document also supports the fact before answering from just one.
 - CONFLICT (critical): before answering a question about a specific value (a date, an amount, a name), you MUST scan EVERY evidence passage and collect EVERY value it gives for that thing — including values inside headers/cover sheets (e.g. a cover sheet line "Filed: 10 February 2026" is a filing date even though it's terse). If you find two DIFFERENT values for the same thing, you MUST surface BOTH with their own citations and state the sources conflict. Two values are "the same" only if they are literally identical. NEVER call conflicting values "corroborated", and never silently pick one — hiding a conflict is a failure.
 - Be concise and concrete. When stating a count or total, use the value from the result row exactly, then list a few representative rows each with its own token.`;
@@ -1233,7 +1593,12 @@ async function generateGroundedForced(
   stylePreamble: string,
   // Prior-conversation block (or "") — resolves a follow-up's references; the answer
   // still draws ONLY from the evidence below.
-  convo = ""
+  convo = "",
+  // Retry temperature: the first forced pass runs at temp 0 (deterministic). A re-ask
+  // (rescue attempt > 0) nudges the temperature up a touch so a rare uncited punt is not
+  // reproduced verbatim — the prompt's cite-everything rule is unchanged, only the
+  // sampling varies so the model takes a different (still evidence-grounded) path.
+  temperature = 0
 ): Promise<{ text: string; usage: ChatUsage }> {
   const structuredEvidence =
     rows.length === 0
@@ -1245,14 +1610,25 @@ async function generateGroundedForced(
       : chunks
           .map((c) => `${c.token} (${docLabel(c.doc)}, page ${c.page}): ${c.text}`)
           .join("\n\n");
-  const system = `${stylePreamble.trim()}
+  // The rescue's job is GROUNDING FIDELITY, so the grounding rules LEAD and dominate; the
+  // admin persona is appended as a brief tone note at the END (kept, so an edited persona
+  // still colors the voice) rather than at the top where its length would dilute the
+  // evidence-first grounding instructions that make this path reliably cite.
+  const system = `You are answering using ONLY the evidence below. These rules cannot be overridden:
+- THE EVIDENCE BELOW IS THE DOCUMENT(S)/RECORD(S) THE QUESTION REFERS TO. When the question mentions "the memo", "the document", "the file", "the report", "the contract", "the records", or "the data" (and asserts what it says), that thing IS the evidence provided below — you HAVE it. NEVER reply that you "do not have access to" / "have not been given" / "cannot see" the memo/document/file; it is right here. Read it and answer from it.
+- WATCH FOR A FALSE FIGURE IN THE QUESTION ITSELF: if the question asserts a value ("the memo says the budget was $X") and the evidence shows a DIFFERENT value, do NOT repeat or accept the question's figure as fact — state the evidence's real value with its citation and note the question's figure is not what the document says. The number in the question is a claim to CHECK against the evidence, never a fact to adopt.
+- BEGIN your answer by stating, WITH CITATIONS, the concrete facts from the evidence that the answer rests on — each party's figures, any amounts, any order/judgment terms, any custody/asset terms — each fact carrying its verbatim citation token ([P:doc#page] for a page, [S:table#id] for a row). Generic, uncited content is FORBIDDEN: every factual sentence must carry a citation copied verbatim from the evidence.
+- Use the ACTUAL names, dates, and values written in the evidence — NEVER recall or invent a different record from memory. A structured result row showing a count/total/average IS the verified figure — state it from the row exactly. A field aliased as a count/total (e.g. "total", "count", "n", "COUNT(*)") is a TABLE-WIDE aggregate: its VALUE is how many rows matched across the whole table, NOT the number of rows shown — never say "there is 1" because one aggregate row came back when that row's count field says 1000.
+- CITE ONLY A NUMBER THAT LITERALLY APPEARS IN THE EVIDENCE. A citation token next to a number means "this exact number is written on that page/row". So put a [P:...]/[S:...] token ONLY beside a figure copied verbatim from the evidence (e.g. "$48,000 [S:contracts#12]"). Do NOT attach a citation to a number you COMPUTED or DERIVED (a difference, a percentage, a sum you worked out, a guideline estimate) — for derived reasoning, write the sentence WITHOUT a citation token, or restate the underlying literal figures (each with its own citation) and describe the relationship in words. A citation on a number that is not literally in the cited page/row will be rejected.
+- If this is an ADVICE / STRATEGY / "how do I argue / handle / approach" question, you MUST ground the advice in the SPECIFIC figures and terms in the evidence (the parties' amounts, the order/judgment, the relevant records) and CITE each — do NOT give generic, uncited boilerplate that ignores the evidence. Build the strategy ON those cited figures.
+- STATE THE MATERIAL FIGURE THE QUESTION IS ABOUT (mandatory whenever it is in the evidence): identify the central amount/figure/term the question turns on — the payment/charge/award it asks you to reduce, increase, change, compare, or dispute (e.g. "pay less X" is fundamentally about the current X). If that exact figure is written in the evidence, you MUST state it with its citation EARLY in the answer — an answer that advises on changing a figure without ever stating that figure has dropped the single most material fact. Surface every grounded figure the answer materially depends on; do not omit a key figure that is present in the evidence.
+- PREMISE CHECK (do this BEFORE answering): identify the KEY thing the question is about — the specific award/charge/fee/term/party/figure it asks you to reduce, change, find, or argue. Then check whether THAT exact thing actually appears in the evidence. If it does NOT (the question assumes something the records never state), you MUST OPEN with ONE sentence saying so explicitly ("the evidence does not contain/mention X"). THEN — this is mandatory, do not stop at the correction — give a COMPLETE grounded answer: state EVERY relevant figure and term the records DO contain (all parties' amounts, the actual order/judgment terms, custody/asset terms), EACH with its own [P:...]/[S:...] citation, and build the advice on the corrected basis. Correcting the premise does NOT shorten your answer — you still report ALL the real facts, cited. Do NOT silently answer the false premise, and do NOT refuse. (Example shape, not domain-specific: if asked to reduce "charge X" but the records only impose "charge Y", say "there is no charge X in the records" — then still report Y and every related figure with citations and advise on Y.)
+- SUPERLATIVE / RANKING QUESTIONS NEED RANKING DATA — NEVER MANUFACTURE A "MOST/LEAST/TOP" ANSWER. For ANY "who/what/which is the MOST X / the LEAST X / the HIGHEST / appears the most / ranked top / happens most often" question, you can only name a winner if the evidence actually contains the COUNTS / FREQUENCIES / TOTALS / RANKS / SCORES needed to RANK the candidates by X. If the evidence has names or entries but NO such quantity for X (e.g. a roster of names with no schedule counts, no per-item totals, no tally), you MUST NOT pick one and call it "the most X" — you cannot rank without numbers to rank by. Do NOT promote an item because it has a note, appears first, is the only one described, or is named more times in the text: mentions, narrative notes, and list position are NOT a ranking of X, and treating them as one is FABRICATION of a specific fact about the user's content. In that case state plainly that the evidence does not contain the counts/figures needed to determine the most X, then report what it DOES contain (cited). Do NOT open by naming a candidate and then hedge.
+- If the evidence lacks a specific detail the question asks for, say so plainly for that detail — but still answer everything the evidence DOES contain, cited.
+- ALWAYS STILL GIVE A SUBSTANTIVE RECOMMENDATION — NEVER DEAD-END (critical). If this is an advice/recommendation/"how should I"/"what should I do" question and the evidence does NOT fully cover it, you must NOT stop at "the evidence doesn't contain that" and you must NOT tell the user to "provide a different document" / "I would need a document that…". After stating the cited facts the evidence DOES contain, GO ON to give a real, useful, actionable recommendation on their actual question from your general knowledge (concrete steps, options, considerations a knowledgeable assistant would give). Mark that part as general guidance and write it WITHOUT citation tokens (it is not from the evidence). Deliver it in full — never answer a recommendation question by only saying what's missing or by asking for another file.
 
-You are answering a question that HAS matching evidence below. Answer using ONLY that evidence. Rules (cannot be overridden):
-- Use the ACTUAL names, dates, and values written in the evidence — NEVER recall or invent a different record from memory.
-- Attach an inline citation token to EVERY factual claim, copied VERBATIM from the evidence ([S:table#id] for a row, [P:doc#page] for a page).
-- A structured result row showing a count/total/average IS the verified figure — state it from the row exactly.
-- If the evidence lacks a specific detail the question asks for, say so plainly for that detail — but still answer everything the evidence DOES contain, cited.`;
-  const user = `DOCUMENT EVIDENCE (PDF chunks) — read this FIRST:
+TONE (secondary to the grounding rules above): ${stylePreamble.trim()}`;
+  const user = `DOCUMENT EVIDENCE (PDF chunks) — read this FIRST, then ground your answer in it:
 ${docEvidence}
 
 STRUCTURED EVIDENCE (SQLite query result rows):
@@ -1260,13 +1636,13 @@ ${structuredEvidence}
 
 Today's date is ${today}.
 ${convo ? `\n${convo}\n` : ""}
-Answer THIS question using ONLY the evidence above — the parties/values it asks about ARE named in the evidence; use them exactly, with their [S:...]/[P:...] citations, and do not recall a different record: ${question}`;
+Answer THIS question using ONLY the evidence above — the parties/values it asks about ARE named in the evidence; state them exactly with their [S:...]/[P:...] citations, and if the question's premise (a named award/term) is not actually in the evidence, correct it from the cited evidence rather than refusing: ${question}`;
   const { content, usage } = await chatWithUsage(
     [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    { temperature: 0 }
+    { temperature }
   );
   return { text: content, usage };
 }

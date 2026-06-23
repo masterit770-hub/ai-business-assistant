@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { getCurrentUser } from "@/lib/supabase/auth";
 import { answerQuestion } from "@/lib/engine/answer";
+import { runWithOwner } from "@/lib/engine/request-context";
 import { backendConfigured } from "@/lib/engine/llm";
 import { logAsk } from "@/lib/engine/ask-history";
 import { friendlyAskError } from "@/lib/engine/error-message";
@@ -69,14 +70,19 @@ export async function POST(req: Request) {
   if (!sessionId) sessionId = randomUUID();
 
   try {
-    const result = await answerQuestion(question, {
-      ownerId: user.id,
-      role: user.role,
-      // Demo accounts see the bundled sample corpus; a real client user (isDemo=false)
-      // retrieves only from their own uploads (clean bucket).
-      isDemo: user.isDemo,
-      history,
-    });
+    // PER-USER settings: run the whole answer under this user's owner context so the
+    // engine resolves THEIR system prompt + model config (cloud/Azure/local) — read deep
+    // in answer.ts/llm.ts via the ALS owner — not the shared default or another user's.
+    const result = await runWithOwner(user.id, () =>
+      answerQuestion(question, {
+        ownerId: user.id,
+        role: user.role,
+        // Demo accounts see the bundled sample corpus; a real client user (isDemo=false)
+        // retrieves only from their own uploads (clean bucket).
+        isDemo: user.isDemo,
+        history,
+      })
+    );
     // Persist this ask to the user's history under its conversation's session_id.
     // BEST-EFFORT: logAsk catches every error internally, so a logging failure NEVER
     // breaks the answer or changes the response below. We await it (rather than

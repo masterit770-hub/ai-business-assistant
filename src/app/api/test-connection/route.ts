@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
 import { getModelConfig } from "@/lib/engine/settings";
+import { runWithOwner } from "@/lib/engine/request-context";
 import {
   chatWithUsage,
   isLocalNotConfigured,
@@ -65,11 +66,9 @@ export async function POST() {
   if (!user || user.disabled) {
     return NextResponse.json({ error: "not authenticated" }, { status: 401 });
   }
-  if (user.role !== "admin") {
-    return NextResponse.json({ error: "admins only" }, { status: 403 });
-  }
-
-  // The mode tells the owner which backend we actually tested (so the result is
+  // PER-USER: every user tests THEIR OWN model config (not admin-gated).
+  return runWithOwner(user.id, async () => {
+  // The mode tells the user which backend we actually tested (so the result is
   // unambiguous: "your Cloud key works" vs "your HIPAA/Azure key works").
   const { mode } = await getModelConfig();
 
@@ -102,4 +101,5 @@ export async function POST() {
       message: `Couldn't connect: ${sanitizeError(raw)}`,
     });
   }
+  });
 }

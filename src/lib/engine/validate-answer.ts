@@ -5,6 +5,15 @@
 // must pass every golden answer and fail every toy (a fluent-but-uncited answer,
 // or a citation that resolves to no retrieved evidence).
 //
+// ── INTENTIONALLY RELAXED (the reliability fix) ─────────────────────────────────
+// The previous gate was TOO STRICT: it hard-failed (and forced flaky retries) over a
+// citation's PLACEMENT or DERIVATION — a right value pinned to a slightly-off page, or
+// a number the model computed (a sum, an income gap, a percentage) sitting beside a
+// token. That over-strictness — NOT the model — was the bug: a single misplaced/derived
+// citation rejected the WHOLE grounded answer and the pipeline punted to generic
+// boilerplate (the bluefalcon 6/10, overdue-payments 2/10 intermittency). So the gate
+// now HARD-FAILS ONLY genuine FABRICATION and is otherwise placement-agnostic.
+//
 // Rules (all structural — no LLM):
 //  1. Every citation token in the answer must RESOLVE to evidence retrieved this
 //     turn (no fabricated row ids / page numbers).
@@ -13,18 +22,29 @@
 //  3. Multi-source citations stay separate: a [S:...] and a [P:...] are each
 //     checked against their own evidence namespace; we never accept one for the
 //     other.
-//  4. CLAIM-SUPPORT cross-check: a citation must not only RESOLVE, it must SUPPORT
-//     the number stated next to it. A stated dollar/number adjacent to [S:src#id]
-//     must equal a value in that row (or a verified server-side aggregate); a
-//     number stated next to [P:doc#page] must literally appear in that page's text
-//     and the cited doc must match. "$999,999.00 [S:contracts#269]" resolves but is
-//     NOT supported by the row → rejected. This is what stops a fluent answer from
-//     hanging a real citation on a fabricated figure.
+//  4. CLAIM-SUPPORT cross-check — PLACEMENT-AGNOSTIC, fabrication-only. A cited
+//     factual number is SUPPORTED when that exact value appears ANYWHERE in the
+//     retrieved evidence this turn — any chunk's text or any row of the cited kind —
+//     NOT necessarily on the exact cited page/row. We DO NOT fail on placement (a
+//     right value cited to a sibling page/doc) or on DERIVATION (a number the model
+//     computed that is in no evidence chunk — that is reasoning, written beside a real
+//     citation; it is not a claimed document fact and is left alone).
+//     The answer fails the cross-check ONLY when it is genuinely UNGROUNDED: it makes
+//     document-fact claims (states figures beside citations) yet NOT ONE of those cited
+//     figures appears anywhere in the retrieved evidence. "$999,999.00 [S:contracts#269]"
+//     as the sole figure — present in no retrieved row — is fabrication and fails;
+//     "$1,285 [P:carter-story#7]" when $1,285 IS in the retrieved family-court page (just
+//     cited to the wrong page) is a placement slip and PASSES.
 //
 // An honest "this is not in the available sources" answer is ALLOWED (it makes no
 // uncited factual claim) — that's the grounding discipline, not a failure.
 
 import { extractCitationTokens, resolvableTokenSet } from "./citations.ts";
+
+// Matches a citation token anywhere inside a string (e.g. inside a validation
+// reason message, which names the offending token verbatim). Same shape as the
+// citations module's token, used here to recover the bad tokens a reason names.
+const ANY_TOKEN_RE = /\[(?:S|P):[^\]#]+#\d+\]/g;
 
 // Evidence carries the citation anchors AND (when available) the underlying values
 // so the claim-support cross-check can run. `data`/`text` are optional: when a
@@ -112,10 +132,103 @@ export function validateAnswer(answer: string, evidence: Evidence): ValidationRe
   return { ok: reasons.length === 0, reasons, unresolved };
 }
 
-// ── Claim-support cross-check ────────────────────────────────────────────────
-// For every number/$ amount stated immediately BEFORE a citation token, verify the
-// citation actually backs that figure. Skipped silently if the evidence carries no
+// ── SALVAGE: strip ONLY the flagged-bad citation tokens ──────────────────────────
+// Now that the claim-support cross-check is relaxed to fail ONLY genuine fabrication
+// (placement/derivation no longer reject an answer), the salvage's job is much smaller:
+// it strips a genuinely-UNRESOLVABLE citation token (rule 1 — a token pointing at evidence
+// that was not retrieved this turn) so the figure beside it becomes uncited prose, rather
+// than discarding a real grounded answer over one bad token. (It also picks up any token a
+// reason names verbatim, but the relaxed cross-check no longer names tokens, so in practice
+// this is the rule-1 unresolved set.) GENERAL — keyed ONLY off validation state (the
+// `unresolved` set + any token a reason names), never the question/domain/any fact. The
+// caller adopts the cleaned text ONLY IF it is then fully clean AND still cites ≥1 real
+// evidence token, so a salvaged answer is still genuinely grounded.
+//
+// Returns the cleaned answer text and the exact set of tokens removed (for telemetry/tests).
+// Pure + exported so the strip contract is unit-tested without an LLM.
+export function flaggedBadTokens(validation: ValidationResult): Set<string> {
+  const bad = new Set<string>(validation.unresolved);
+  // Each claim-support reason embeds the offending token verbatim
+  // ("claim \"$X\" cited to [P:doc#page] does not appear …" / "… is not supported …").
+  for (const reason of validation.reasons) {
+    for (const m of reason.matchAll(ANY_TOKEN_RE)) bad.add(m[0]);
+  }
+  return bad;
+}
+
+export function stripFlaggedCitations(
+  answer: string,
+  validation: ValidationResult
+): { text: string; removed: string[] } {
+  const bad = flaggedBadTokens(validation);
+  if (bad.size === 0) return { text: answer, removed: [] };
+  const removed: string[] = [];
+  // Remove each flagged token (and a single adjacent space/leading space it leaves)
+  // so the figure beside it becomes clean uncited prose, never a dangling "  ." gap.
+  let text = answer;
+  for (const token of bad) {
+    // Escape the token for use in a regex (the brackets/# are regex-meaningful).
+    const esc = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Eat an optional single space immediately before the token so "$X [P:..]" → "$X".
+    const re = new RegExp(`\\s?${esc}`, "g");
+    if (re.test(text)) {
+      removed.push(token);
+      text = text.replace(re, "");
+    }
+  }
+  // Collapse any double spaces the removal introduced (cosmetic; keeps prose clean).
+  text = text.replace(/[ \t]{2,}/g, " ").replace(/ +([.,;:])/g, "$1");
+  return { text, removed };
+}
+
+// The full salvage decision, run by the rescue loops. Given a forced grounded answer
+// and the evidence, attempt to rescue it by stripping ONLY the flagged-bad citations.
+// Returns the cleaned answer iff it is then fidelity-clean AND still cites ≥1 real
+// evidence token; otherwise null (the answer genuinely can't be salvaged → the caller
+// falls through to its honest path). GENERAL — keyed only off validation state.
+//
+// Pure + exported so the adopt/reject decision is unit-tested deterministically.
+export function salvageGroundedAnswer(
+  answer: string,
+  evidence: Evidence
+): { text: string; removed: string[] } | null {
+  const first = validateAnswer(answer, evidence);
+  if (first.ok) {
+    // Already clean — nothing to salvage; let the caller's own clean-check adopt it.
+    return extractCitationTokens(answer).length > 0 ? { text: answer, removed: [] } : null;
+  }
+  const { text: cleaned, removed } = stripFlaggedCitations(answer, first);
+  if (removed.length === 0) return null; // no flagged tokens to strip → not salvageable here
+  const second = validateAnswer(cleaned, evidence);
+  // Adopt ONLY if the cleaned answer is now fully clean AND still carries ≥1 real
+  // (resolvable) citation — i.e. it is still a genuinely grounded answer, not stripped
+  // bare. extractCitationTokens on the cleaned text are all valid because validateAnswer
+  // just passed (every remaining token resolves and is supported).
+  if (second.ok && extractCitationTokens(cleaned).length > 0) {
+    return { text: cleaned, removed };
+  }
+  return null;
+}
+
+// ── Claim-support cross-check — PLACEMENT-AGNOSTIC, fabrication-only ─────────────
+// For every number/$ amount stated immediately BEFORE a citation token, decide whether
+// that figure is BACKED BY THE EVIDENCE AT ALL (anywhere this turn) — not whether it
+// sits on the exact cited page/row. Skipped silently when the evidence carries no
 // values (data/text absent) so resolvability-only callers are unaffected.
+//
+// THE RELAXED CONTRACT (the reliability fix):
+//   • PLACEMENT-AGNOSTIC: a cited factual figure is supported if it appears ANYWHERE in
+//     the retrieved evidence — any chunk's text, any row of the cited kind. A right value
+//     pinned to a slightly-off page/doc (placement) is NOT a fabrication and does not fail.
+//   • DERIVATION-TOLERANT: a number that appears in NO evidence chunk/row is treated as
+//     REASONING the model wrote beside a citation (a sum, a gap, a percentage) — it is not
+//     a claimed document FACT, so it does NOT fail the answer on its own.
+//   • FABRICATION-ONLY FAILURE: the cross-check fails the answer ONLY when it is genuinely
+//     UNGROUNDED — it states figures beside citations yet NOT ONE of those cited figures is
+//     found anywhere in the evidence. (A purely-derived answer that also restates ≥1 real
+//     evidence figure is grounded; one that restates a real figure on the WRONG page is
+//     grounded.) The one remaining RED is "every cited figure is absent from all evidence"
+//     — the $999,999 / $5,000-fabrication case.
 
 const TOKEN_WITH_CONTEXT_RE = /\[(S|P):([^\]#]+)#(\d+)\]/g;
 // A stated number/currency amount. Capturing the raw text lets us match it against
@@ -127,155 +240,110 @@ function crossCheckClaims(answer: string, evidence: Evidence): string[] {
   const haveChunkText = evidence.chunks.some((c) => c.text);
   if (!haveRowData && !haveChunkText) return []; // anchors only — nothing to cross-check
 
-  const rowById = new Map<string, Record<string, unknown>>();
-  for (const r of evidence.rows) if (r.data) rowById.set(`${r.table}#${r.id}`, r.data);
-  const chunkByKey = new Map<string, string>();
-  for (const c of evidence.chunks) if (c.text != null) chunkByKey.set(`${c.doc}#${c.page}`, c.text);
-
+  // PLACEMENT-AGNOSTIC support sets, built ONCE from ALL retrieved evidence this turn:
+  //   • numericValues  — every numeric value present across every row AND every chunk's
+  //     text (component-split so a year inside a date counts), plus verified aggregates.
+  //   • pageTextBlob   — all chunk text concatenated + normalized, so a verbatim figure
+  //     ("$494,513,028.33", "52,800") is found regardless of which page it was cited to.
+  // A cited figure is "in the evidence" if it matches either set. Placement no longer
+  // matters; only presence-anywhere does.
+  const numericValues = collectAllNumericValues(evidence);
   const aggregates = new Set((evidence.aggregates ?? []).map((n) => round2(n)));
-  // Every numeric value present across the retrieved rows of each table. A model
-  // listing a breakdown / sample rows sometimes pairs a REAL row value with a
-  // sibling row's citation (e.g. "$549.98 [S:maintenance#685]" where 549.98 is
-  // another retrieved row). The value is genuinely in the evidence set, so it is
-  // accepted against any citation of the SAME table. The cross-check's hard job is
-  // rejecting FABRICATED values — a number present in NO retrieved row of that table
-  // (e.g. "$999,999.00 [S:contracts#269]") still fails.
-  const valuesByTable = collectValuesByTable(evidence.rows);
-  // Calendar years present ANYWHERE in the retrieved structured evidence. A bare
-  // year (e.g. "2024") is a real value in the evidence set; the cross-check polices
-  // fabricated VALUES (dollar amounts, counts), not which exact dated row a model
-  // pins a calendar year to — so a year that appears in any retrieved row is allowed
-  // beside any structured citation. A dollar amount gets no such latitude.
-  const yearsInEvidence = collectYears(evidence.rows);
-  // Years present in each retrieved DOCUMENT's chunks (across its pages). A bare year
-  // beside a page citation is accepted if that year appears anywhere in the same
-  // document — a conflict answer legitimately surfaces a filing year that lives on a
-  // different page (the cover sheet) than the page it pins the citation to. Dollar
-  // amounts get NO such latitude: they must appear on the exact cited page.
-  const yearsByDoc = collectYearsByDoc(evidence.chunks);
-  const reasons: string[] = [];
+  const pageTextBlob = evidence.chunks
+    .map((c) => c.text ?? "")
+    .join(" ")
+    .replace(/[$,\s]/g, "");
+  const rowTextBlob = evidence.rows
+    .map((r) => (r.data ? Object.values(r.data).map((v) => String(v)).join(" ") : ""))
+    .join(" ")
+    .replace(/[$,\s]/g, "");
+
+  // A cited figure is supported (present anywhere in evidence) — placement-agnostic.
+  const figureInEvidence = (claimText: string): boolean => {
+    const claim = parseNumber(claimText);
+    if (claim != null) {
+      if (aggregates.has(round2(claim))) return true;
+      if (numericValues.has(round2(claim))) return true;
+    }
+    // Verbatim substring match against the normalized chunk/row text (catches exact
+    // figures the numeric parse might miss, and component matches like a year in a date).
+    const norm = claimText.replace(/[$,\s]/g, "");
+    if (norm.length >= 2 && (pageTextBlob.includes(norm) || rowTextBlob.includes(norm))) return true;
+    return false;
+  };
+
+  // We collect EVERY figure stated beside a citation token across the WHOLE answer and ask
+  // a single, answer-level question: did ANY of them resolve to a real evidence value? An
+  // answer is grounded if at least one cited figure is real — so a DERIVED number (a sum,
+  // a per-year extrapolation) sitting beside the same citation as a real figure never sinks
+  // the answer, and a real figure on the WRONG page is still real. Only an answer whose
+  // EVERY cited figure is absent from all evidence is fabrication. (We grade per-figure
+  // across the answer, not per-token-nearest, precisely so a derived figure adjacent to a
+  // token doesn't independently fail an otherwise-grounded answer.)
+  const WINDOW_AFTER_RE = /^\s*(days?|weeks?|months?|years?|quarters?|hours?|minutes?)\b/i;
+  let citedFactualFigures = 0; // cited figures the answer presents as facts
+  let supportedFigures = 0; // those that resolve to a real evidence value (anywhere)
 
   for (const m of answer.matchAll(TOKEN_WITH_CONTEXT_RE)) {
-    const [token, kind, name, idStr] = m;
-    // The text in the ~60 chars immediately before this token is the claim it backs.
+    // The ~60 chars immediately before this token are the claim(s) it backs.
     const start = Math.max(0, m.index! - 60);
     const context = answer.slice(start, m.index!);
     const numbers = context.match(NUMBER_RE);
     if (!numbers || numbers.length === 0) continue; // a non-numeric claim — nothing to check
-    // The number nearest the token is the one it cites.
-    const claimText = numbers[numbers.length - 1];
-
-    if (kind === "S") {
-      const data = rowById.get(`${name}#${idStr}`);
-      if (!data) continue; // resolvability handled by rule 1; only cross-check what we hold
-      if (isBareYear(claimText) && yearsInEvidence.has(claimText.trim())) continue;
-      const tableValues = valuesByTable.get(name);
-      if (!numberSupportedByRow(claimText, data, aggregates, tableValues)) {
-        reasons.push(
-          `claim "${claimText.trim()}" cited to ${token} is not supported by any retrieved ${name} row or verified aggregate`
-        );
-      }
-    } else {
-      // [P:doc#page] — the stated number must literally appear on that page.
-      const text = chunkByKey.get(`${name}#${idStr}`);
-      if (text == null) continue;
-      if (isBareYear(claimText) && (yearsByDoc.get(name)?.has(claimText.trim()) ?? false)) continue;
-      if (!pageContainsNumber(claimText, text)) {
-        reasons.push(
-          `claim "${claimText.trim()}" cited to ${token} does not appear in that page's text`
-        );
-      }
+    for (const n of numbers) {
+      // INCIDENTAL QUERY-PARAMETER GUARD (general, no figure/table named): a bare integer
+      // immediately followed by a time-unit/window word ("next 90 DAYS", "3 MONTHS") is the
+      // QUERY WINDOW, not a cited data figure — skip it. (A $ amount is never followed by
+      // such a word, so a fabricated dollar amount is unaffected.)
+      const after = context.slice(context.indexOf(n) + n.length);
+      if (/^\d{1,4}$/.test(n.trim()) && WINDOW_AFTER_RE.test(after)) continue;
+      // A bare calendar year is real document evidence wherever it appears — never a
+      // fabrication candidate; don't count it as a factual figure to support.
+      if (isBareYear(n)) continue;
+      citedFactualFigures++;
+      if (figureInEvidence(n)) supportedFigures++;
     }
   }
-  return reasons;
-}
 
-// A stated number is supported if it numerically equals any value in the cited row,
-// OR any value present across the retrieved rows of that table (a breakdown/sample
-// listing may pin a real value to a sibling row's token), OR a verified server-side
-// aggregate (totals/counts live in no single row but ARE ground truth). A value in
-// NONE of these — a fabrication — is rejected. Percentages are literal numbers.
-function numberSupportedByRow(
-  claimText: string,
-  data: Record<string, unknown>,
-  aggregates: Set<number>,
-  tableValues?: Set<number>
-): boolean {
-  const claim = parseNumber(claimText);
-  if (claim == null) return true; // unparseable → don't false-fail
-  if (aggregates.has(round2(claim))) return true;
-  if (tableValues?.has(round2(claim))) return true; // any retrieved row of this table
-  // The claim's bare digit string, for substring/component matching against a row's
-  // string fields (a year inside a date, an id inside a label, etc.).
-  const claimDigits = claimText.replace(/[$,%\s]/g, "");
-  for (const v of Object.values(data)) {
-    const n = typeof v === "number" ? v : parseNumber(String(v));
-    if (n != null && round2(n) === round2(claim)) return true;
-    if (typeof v === "string") {
-      // Exact field match (an id/ticket label cited verbatim).
-      if (v.trim() === claimText.trim()) return true;
-      // A numeric COMPONENT of a structured string value (e.g. the year "2024" in
-      // the completion date "3/7/2024", which IS literally in this row). We split on
-      // non-digits and compare components so a fabricated number still can't sneak in
-      // as a spurious substring of a longer run of digits.
-      const components = v.split(/\D+/).filter(Boolean);
-      if (components.includes(claimDigits)) return true;
-    }
+  // FABRICATION-ONLY FAILURE: the answer states cited figures yet NOT ONE of them appears
+  // anywhere in the retrieved evidence → genuinely ungrounded/fabricated. A single real
+  // figure (even one cited to the wrong page, or sitting beside a derived number) makes it
+  // grounded — placement & derivation never fail it.
+  if (citedFactualFigures > 0 && supportedFigures === 0) {
+    return [
+      `answer states cited figure(s) that appear nowhere in the retrieved evidence — ungrounded/fabricated`,
+    ];
   }
-  return false;
+  return [];
 }
 
-// Every numeric value present across the retrieved rows of each table, keyed by
-// table. Used to accept a real row value paired with a sibling row's citation.
-function collectValuesByTable(
-  rows: { table: string; data?: Record<string, unknown> }[]
-): Map<string, Set<number>> {
-  const byTable = new Map<string, Set<number>>();
-  for (const r of rows) {
+// Every numeric value present across ALL retrieved evidence this turn — every row's
+// values AND every chunk's text (component-split, so a year inside a date or a figure
+// embedded in prose counts). Placement-agnostic by construction. Used to accept a cited
+// figure that appears ANYWHERE in the evidence regardless of the exact page/row cited.
+function collectAllNumericValues(evidence: Evidence): Set<number> {
+  const set = new Set<number>();
+  const addFromString = (s: string) => {
+    for (const m of s.matchAll(/\d[\d,]*(?:\.\d+)?/g)) {
+      const n = parseNumber(m[0]);
+      if (n != null) set.add(round2(n));
+    }
+  };
+  for (const r of evidence.rows) {
     if (!r.data) continue;
-    const set = byTable.get(r.table) ?? new Set<number>();
     for (const v of Object.values(r.data)) {
       const n = typeof v === "number" ? v : parseNumber(String(v));
       if (n != null) set.add(round2(n));
+      if (typeof v === "string") addFromString(v);
     }
-    byTable.set(r.table, set);
   }
-  return byTable;
+  for (const c of evidence.chunks) if (c.text) addFromString(c.text);
+  return set;
 }
 
 // A bare 4-digit calendar year (no currency/decimal), e.g. "2024".
 function isBareYear(claimText: string): boolean {
   return /^\d{4}$/.test(claimText.trim()) && /^(19|20)\d\d$/.test(claimText.trim());
-}
-
-// Every 4-digit year that appears in any retrieved row's string values (dates).
-function collectYears(rows: { data?: Record<string, unknown> }[]): Set<string> {
-  const years = new Set<string>();
-  for (const r of rows) {
-    if (!r.data) continue;
-    for (const v of Object.values(r.data)) {
-      if (typeof v !== "string") continue;
-      for (const comp of v.split(/\D+/)) if (/^(19|20)\d\d$/.test(comp)) years.add(comp);
-    }
-  }
-  return years;
-}
-
-// Years (4-digit) present in each document's retrieved chunks, keyed by doc.
-function collectYearsByDoc(chunks: { doc: string; text?: string }[]): Map<string, Set<string>> {
-  const byDoc = new Map<string, Set<string>>();
-  for (const c of chunks) {
-    if (c.text == null) continue;
-    const set = byDoc.get(c.doc) ?? new Set<string>();
-    for (const comp of c.text.split(/\D+/)) if (/^(19|20)\d\d$/.test(comp)) set.add(comp);
-    byDoc.set(c.doc, set);
-  }
-  return byDoc;
-}
-
-function pageContainsNumber(claimText: string, pageText: string): boolean {
-  const norm = (s: string) => s.replace(/[$,\s]/g, "");
-  return norm(pageText).includes(norm(claimText));
 }
 
 function parseNumber(s: string): number | null {

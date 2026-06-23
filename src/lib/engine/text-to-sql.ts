@@ -18,6 +18,8 @@ import { chatWithUsage, type ChatUsage } from "./llm.ts";
 import {
   introspectSchema,
   runGeneratedSelect,
+  hydrateUploadedTables,
+  type CatalogScope,
   type SqlRow,
 } from "./structured-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
@@ -130,7 +132,13 @@ async function generateSql(
 - SELECT only. Never INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/ATTACH/PRAGMA.
 - Use ONLY the columns listed for the table. Do not invent columns.
 - For an aggregate question (total/sum/count/average/top-N), use SQL aggregates (SUM, COUNT, AVG, GROUP BY, ORDER BY … LIMIT). When the answer is a single aggregate, also SELECT the id column so the row can be cited.
+- For a SUMMARIZE / OVERVIEW / "describe this data" / "summarize the <rows/invoices/records>" question (the user wants the big picture of the whole table, not a list of rows), you MUST return a SINGLE aggregate row — NEVER a list of individual rows. Compute: COUNT(*) of all rows, plus SUM over every clearly-numeric amount/cost/total/price/value column. Optionally add AVG. Do this as ONE row with no GROUP BY and no LIMIT-1 over raw rows. The headline of a summary is the row count and the column totals, so they MUST be computed, not sampled. (Include an id column alias if the table has one so the single aggregate row can be cited.) Example SHAPE (column names are illustrative — use the ACTUAL numeric columns from the schema): SELECT COUNT(*) AS n, SUM(<amount_col>) AS total_<amount_col> FROM <table>. This is general: derive which columns are numeric from the schema/sample rows; never assume a specific column name and never hardcode a figure.
 - ALWAYS include the id column (the integer primary key) in the projection so each row can be cited — unless the query is a pure single-aggregate, in which case selecting the aggregate alone is fine.
+- WRITE ONE SIMPLE SELECT — the only supported shape is: SELECT <columns/aggregates> FROM <table> [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT ...]. The following are NOT supported and will be REJECTED — do NOT use them: WINDOW FUNCTIONS / OVER( ... ) clauses (e.g. SUM(x) OVER ()), Common Table Expressions / WITH clauses, subqueries in the FROM/SELECT, UNION, and JOINs.
+- COMPOUND QUESTIONS (two things asked at once) — handle them in ONE plain SELECT, NO window functions / subqueries / WITH:
+  • "HOW MANY … AND <which row is the X-est>" (a COUNT plus a single extreme row): put COUNT(*) in the projection ALONGSIDE the extreme row's columns and order by the extreme — write exactly this shape: SELECT COUNT(*) AS total, id, <key cols> FROM <table> ORDER BY <extreme col> [DESC] LIMIT 1. In SQLite, COUNT(*) beside non-aggregated columns returns the table-wide count next to the single row picked by ORDER BY + LIMIT 1 — so that one row carries BOTH the total count AND the extreme row. The "how many" part REQUIRES COUNT(*) — never drop it, and NEVER report a LIMIT-1 row as if it were the total count.
+  • "which rows match AND their combined total / value" (a filtered set plus an overall SUM): the COMBINED TOTAL must be COMPUTED BY SQL, not left to be added up by hand from a long row list. Write a SINGLE aggregate SELECT that computes BOTH the count and the sum over the matching set: SELECT COUNT(*) AS n, SUM(<amount_col>) AS total_<amount_col>, MIN(id) AS id FROM <table> WHERE <filter>. That one aggregate row carries the count + the combined total (cite it with its id). Do NOT return every matching row and rely on the model to add them up — for a large matched set that is error-prone and can truncate. (If the user ALSO explicitly wants the individual rows listed, a few representative rows may be added, but the COMBINED TOTAL itself must come from the SUM aggregate, never from hand-addition.)
+- A "how many" / count question's answer MUST include COUNT(*) — never answer a count with a single sampled row and call it the count.
 - Add a LIMIT (<= 200). For "top N" use LIMIT N.
 - A numeric column stored as TEXT may need CAST(col AS REAL) for math; a money string like "$1,234.50" is already numeric here if its column type is REAL.
 - For DATE filtering, prefer a column already in ISO form (a column ending in "_iso" sorts/compares correctly as YYYY-MM-DD). To filter "within the next N days of today", use: column_iso BETWEEN '<today>' AND date('<today>', '+N days'). Today's date is provided below.`;
@@ -163,10 +171,21 @@ export async function answerStructured(
   question: string,
   // Demo accounts query the bundled sample tables; a non-demo user (includeBundled=false)
   // queries only their own uploaded tables — the sample data is invisible to them.
-  includeBundled = true
+  includeBundled = true,
+  // The OWNER-ISOLATION scope (per-user). A member scope materializes ONLY that owner's
+  // uploaded tables; an admin scope sees all; undefined = legacy default (all uploaded
+  // rows — single-user / direct callers / the existing tests). Threaded into the
+  // introspect + every runGeneratedSelect so the guarded catalog == the queried DB.
+  scope?: CatalogScope
 ): Promise<StructuredResult> {
   const usages: ChatUsage[] = [];
-  const { catalog, samples } = introspectSchema(3, includeBundled);
+  // DURABLE COLD-START FIX: before the SYNCHRONOUS introspect, rehydrate this owner's
+  // uploaded rows from Supabase into the runtime store (owner-scoped, fail-open). After a
+  // Vercel cold start the in-memory store is empty, so without this the SQL lane would
+  // have no uploaded tables and a spreadsheet question would wrongly answer "there are
+  // none". No-op when Supabase is off or the caller is fail-closed.
+  if (scope) await hydrateUploadedTables(scope.ownerId, !!scope.isAdmin);
+  const { catalog, samples } = introspectSchema(3, includeBundled, scope);
   if (catalog.length === 0) {
     return { table: null, sql: null, rows: [], ok: false, note: "no structured tables loaded", usages };
   }
@@ -186,7 +205,7 @@ export async function answerStructured(
   const failures: string[] = [];
 
   for (const table of plan.tables) {
-    const outcome = await runForTable(question, table, catalog, samples, usages);
+    const outcome = await runForTable(question, table, catalog, samples, usages, scope);
     if (outcome.ok && outcome.rows.length > 0) {
       if (!primaryTable) { primaryTable = table; primarySql = outcome.sql; }
       allRows.push(...outcome.rows);
@@ -225,13 +244,16 @@ async function runForTable(
   table: string,
   catalog: TableSchema[],
   samples: Map<string, Record<string, unknown>[]>,
-  usages: ChatUsage[]
+  usages: ChatUsage[],
+  // The OWNER-ISOLATION scope — passed to runGeneratedSelect so the query runs against
+  // the SAME per-owner handle the catalog was introspected from.
+  scope?: CatalogScope
 ): Promise<{ ok: boolean; rows: SqlRow[]; sql: string | null; note?: string }> {
   let priorError: string | undefined;
   for (let attempt = 1; attempt <= 2; attempt++) {
     const gen = await generateSql(question, table, catalog, samples, priorError);
     usages.push(gen.usage);
-    const run = runGeneratedSelect(gen.sql, table, catalog);
+    const run = runGeneratedSelect(gen.sql, table, catalog, scope);
     if (run.ok) {
       return { ok: true, rows: run.rows, sql: cleanSql(gen.sql) };
     }

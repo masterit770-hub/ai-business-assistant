@@ -8,6 +8,7 @@
 // missing/blank value falls back to the built-in default, so the engine always
 // has a working prompt.
 import { supabaseEnabled, admin } from "./supabase.ts";
+import { currentOwner } from "./request-context.ts";
 
 // Editable settings are of two shapes:
 //  • PROMPT settings (system_prompt, urgency_prompt) — long free text; a blank
@@ -95,14 +96,27 @@ function mem(): Partial<Record<SettingKey, string>> {
   return g.__nucleusSettings;
 }
 
-/** Read a setting (the stored override, or the built-in default). */
-export async function getSetting(key: SettingKey): Promise<string> {
+/**
+ * Read a setting for the CURRENT USER (the stored per-user override, else the shared
+ * NULL-owner workspace default, else the built-in default). The owner is the per-request
+ * ALS owner (`currentOwner()`); pass `ownerId` explicitly to override. `bundled_urgency`
+ * is a workspace-level cache (NOT a user setting) so it is always read globally.
+ */
+export async function getSetting(key: SettingKey, ownerId = currentOwner()): Promise<string> {
+  const owner = key === "bundled_urgency" ? undefined : ownerId;
   if (!supabaseEnabled()) return mem()[key] ?? DEFAULTS[key];
-  const { data, error } = await admin()
-    .from("engine_settings")
-    .select("value")
-    .eq("key", key)
-    .maybeSingle();
+  let q = admin().from("engine_settings").select("value, owner_id").eq("key", key);
+  if (owner) {
+    // The user's OWN row OR the shared (NULL-owner) default; order so the user's row
+    // (non-null owner) wins when present, the default is the fallback.
+    q = q
+      .or(`owner_id.eq.${owner},owner_id.is.null`)
+      .order("owner_id", { ascending: true, nullsFirst: false })
+      .limit(1);
+  } else {
+    q = q.is("owner_id", null).limit(1);
+  }
+  const { data, error } = await q.maybeSingle();
   if (error) throw new Error(`settings read failed: ${error.message}`);
   const v = data?.value;
   return v && v.trim() ? v : DEFAULTS[key];
@@ -241,8 +255,17 @@ export async function getHipaaConfig(): Promise<HipaaConfig> {
   };
 }
 
-/** Persist a setting override. Empty/blank clears it (back to the default). */
-export async function setSetting(key: SettingKey, value: string): Promise<void> {
+/**
+ * Persist a setting override for the CURRENT USER (per-request ALS owner, or `ownerId`
+ * if passed). Empty/blank clears it (the read then falls back to the shared default).
+ * `bundled_urgency` is a workspace-level cache → always written globally (NULL owner).
+ */
+export async function setSetting(
+  key: SettingKey,
+  value: string,
+  ownerId = currentOwner()
+): Promise<void> {
+  const owner = key === "bundled_urgency" ? null : ownerId ?? null;
   if (!supabaseEnabled()) {
     if (value.trim()) mem()[key] = value;
     else delete mem()[key];
@@ -253,10 +276,13 @@ export async function setSetting(key: SettingKey, value: string): Promise<void> 
   }
   const { error } = await admin()
     .from("engine_settings")
-    .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: "key" });
+    .upsert(
+      { owner_id: owner, key, value, updated_at: new Date().toISOString() },
+      { onConflict: "owner_id,key" }
+    );
   if (error) throw new Error(`settings write failed: ${error.message}`);
-  // Changing the urgency prompt clears the bundled-urgency cache → re-derivation.
+  // Changing the urgency prompt clears the (global) bundled-urgency cache → re-derivation.
   if (key === "urgency_prompt") {
-    await admin().from("engine_settings").delete().eq("key", "bundled_urgency");
+    await admin().from("engine_settings").delete().eq("key", "bundled_urgency").is("owner_id", null);
   }
 }

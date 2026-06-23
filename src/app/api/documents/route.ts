@@ -2,6 +2,10 @@ import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
 import { listDocsWithMeta } from "@/lib/engine/doc-store";
 import { listUploadedDocs, deleteUploadedDoc } from "@/lib/engine/pgvector-store";
+import {
+  listUploadedTables,
+  deleteUploadedTable,
+} from "@/lib/engine/structured-rows-store";
 import { removeRuntimeDoc } from "@/lib/engine/runtime-store";
 import { bundledSources, enrichBundledUrgency } from "@/lib/engine/bundled-sources";
 import {
@@ -55,8 +59,24 @@ export async function GET() {
     } else {
       uploaded = await listDocsWithMeta();
     }
+    // DURABLE uploaded STRUCTURED tables (spreadsheets) — owner-scoped, from uploaded_rows.
+    // A spreadsheet is structured data answered by text-to-SQL, so it surfaces as a
+    // "table · N rows" STRUCTURED source (a [S] chip), NOT as a pgvector document. This
+    // is what makes an uploaded Excel/CSV show up in the Sources list even after a cold
+    // start. Empty when Supabase is off (the dev/offline path has no durable tables list).
+    const structuredTables = supabaseEnabled()
+      ? (await listUploadedTables(scopeOwner)).map((t) => ({
+          doc: t.table,
+          label: t.label,
+          rows: t.rows,
+          detail: `table · ${t.rows} row${t.rows === 1 ? "" : "s"}`,
+        }))
+      : [];
     return NextResponse.json({
       documents: uploaded,
+      // Uploaded STRUCTURED sources (spreadsheets) — rendered with the [S] chip + a row
+      // viewer, distinct from the document (RAG) list above.
+      structuredTables,
       // The bundled sample corpus is part of the DEMO accounts only. A real client user
       // (isDemo=false) gets an empty bundled list → a clean bucket of just their uploads.
       // Enriched with a (cached) urgency badge so EVERY document shows urgency, not just
@@ -110,16 +130,22 @@ export async function DELETE(req: Request) {
     }
   }
 
-  // ── UPLOADED doc → per-user removal from the pgvector store + in-memory registry ─
-  // Owner-scoped so a member can only delete their OWN doc; an admin may delete any.
+  // ── UPLOADED doc/table → per-user removal from the durable stores + in-memory registry ─
+  // Owner-scoped so a member can only delete their OWN source; an admin may delete any.
+  // A spreadsheet lives in uploaded_rows (structured), a PDF/Word in doc_chunks
+  // (document) — the same id can only be one, so removing from both is safe (the other
+  // is a no-op) and covers either kind.
   try {
     let removed = 0;
+    let rowsRemoved = 0;
     if (supabaseEnabled()) {
       const scopeOwner = user.role === "admin" ? undefined : user.id;
-      removed = await deleteUploadedDoc(scopeOwner, doc, user.role === "admin");
+      const isAdmin = user.role === "admin";
+      removed = await deleteUploadedDoc(scopeOwner, doc, isAdmin);
+      rowsRemoved = await deleteUploadedTable(scopeOwner, doc, isAdmin);
     }
     removeRuntimeDoc(doc);
-    return NextResponse.json({ ok: true, doc, removedFromStore: removed });
+    return NextResponse.json({ ok: true, doc, removedFromStore: removed, rowsRemoved });
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "failed to delete document" },

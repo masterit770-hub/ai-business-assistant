@@ -32,7 +32,11 @@ export async function storeDocument(
   addRuntimeDocument(spec, records, urgency);
 }
 
-/** Register ingested structured (CSV/XLSX) rows under a synthetic table name. */
+/** Register ingested structured (CSV/XLSX) rows in the WARM in-memory runtime store
+ *  (the fast-path). The rows are expected to already carry their `owner` tag (set by the
+ *  ingest path) so the materialized SQLite catalog is owner-scoped; addRuntimeRows
+ *  replaces per (owner, table). The DURABLE copy is written separately to uploaded_rows
+ *  (structured-rows-store) — that is what survives a serverless cold start. */
 export async function storeRows(
   _table: string,
   rows: RuntimeSqlRow[],

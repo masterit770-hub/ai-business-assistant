@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { FileText, Database, Trash2, Loader2, RefreshCw, Download, Table } from "lucide-react";
+import { FileText, Database, Trash2, Loader2, RefreshCw, Download, Table, Check, X } from "lucide-react";
 import { UploadButton } from "@/components/upload-button";
 import { UrgencyBadge } from "@/components/urgency-badge";
 import { TableViewer } from "@/components/assistant/table-viewer";
@@ -9,6 +9,9 @@ import type { Urgency } from "@/lib/mock";
 
 type DocLang = "en" | "he" | null;
 type DocMeta = { doc: string; label: string; urgency: Urgency | null; lang?: DocLang; pages?: number };
+// An uploaded STRUCTURED source (a spreadsheet) — answered by text-to-SQL, surfaced with
+// the [S] chip + a row viewer. Durable + owner-scoped from /api/documents.structuredTables.
+type StructuredTable = { doc: string; label: string; rows: number; detail: string };
 type BundledSource = {
   doc: string;
   label: string;
@@ -36,10 +39,16 @@ function labelLang(label: string): DocLang {
 // `nucleus:docs` / `nucleus:bundled` so the dashboard stat cards stay in sync.
 export function MaterialsRail() {
   const [uploaded, setUploaded] = useState<DocMeta[] | null>(null);
+  const [tables, setTables] = useState<StructuredTable[] | null>(null);
   const [bundled, setBundled] = useState<BundledSource[] | null>(null);
   const [role, setRole] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  // The source row awaiting a delete confirmation (its `doc` id), or null. We use an
+  // INLINE confirm (Delete? / Delete / Cancel) instead of the native window.confirm()
+  // dialog: native confirm() can be suppressed by the browser ("prevent this page from
+  // creating more dialogs"), which made delete silently do nothing and feel unreachable.
+  const [confirming, setConfirming] = useState<string | null>(null);
   // The structured table currently open in the viewer (FIX 1), or null.
   const [viewing, setViewing] = useState<{ table: string; label: string } | null>(null);
   // Retrievability of each UPLOADED doc's original file, probed via HEAD (FIX 3):
@@ -52,8 +61,10 @@ export function MaterialsRail() {
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "failed to load");
       const docs: DocMeta[] = d.documents ?? [];
+      const t: StructuredTable[] = d.structuredTables ?? [];
       const b: BundledSource[] = d.bundled ?? [];
       setUploaded(docs);
+      setTables(t);
       setBundled(b);
       setRole(d.role ?? null);
       setError(null);
@@ -68,7 +79,8 @@ export function MaterialsRail() {
         b.filter((x) => x.urgency === "high").length;
       window.dispatchEvent(
         new CustomEvent("nucleus:docs", {
-          detail: { uploaded: docs.length, bundled: b.length, high },
+          // Uploaded count includes structured tables (spreadsheets) — they're sources too.
+          detail: { uploaded: docs.length + t.length, bundled: b.length, high },
         })
       );
     } catch (e) {
@@ -101,17 +113,16 @@ export function MaterialsRail() {
     return () => window.removeEventListener("nucleus:uploaded", onUploaded);
   }, []);
 
+  // Delete a source (after the INLINE confirm). No native confirm() — the caller arms
+  // the confirmation via `confirming`, this just performs the DELETE and refreshes the
+  // list. Owner-scoped server-side; `scope: "bundled"` is the admin-only shared-source
+  // soft-delete. On success the list reloads, which re-publishes the `nucleus:docs` count
+  // event so the header stats and the chat's source count stay in sync.
   async function remove(
     doc: string,
-    label: string,
     scope: "upload" | "bundled" = "upload",
     kind?: "document" | "structured"
   ) {
-    const prompt =
-      scope === "bundled"
-        ? `Remove the built-in source “${label}”? It will no longer be used in answers for the whole workspace.`
-        : `Remove “${label}”? It will no longer be searchable.`;
-    if (!confirm(prompt)) return;
     setRemoving(doc);
     try {
       const q = new URLSearchParams({ doc, scope });
@@ -119,6 +130,7 @@ export function MaterialsRail() {
       const res = await fetch(`/api/documents?${q.toString()}`, { method: "DELETE" });
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "remove failed");
+      setConfirming(null);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "remove failed");
@@ -151,7 +163,7 @@ export function MaterialsRail() {
         </div>
         <div className="mt-3 rounded-xl border border-dashed border-line bg-surface-2 px-4 py-5 text-center">
           <p className="text-sm font-medium text-ink">Upload PDF or spreadsheet</p>
-          <p className="mt-1 text-xs text-faint">PDFs, scanned docs, CSV or Excel</p>
+          <p className="mt-1 text-xs text-faint">PDFs, scanned docs, Word, CSV or Excel</p>
           <div className="mt-3 flex justify-center">
             <UploadButton />
           </div>
@@ -171,14 +183,14 @@ export function MaterialsRail() {
             Your materials
           </span>
           <span className="text-[11px] text-faint">
-            {(uploaded?.length ?? 0) + (bundled?.length ?? 0)} sources
+            {(uploaded?.length ?? 0) + (tables?.length ?? 0) + (bundled?.length ?? 0)} sources
           </span>
         </div>
         {uploaded === null ? (
           <p className="px-4 py-4 text-xs text-faint">Loading…</p>
-        ) : uploaded.length === 0 && (bundled?.length ?? 0) === 0 ? (
+        ) : uploaded.length === 0 && (tables?.length ?? 0) === 0 && (bundled?.length ?? 0) === 0 ? (
           <p className="px-4 py-4 text-xs text-faint">
-            No materials yet. Upload a PDF, CSV, or Excel — it appears here with a [P]/[S] chip and
+            No materials yet. Upload a PDF, Word, CSV, or Excel — it appears here with a [P]/[S] chip and
             is answerable instantly.
           </p>
         ) : (
@@ -218,19 +230,17 @@ export function MaterialsRail() {
                       <Download className="size-3.5" />
                     </button>
                   )}
-                  <button
-                    onClick={() => remove(d.doc, d.label)}
-                    disabled={removing === d.doc}
-                    data-testid={`doc-remove-${d.doc}`}
-                    title="Remove"
-                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
-                  >
-                    {removing === d.doc ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Trash2 className="size-3.5" />
-                    )}
-                  </button>
+                  <DeleteControl
+                    testid={`doc-remove-${d.doc}`}
+                    confirming={confirming === d.doc}
+                    busy={removing === d.doc}
+                    onArm={() => {
+                      setError(null);
+                      setConfirming(d.doc);
+                    }}
+                    onCancel={() => setConfirming(null)}
+                    onConfirm={() => remove(d.doc)}
+                  />
                 </div>
                 {/* line 2: the metadata chips, indented under the name. */}
                 <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-7">
@@ -245,6 +255,65 @@ export function MaterialsRail() {
                       <UrgencyBadge urgency={d.urgency} />
                     </span>
                   )}
+                </div>
+              </li>
+            ))}
+            {/* uploaded STRUCTURED tables (spreadsheets) — [S] chip + row viewer + CSV
+                export + remove, in the SAME list. Durable + owner-scoped; they survive a
+                serverless cold start (the text-to-SQL lane answers from uploaded_rows). */}
+            {(tables ?? []).map((t) => (
+              <li
+                key={t.doc}
+                data-testid={`table-row-${t.doc}`}
+                className="border-b border-line px-4 py-3 last:border-0"
+              >
+                <div className="flex items-center gap-2">
+                  <SourceChip kind="structured" />
+                  <span
+                    data-testid={`table-name-${t.doc}`}
+                    title={t.label}
+                    className="min-w-0 flex-1 truncate text-sm font-medium text-ink"
+                  >
+                    {t.label}
+                  </span>
+                  <button
+                    onClick={() => setViewing({ table: t.doc, label: t.label })}
+                    data-testid={`table-view-${t.doc}`}
+                    title="View rows"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                  >
+                    <Table className="size-3.5" />
+                  </button>
+                  <button
+                    onClick={() =>
+                      window.open(
+                        `/api/table?table=${encodeURIComponent(t.doc)}&format=csv`,
+                        "_blank",
+                        "noopener"
+                      )
+                    }
+                    data-testid={`table-export-${t.doc}`}
+                    title="Export CSV"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                  >
+                    <Download className="size-3.5" />
+                  </button>
+                  <DeleteControl
+                    testid={`table-remove-${t.doc}`}
+                    confirming={confirming === t.doc}
+                    busy={removing === t.doc}
+                    onArm={() => {
+                      setError(null);
+                      setConfirming(t.doc);
+                    }}
+                    onCancel={() => setConfirming(null)}
+                    onConfirm={() => remove(t.doc)}
+                  />
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-7">
+                  <span data-testid={`table-detail-${t.doc}`} className="text-[11px] text-faint">
+                    {t.detail}
+                  </span>
                 </div>
               </li>
             ))}
@@ -303,19 +372,18 @@ export function MaterialsRail() {
                     </>
                   )}
                   {role === "admin" && (
-                    <button
-                      onClick={() => remove(s.doc, s.label, "bundled", s.kind)}
-                      disabled={removing === s.doc}
-                      data-testid={`bundled-remove-${s.doc}`}
+                    <DeleteControl
+                      testid={`bundled-remove-${s.doc}`}
                       title="Remove built-in source (admin)"
-                      className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
-                    >
-                      {removing === s.doc ? (
-                        <Loader2 className="size-3.5 animate-spin" />
-                      ) : (
-                        <Trash2 className="size-3.5" />
-                      )}
-                    </button>
+                      confirming={confirming === s.doc}
+                      busy={removing === s.doc}
+                      onArm={() => {
+                        setError(null);
+                        setConfirming(s.doc);
+                      }}
+                      onCancel={() => setConfirming(null)}
+                      onConfirm={() => remove(s.doc, "bundled", s.kind)}
+                    />
                   )}
                 </div>
                 {/* line 2: metadata — lang (docs only) + detail + urgency badge */}
@@ -343,6 +411,74 @@ export function MaterialsRail() {
         />
       )}
     </div>
+  );
+}
+
+// The per-source DELETE control. Two states, no native dialog:
+//   • disarmed → a labelled "Delete" button (text, not just a bare trash icon) so a
+//     non-technical user can actually find how to remove a source. This is the fix for
+//     "the sources are not reachable for deleting them" — the affordance was an
+//     easy-to-miss icon, and the native confirm() it used could be browser-suppressed.
+//   • armed (`confirming`) → an INLINE "Delete this source? Delete / Cancel" confirm,
+//     mirroring the conversation-delete pattern in history-panel.tsx. While the DELETE
+//     is in flight (`busy`) the confirm button shows a spinner and both are disabled.
+function DeleteControl({
+  testid,
+  title = "Remove source",
+  confirming,
+  busy,
+  onArm,
+  onCancel,
+  onConfirm,
+}: {
+  testid: string;
+  title?: string;
+  confirming: boolean;
+  busy: boolean;
+  onArm: () => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  if (confirming) {
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1.5" data-testid={`${testid}-confirm`}>
+        <span className="hidden text-[11px] font-medium text-high sm:inline">Delete?</span>
+        <button
+          type="button"
+          onClick={onConfirm}
+          disabled={busy}
+          data-testid={`${testid}-yes`}
+          className="inline-flex items-center gap-1 rounded-md bg-high px-2 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-high/90 disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="size-3 animate-spin" /> : <Check className="size-3" />}
+          Delete
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={busy}
+          data-testid={`${testid}-no`}
+          className="inline-flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] font-medium text-subtle transition-colors hover:bg-surface-2 hover:text-ink disabled:opacity-50"
+        >
+          <X className="size-3" />
+          Cancel
+        </button>
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onArm}
+      disabled={busy}
+      data-testid={testid}
+      title={title}
+      aria-label={title}
+      className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] font-medium text-subtle transition-colors hover:border-high/40 hover:bg-high-soft hover:text-high disabled:opacity-50"
+    >
+      <Trash2 className="size-3.5" />
+      <span className="hidden sm:inline">Delete</span>
+    </button>
   );
 }
 

@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { MessageSquare, FileText, Clock, User, Settings } from "lucide-react";
@@ -17,7 +16,9 @@ const nav = [
   { label: "Chat", href: "/dashboard", icon: MessageSquare, match: "chat" },
   { label: "Sources", href: "/sources", icon: FileText, match: "sources" },
   { label: "History", href: "/history", icon: Clock, match: "history" },
-  { label: "Settings", href: "/settings", icon: Settings, match: "settings", adminOnly: true },
+  // Settings is PER-USER (each user owns their prompt + model config), so it's visible to
+  // everyone; only the Users tab inside it is admin-only (gated in the settings page).
+  { label: "Settings", href: "/settings", icon: Settings, match: "settings" },
   { label: "Account", href: "/account", icon: User, match: "account" },
 ];
 
@@ -25,21 +26,9 @@ export function AppSidebar({ active }: { active: string }) {
   const pathname = usePathname();
   void pathname; // pathname kept for future client-side active detection
 
-  // Resolve the real role to gate admin-only nav (the dashboard is reachable by
-  // everyone; Settings/Users is admin-only). Defaults to hiding admin items until
-  // the role is known, so a member never briefly sees a dead-end link.
-  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
-  useEffect(() => {
-    let alive = true;
-    fetch("/api/me")
-      .then((r) => r.json())
-      .then((d) => alive && setIsAdmin(d?.user?.role === "admin"))
-      .catch(() => alive && setIsAdmin(false));
-    return () => {
-      alive = false;
-    };
-  }, []);
-  const visibleNav = nav.filter((item) => !item.adminOnly || isAdmin === true);
+  // Every nav destination is reachable by every signed-in user (Settings is per-user; only
+  // the Users TAB inside it is admin-only, gated in the settings page).
+  const visibleNav = nav;
 
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-line bg-surface">

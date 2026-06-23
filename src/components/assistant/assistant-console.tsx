@@ -6,6 +6,7 @@ import { suggestedQuestions } from "@/lib/mock";
 import { cn } from "@/lib/utils";
 import type { EngineResult } from "./types";
 import { AnswerSetup } from "./answer-setup";
+import { ChatUpload } from "./chat-upload";
 import { AnswerView } from "./answer-view";
 import { classifyAskError } from "./answer-helpers";
 import {
@@ -179,6 +180,10 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
       }
       setTurns((prev) => [...prev, { question: query, result: data as EngineResult }]);
       setQuestion("");
+      // Tell the conversations column a turn was saved so it re-fetches /api/history —
+      // a brand-new conversation then appears in the list (and an existing one's
+      // turn-count/title updates) without a manual refresh.
+      window.dispatchEvent(new CustomEvent("nucleus:session"));
     } catch (e) {
       // An abort is a deliberate CANCEL, not an error: restore the input, show nothing.
       if (e instanceof DOMException && e.name === "AbortError") {
@@ -246,27 +251,32 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
           New chat
         </button>
 
-        {/* the tab switcher */}
-        <div className="inline-flex items-center gap-1 rounded-xl border border-line bg-surface-2 p-1" role="tablist">
-          {tabs.map((t) => (
-            <button
-              key={t.value}
-              role="tab"
-              aria-selected={tab === t.value}
-              data-testid={`tab-${t.value}`}
-              onClick={() => setTab(t.value)}
-              className={cn(
-                "inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-semibold transition-colors",
-                tab === t.value
-                  ? "bg-accent text-accent-fg shadow-soft"
-                  : "text-subtle hover:text-ink"
-              )}
-            >
-              <t.icon className="size-3.5" strokeWidth={2.2} />
-              {t.label}
-            </button>
-          ))}
-        </div>
+        {/* the tab switcher — these are PER-ANSWER views (Workspace = the answer,
+            Inspector = its retrieval trace, Demo = golden questions). They mean nothing
+            before an answer exists, where all three collapsed to the same empty state and
+            looked identical. So we only show the switcher once there's a conversation. */}
+        {hasThread && (
+          <div className="inline-flex items-center gap-1 rounded-xl border border-line bg-surface-2 p-1" role="tablist">
+            {tabs.map((t) => (
+              <button
+                key={t.value}
+                role="tab"
+                aria-selected={tab === t.value}
+                data-testid={`tab-${t.value}`}
+                onClick={() => setTab(t.value)}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-semibold transition-colors",
+                  tab === t.value
+                    ? "bg-accent text-accent-fg shadow-soft"
+                    : "text-subtle hover:text-ink"
+                )}
+              >
+                <t.icon className="size-3.5" strokeWidth={2.2} />
+                {t.label}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* live status badge — honest about the active provider */}
         <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-surface px-2.5 py-1 text-[11px] font-medium text-subtle">
@@ -287,6 +297,8 @@ export function AssistantConsole({ initialSessionId }: { initialSessionId?: stri
         }}
       >
         <div className="flex items-start gap-2 rounded-xl border border-line bg-surface px-3.5 py-2.5 focus-within:border-accent-ring focus-within:ring-2 focus-within:ring-accent/15">
+          {/* attach a file without leaving the chat (PDF / Word / Excel / CSV) */}
+          <ChatUpload />
           <textarea
             value={question}
             onChange={(e) => setQuestion(e.target.value)}

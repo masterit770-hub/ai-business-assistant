@@ -155,6 +155,28 @@ Nucleus has a **three-way model switch** (top of the Ask panel, and in **Setting
 
 ---
 
+## Editing how the assistant answers (your prompt)
+
+Each signed-in user has **their own** answering style (system prompt). You can change it in **two places — both save the same per-user prompt**:
+
+- **Answer Setup** strip (above the chat box): pick a style preset, or click **Edit prompt** to type your own, then **Save prompt**.
+- **Settings → Prompts**: the full editor for the assistant persona + the document-urgency prompt, with **Save prompts**.
+
+What to expect when you save:
+- You'll see **"Saved"** only when the change was actually stored. If a save fails (e.g. you picked a cloud provider with no key, or the connection dropped), you now get a **clear red error** instead — it will **never show "Saved" for a change that didn't save.** (This fixes the earlier "I changed the prompt but it didn't stick" report — that was a save silently failing while still showing "Saved".)
+- Your prompt is **private to you** and **persists** — reload, sign out and back in, or come back days later and your saved prompt is still there. One user's prompt never affects another's.
+
+## When your documents don't fully cover a question
+
+Nucleus always tries to **help**, not dead-end:
+
+- If your files **contain** the answer, it answers from them and **cites** the exact page/row.
+- If your files **partly** cover an **advice / "how should I" / recommendation** question, it grounds on what your files do say (cited) **and still gives you a substantive, ChatGPT-style recommendation** from general knowledge for the rest — it will **not** stop at "that isn't in your documents" or tell you to go find another file.
+- If you ask for a **specific fact** that simply **isn't in your file** (e.g. a count or name the file never lists), it tells you so **honestly** rather than inventing one — that honest answer is the correct answer; it won't make up a fact about your data.
+- A purely **general-knowledge** question (a definition, "what is the capital of …") is answered normally, with a note that it's general knowledge, not from your file.
+
+---
+
 ## Set up Azure OpenAI as your HIPAA-eligible AI backend (optional)
 
 *(Only if you'll run real patient/legal data. Skip otherwise — Cloud and Local don't need this.)* This connects the app's **HIPAA mode** to Microsoft's Azure OpenAI. By the end you'll have **four values** to paste into **Settings → Model → HIPAA**. The exact env/field names the code reads are `hipaa_endpoint`, `hipaa_api_key`, `hipaa_model` (the deployment name), and `hipaa_api_version` (defaulted). **There is no environment-variable fallback for HIPAA** — if any of endpoint/key/deployment is missing, the mode refuses to answer rather than route to the cloud backend.

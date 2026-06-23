@@ -87,13 +87,22 @@ export function ModelsPanel() {
     message: string;
   } | null>(null);
 
-  // POST /api/test-connection (admin-only). It tests the model backend as SAVED, so a
-  // just-typed-but-unsaved key needs a Save first; we surface that hint when relevant.
-  // The route never throws for a bad key — it returns { ok, message } — so we just
-  // reflect that. `section` only labels which button the result belongs to.
+  // "Test connection" first SAVES the current form, then tests the backend AS SAVED — so
+  // the test reflects exactly what you just selected/typed (e.g. switching to Azure and
+  // testing tests AZURE, not the previously-saved default). Without the save-first step,
+  // selecting a provider and testing reported the OLD saved config (the confusing
+  // "it says DeepSeek even on Azure" bug). The route never throws for a bad key — it
+  // returns { ok, message } — so we just reflect that. `section` labels which button.
   async function testConnection(section: "cloud" | "hipaa") {
     setTesting(section);
     setTestResult(null);
+    // Persist the current selection FIRST so we test what's on screen, not a stale save.
+    const okSaved = await save();
+    if (!okSaved) {
+      setTestResult({ section, ok: false, message: "Couldn't save the settings to test — check the fields above." });
+      setTesting(null);
+      return;
+    }
     try {
       const res = await fetch("/api/test-connection", { method: "POST" });
       const d = await res.json();
@@ -179,7 +188,7 @@ export function ModelsPanel() {
       hipaaApiVersion !== loaded.hipaaApiVersion ||
       hipaaModel !== loaded.hipaaModel);
 
-  async function save() {
+  async function save(): Promise<boolean> {
     setSaving(true);
     setError(null);
     setSaved(false);
@@ -218,8 +227,10 @@ export function ModelsPanel() {
       applyServer(d);
       setSaved(true);
       setTimeout(() => setSaved(false), 2600);
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : "save failed");
+      return false;
     } finally {
       setSaving(false);
     }
@@ -372,7 +383,7 @@ export function ModelsPanel() {
 
           {/* local endpoint + model — only meaningful in Local mode, but always
               editable so the owner can fill them in before flipping the switch. */}
-          <div className={cn("grid gap-4 sm:grid-cols-2", modelMode === "cloud" && "opacity-60")}>
+          <div className={cn("grid gap-4 sm:grid-cols-2", modelMode !== "local" && "opacity-60")}>
             <div className="space-y-2">
               <label className="text-sm font-semibold text-ink" htmlFor="local-endpoint">
                 Local model endpoint
@@ -415,7 +426,7 @@ export function ModelsPanel() {
               renders each model as a clickable chip. Clicking a chip just sets the
               Local model name field, so it's equivalent to typing it — the free-text
               input above stays the fallback when nothing is detected yet. */}
-          <div className={cn("space-y-3", modelMode === "cloud" && "opacity-60")} data-testid="local-model-picker">
+          <div className={cn("space-y-3", modelMode !== "local" && "opacity-60")} data-testid="local-model-picker">
             <Button
               type="button"
               variant="outline"
@@ -490,7 +501,7 @@ export function ModelsPanel() {
             data-testid="cloud-model-section"
             className={cn(
               "space-y-4 rounded-xl border border-line bg-canvas/60 p-5",
-              modelMode === "local" && "opacity-60"
+              modelMode !== "cloud" && "opacity-60"
             )}
           >
             <div className="flex items-center gap-2">
@@ -518,7 +529,6 @@ export function ModelsPanel() {
                 >
                   <option value="">Default (server)</option>
                   <option value="openai">OpenAI</option>
-                  <option value="azure">Azure OpenAI</option>
                   <option value="gemini">Google Gemini</option>
                   <option value="deepseek">DeepSeek</option>
                 </select>
@@ -643,7 +653,7 @@ export function ModelsPanel() {
                 className="gap-2"
               >
                 {testing === "cloud" ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
-                {testing === "cloud" ? "Testing…" : "Test connection"}
+                {testing === "cloud" ? "Saving & testing…" : "Save & test connection"}
               </Button>
               <span className="text-xs text-faint">Tests the key as currently saved — Save first if you just changed it.</span>
               {testResult?.section === "cloud" && (
@@ -795,7 +805,7 @@ export function ModelsPanel() {
                 className="gap-2"
               >
                 {testing === "hipaa" ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
-                {testing === "hipaa" ? "Testing…" : "Test connection"}
+                {testing === "hipaa" ? "Saving & testing…" : "Save & test connection"}
               </Button>
               <span className="text-xs text-faint">
                 Set the mode to HIPAA and Save, then test — it calls the backend as saved.

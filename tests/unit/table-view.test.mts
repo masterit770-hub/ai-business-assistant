@@ -102,10 +102,20 @@ test("a BUNDLED non-hidden table is readable by any authed user", () => {
   assert.equal(decideAccess({ table: "contracts", isHidden: false, kind: "bundled", role: "admin" }).ok, true);
 });
 
-test("an UPLOADED table is ADMIN-only — a member gets 404 (can't view another member's upload)", () => {
-  const asMember = decideAccess({ table: "u", isHidden: false, kind: "uploaded", role: "user" });
-  assert.deepEqual(asMember, { ok: false, status: 404, error: "table not found" });
+test("an UPLOADED table PRESENT in the caller's scoped catalog is readable (presence encodes ownership)", () => {
+  // The route now introspects the catalog OWNER-SCOPED, so a member's catalog contains
+  // ONLY their own uploaded tables. An uploaded `kind` reaching decideAccess therefore
+  // belongs to the caller (member) or is any owner's (admin) → readable. Isolation is
+  // enforced upstream: another member's table resolves to kind=null → 404 (below).
+  assert.equal(decideAccess({ table: "u", isHidden: false, kind: "uploaded", role: "user" }).ok, true);
   assert.equal(decideAccess({ table: "u", isHidden: false, kind: "uploaded", role: "admin" }).ok, true);
+});
+
+test("an uploaded table NOT in the caller's scoped catalog is 404 (a member can't read another member's upload)", () => {
+  // The owner-scoping happens in the route (introspectSchema(scope)); a table not in the
+  // caller's scope arrives here as kind=null → 404. This is the isolation gate.
+  const d = decideAccess({ table: "someone-elses", isHidden: false, kind: null, role: "user" });
+  assert.deepEqual(d, { ok: false, status: 404, error: "table not found" });
 });
 
 test("a table not in the catalog is 404", () => {

@@ -8,8 +8,8 @@ import { cn } from "@/lib/utils";
 // THE BIG SWITCH — a prominent, segmented Cloud ⇄ Local control. The ACTIVE side is
 // filled in the accent color so the current backend is unmistakable at a glance;
 // the inactive side is a quiet ghost button. Admin-only: it self-resolves the
-// viewer's role (/api/me) and the live mode (/api/settings, admin-only), renders
-// NOTHING for a non-admin, and PUTs model_mode on click so the change takes effect
+// caller's OWN live mode (/api/settings is per-user), renders once that mode has
+// loaded, and PUTs model_mode on click so the change takes effect
 // on the very next question (chat() reads the mode at request time).
 //
 // `variant="panel"` is the compact form for the top of the Ask panel;
@@ -28,21 +28,16 @@ export function ModelSwitch({
   variant?: "panel" | "header";
   onModeChange?: (mode: Mode) => void;
 }) {
-  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
   const [mode, setMode] = useState<Mode | null>(null);
   const [endpointSet, setEndpointSet] = useState<boolean>(true);
   const [saving, setSaving] = useState<Mode | null>(null);
 
-  // Resolve role first; only an admin loads + can flip the switch.
+  // Settings are PER-USER: every signed-in user loads + flips their OWN model. /api/settings
+  // is owner-scoped (no admin gate), so this reads/writes the caller's own model_mode.
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const me = await fetch("/api/me").then((r) => r.json());
-        const admin = me?.user?.role === "admin";
-        if (!alive) return;
-        setIsAdmin(admin);
-        if (!admin) return;
         const s = await fetch("/api/settings").then((r) => r.json());
         if (!alive || s?.error) return;
         const m: Mode = normMode(s.model_mode);
@@ -50,7 +45,7 @@ export function ModelSwitch({
         setEndpointSet(Boolean((s.local_endpoint ?? "").trim()));
         onModeChange?.(m);
       } catch {
-        if (alive) setIsAdmin(false);
+        /* leave mode null → render nothing */
       }
     })();
     return () => {
@@ -88,8 +83,8 @@ export function ModelSwitch({
     }
   }
 
-  // Hidden entirely until we know the viewer is an admin (and mode loaded).
-  if (isAdmin !== true || mode === null) return null;
+  // Hidden until the caller's own mode has loaded.
+  if (mode === null) return null;
 
   const big = variant === "header";
   const segBase =

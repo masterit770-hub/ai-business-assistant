@@ -5,10 +5,11 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { AppSidebar } from "@/components/app-sidebar";
 import { AssistantConsole } from "@/components/assistant/assistant-console";
+import { ConversationsColumn } from "@/components/assistant/conversations-column";
 
-// Reads the ?session=<id> param (set when a user resumes a conversation from /history)
-// and hands it to the console so it loads that thread. Wrapped in Suspense because
-// useSearchParams suspends during prerender.
+// Reads the ?session=<id> param (set when a user resumes a conversation from /history or
+// the conversations column) and hands it to the console so it loads that thread. Wrapped
+// in Suspense because useSearchParams suspends during prerender.
 function ConsoleWithSession() {
   const params = useSearchParams();
   const sessionId = params.get("session") ?? undefined;
@@ -39,6 +40,12 @@ export default function DashboardPage() {
   return (
     <div className="flex h-screen overflow-hidden bg-canvas">
       <AppSidebar active="chat" />
+
+      {/* the user's conversations — a list/column to see + switch between her chats,
+          plus a prominent New chat action (reuses the ?session= resume flow). */}
+      <Suspense fallback={null}>
+        <ConversationsColumn />
+      </Suspense>
 
       <main className="flex flex-1 flex-col overflow-hidden">
         <header className="border-b border-line bg-surface px-7 py-4">

@@ -138,15 +138,22 @@ test("friendlyAskError maps a rate-limit / quota blob to the retry line", () => 
   );
 });
 
-test("friendlyAskError maps an auth failure to the Settings → Model line", () => {
-  assert.equal(
-    friendlyAskError(new Error("gemini (gemini-2.5-flash) 401: API key not valid")),
-    "The cloud model key looks invalid — check it in Settings → Model."
-  );
-  assert.equal(
-    friendlyAskError(new Error("openai (gpt-4o) 403: permission denied")),
-    "The cloud model key looks invalid — check it in Settings → Model."
-  );
+test("friendlyAskError maps an auth failure to the clear 'fix your key in Settings → Models' line (key isn't working, no answer)", () => {
+  // The message was sharpened to the client's required wording: it names the fix location
+  // (Settings → Models) AND makes plain that NO answer was produced — so a failed model
+  // can never look like a real answer. It must NOT be the calm generic line.
+  for (const blob of [
+    "gemini (gemini-2.5-flash) 401: API key not valid",
+    "openai (gpt-4o) 403: permission denied",
+  ]) {
+    const line = friendlyAskError(new Error(blob));
+    assert.match(line, /Settings → Models/i, blob);
+    assert.match(line, /key isn'?t (set or isn'?t )?working|isn'?t set or isn'?t working/i, blob);
+    assert.match(line, /no answer/i, blob);
+    assert.doesNotMatch(line, /something went wrong/i, blob);
+    // Never leaks the raw provider blob.
+    assert.doesNotMatch(line, /gemini|gpt-4o|401|403|permission denied|not valid/i, blob);
+  }
 });
 
 test("friendlyAskError maps a timeout/abort to the took-too-long line", () => {

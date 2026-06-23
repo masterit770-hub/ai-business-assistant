@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Sliders, Pencil, Check, Loader2 } from "lucide-react";
+import { Sliders, Pencil, Check, Loader2, AlertCircle } from "lucide-react";
 import { ModelSwitch } from "@/components/model-switch";
 import { cn } from "@/lib/utils";
+import { interpretSaveResponse, interpretSaveThrow } from "@/lib/settings/save-feedback";
 
 // ANSWER SETUP — the inline strip above the chat input. It lets you tune HOW the
 // assistant answers without leaving the chat: pick a style preset, edit the system
@@ -32,29 +33,27 @@ function presetOf(prompt: string): PresetKey {
 }
 
 export function AnswerSetup() {
-  const [isAdmin, setIsAdmin] = useState(false);
   const [editing, setEditing] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // A real save error, surfaced to the user. The bug this fixes: persist() used to
+  // swallow every failure in an empty catch{} and show "Saved" UNCONDITIONALLY — a
+  // failed PUT (a 4xx/5xx, or a network error) looked successful, so a prompt the
+  // server never stored appeared saved. Now we check res.ok, show a real error on
+  // failure, and only show "Saved" when the server actually persisted the value.
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
+    // Settings are PER-USER: every signed-in user has their OWN system prompt and can edit
+    // it here (it applies to their own chats). /api/me returns the caller's current prompt
+    // so the active style shows correctly from the start.
     fetch("/api/me")
       .then((r) => r.json())
       .then((d) => {
         if (!alive) return;
-        const admin = d?.user?.role === "admin";
-        setIsAdmin(admin);
-        // /api/settings is admin-only (403 for members). Only fetch the prompt when we
-        // know we're an admin — otherwise a member's 403 leaves prompt="" and the strip
-        // would wrongly show "Custom". (The whole strip is admin-only anyway; see below.)
-        if (admin) {
-          fetch("/api/settings")
-            .then((r) => (r.ok ? r.json() : null))
-            .then((s) => alive && s && setPrompt(typeof s.system_prompt === "string" ? s.system_prompt : ""))
-            .catch(() => {});
-        }
+        if (typeof d?.system_prompt === "string") setPrompt(d.system_prompt);
       })
       .catch(() => {});
     return () => {
@@ -62,26 +61,35 @@ export function AnswerSetup() {
     };
   }, []);
 
-  // Answer Setup (style presets + prompt editor + model switch) is entirely admin-only —
-  // a member can't change any of it — so we hide the whole strip for non-admins rather
-  // than show disabled controls with a misleading "Custom" pill.
-  if (!isAdmin) return null;
-
   const active = presetOf(prompt);
 
   async function persist(value: string) {
     setSaving(true);
+    setError(null);
+    setSaved(false);
     try {
-      await fetch("/api/settings", {
+      const res = await fetch("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ system_prompt: value }),
       });
+      // Read the body (the route returns { error } on failure) so the interpreter can
+      // surface the real reason. Tolerate a non-JSON body.
+      const body = await res.json().catch(() => undefined);
+      // Honest outcome via the shared, unit-tested interpreter: success ONLY on a 2xx.
+      // A non-ok response is NEVER reported as saved (the silent-failure bug).
+      const outcome = interpretSaveResponse({ ok: res.ok, status: res.status, body });
+      if (!outcome.ok) {
+        setError(outcome.error);
+        return;
+      }
+      // Only adopt the value + show success once the PUT genuinely succeeded.
       setPrompt(value);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-    } catch {
-      /* surfaced by the next load; non-fatal to the chat */
+    } catch (e) {
+      // The fetch itself REJECTED (network failure / offline) → a REAL error, never "Saved".
+      setError(interpretSaveThrow(e).error);
     } finally {
       setSaving(false);
     }
@@ -101,16 +109,15 @@ export function AnswerSetup() {
             <button
               key={k}
               type="button"
-              disabled={!isAdmin || saving}
+              disabled={saving}
               onClick={() => persist(PRESETS[k].prompt)}
               data-testid={`preset-${k}`}
               aria-pressed={active === k}
               className={cn(
                 "rounded-md px-2.5 py-1 text-[12px] font-semibold transition-colors disabled:cursor-default",
-                active === k ? "bg-accent text-accent-fg" : "text-subtle hover:text-ink",
-                !isAdmin && "opacity-70"
+                active === k ? "bg-accent text-accent-fg" : "text-subtle hover:text-ink"
               )}
-              title={isAdmin ? `Set the ${PRESETS[k].label} answering style` : "The active answering style"}
+              title={`Set the ${PRESETS[k].label} answering style`}
             >
               {PRESETS[k].label}
             </button>
@@ -120,25 +127,35 @@ export function AnswerSetup() {
           )}
         </div>
 
-        {isAdmin && (
-          <button
-            type="button"
-            onClick={() => setEditing((v) => !v)}
-            data-testid="edit-prompt-toggle"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 py-1 text-[12px] font-semibold text-subtle transition-colors hover:border-accent-ring hover:text-ink"
+        <button
+          type="button"
+          onClick={() => setEditing((v) => !v)}
+          data-testid="edit-prompt-toggle"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 py-1 text-[12px] font-semibold text-subtle transition-colors hover:border-accent-ring hover:text-ink"
+        >
+          <Pencil className="size-3.5" />
+          {editing ? "Close" : "Edit prompt"}
+        </button>
+
+        {/* A save error from a preset button (no editor open) — surfaced inline so a failed
+            save is NEVER mistaken for success. The editor below shows its own error too. */}
+        {error && !editing && (
+          <span
+            data-testid="answer-setup-error"
+            className="inline-flex items-center gap-1 text-[12px] font-medium text-red-600"
           >
-            <Pencil className="size-3.5" />
-            {editing ? "Close" : "Edit prompt"}
-          </button>
+            <AlertCircle className="size-3.5" />
+            {error}
+          </span>
         )}
 
-        {/* model switch (admin-gated internally) lives here so it's all in one place */}
+        {/* model switch — each user picks their own model — lives here so it's all in one place */}
         <div className="ml-auto">
           <ModelSwitch variant="panel" />
         </div>
       </div>
 
-      {isAdmin && editing && (
+      {editing && (
         <div className="mt-3" data-testid="inline-prompt-editor">
           <textarea
             value={prompt}
@@ -159,10 +176,22 @@ export function AnswerSetup() {
               {saving && <Loader2 className="size-3.5 animate-spin" />}
               Save prompt
             </button>
-            {saved && (
-              <span className="inline-flex items-center gap-1 text-[12px] font-medium text-accent">
+            {saved && !error && (
+              <span
+                data-testid="answer-setup-saved"
+                className="inline-flex items-center gap-1 text-[12px] font-medium text-accent"
+              >
                 <Check className="size-3.5" strokeWidth={2.5} />
                 Saved
+              </span>
+            )}
+            {error && (
+              <span
+                data-testid="answer-setup-error"
+                className="inline-flex items-center gap-1 text-[12px] font-medium text-red-600"
+              >
+                <AlertCircle className="size-3.5" />
+                {error}
               </span>
             )}
             <span className="text-[11px] text-faint">

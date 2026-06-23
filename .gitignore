@@ -33,6 +33,9 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 !.env.example
+# pulled prod env for local in-process evals (carries the LLM key) — NEVER commit.
+# Re-derive with: vercel env pull .vercel-prod.env --environment=production
+.vercel-prod.env
 
 # vercel
 .vercel
@@ -45,3 +48,7 @@ next-env.d.ts
 # Supabase CLI local artifacts
 supabase/.temp/
 .branches/
+
+# OCR trained data (large, regenerable)
+eng.traineddata
+heb.traineddata

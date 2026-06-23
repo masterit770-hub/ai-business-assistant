@@ -1,5 +1,10 @@
 import { getCurrentUser } from "@/lib/supabase/auth";
-import { getStore, introspectSchema } from "@/lib/engine/structured-store";
+import {
+  getStore,
+  introspectSchema,
+  hydrateUploadedTables,
+  type CatalogScope,
+} from "@/lib/engine/structured-store";
 import { refreshDeletedSources, deletedSourceIds } from "@/lib/engine/deleted-sources";
 import { bundledSources } from "@/lib/engine/bundled-sources";
 import {
@@ -24,10 +29,12 @@ import {
 //     • requires a signed-in, enabled user.
 //     • HIDDEN (admin-deleted) tables are never served (404) — excluded everywhere.
 //     • BUNDLED business tables (contracts, maintenance, …) are shared → any authed user.
-//     • UPLOADED tables carry no verifiable owner in the runtime store, so a member
-//       must not read another member's upload → uploaded tables are ADMIN-only; a
-//       member gets 404. This guarantees per-user isolation without owner metadata
-//       the runtime store doesn't hold.
+//     • UPLOADED tables now carry a verifiable owner (uploaded_rows.owner_id), and the
+//       catalog is introspected OWNER-SCOPED below — so a member's scoped catalog holds
+//       ONLY their own uploaded tables. An uploaded table present in the caller's scoped
+//       catalog is therefore theirs (or, for an admin, any owner's) → readable; a table
+//       belonging to another member never appears in the caller's catalog (resolves to
+//       null → 404). Isolation is enforced by the scope, not a blanket admin-only rule.
 export const runtime = "nodejs";
 
 export async function GET(req: Request) {
@@ -46,9 +53,17 @@ export async function GET(req: Request) {
   await refreshDeletedSources();
   const hidden = deletedSourceIds();
 
+  // OWNER-SCOPED catalog: an admin sees all uploaded tables; a member only their own.
+  // Presence in this scoped catalog encodes ownership, so isolation is enforced here
+  // (a member never sees another member's table → resolves to null → 404). Hydrate the
+  // caller's durable rows first so a table they uploaded is visible after a cold start.
+  const isAdmin = user.role === "admin";
+  const scope: CatalogScope = { ownerId: isAdmin ? undefined : user.id, isAdmin };
+  await hydrateUploadedTables(scope.ownerId, isAdmin);
+
   // The introspected catalog already drops hidden + internal tables. Find the exact
   // match (case-insensitively) so we use the catalog's canonical name + column list.
-  const { catalog } = introspectSchema();
+  const { catalog } = introspectSchema(3, true, scope);
   const entry = catalog.find((t) => t.table.toLowerCase() === table.toLowerCase());
 
   // Is this a BUNDLED (shared) structured table, or an uploaded/runtime one?
@@ -87,7 +102,7 @@ export async function GET(req: Request) {
   let total = 0;
   let rows: Record<string, unknown>[] = [];
   try {
-    const db = getStore();
+    const db = getStore(scope);
     // Identifiers (table + columns) come from the INTROSPECTED catalog, not raw user
     // input; values (limit/offset) are bound parameters → no SQL injection surface.
     const colList = columns.map((c) => `"${c}"`).join(", ");

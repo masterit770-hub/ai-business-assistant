@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizePlan } from "../../src/lib/engine/router.ts";
+import { normalizePlan, guardEmptyCatalogs } from "../../src/lib/engine/router.ts";
 
 // The router's LLM call is integration-tested by the journey suite. Here we pin the
 // PURE plan-normalization contract: only valid sources kept, safe defaults. (The
@@ -61,4 +61,49 @@ test("a non-empty but all-garbage sources array degrades to querying all sources
 test("a non-string docFilter is normalized to null", () => {
   const p = normalizePlan({ sources: ["documents"], docFilter: 12, rationale: "x" });
   assert.equal(p.docFilter, null);
+});
+
+// ── guardEmptyCatalogs: the deterministic no-hallucinated-source net (RED #3) ──────
+// Independent of the LLM: a source whose catalog is empty for this caller is dropped,
+// so the router can never route to "documents"/"structured" the caller cannot access.
+
+test("guard DROPS 'documents' when the caller has NO accessible documents", () => {
+  // The recorded RED #3: a non-demo owner with only a table; the model guessed
+  // ["documents"]. The guard must strip it → empty (no hallucinated source).
+  const p = guardEmptyCatalogs(
+    { sources: ["documents"], docFilter: "castle", rationale: "guessed" },
+    /* hasAccessibleDocs */ false,
+    /* hasAccessibleTables */ true
+  );
+  assert.deepEqual(p.sources, []);
+  assert.equal(p.docFilter, null, "docFilter is cleared when documents is dropped");
+});
+
+test("guard DROPS 'structured' when there are no tables, keeping a valid 'documents'", () => {
+  const p = guardEmptyCatalogs(
+    { sources: ["structured", "documents"], docFilter: null, rationale: "x" },
+    /* hasAccessibleDocs */ true,
+    /* hasAccessibleTables */ false
+  );
+  assert.deepEqual(p.sources, ["documents"]);
+});
+
+test("guard DROPS both when both catalogs are empty → empty route", () => {
+  const p = guardEmptyCatalogs(
+    { sources: ["structured", "documents"], docFilter: null, rationale: "x" },
+    false,
+    false
+  );
+  assert.deepEqual(p.sources, []);
+});
+
+test("guard is a NO-OP when every chosen source is accessible", () => {
+  const plan = { sources: ["documents"] as ("structured" | "documents")[], docFilter: "d1", rationale: "ok" };
+  const p = guardEmptyCatalogs(plan, true, true);
+  assert.equal(p, plan, "returns the same plan object unchanged when nothing is dropped");
+});
+
+test("guard leaves an already-empty route empty (a greeting stays empty)", () => {
+  const p = guardEmptyCatalogs({ sources: [], docFilter: null, rationale: "greeting" }, true, true);
+  assert.deepEqual(p.sources, []);
 });

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
-import { getSettings, setSetting, type SettingKey } from "@/lib/engine/settings";
+import { getSettings, setSetting, getSetting, type SettingKey } from "@/lib/engine/settings";
+import { runWithOwner } from "@/lib/engine/request-context";
 
 // Admin Prompt-config — engine logic IN-PROCESS (no proxy). GET reads the live
 // editable prompts; PUT persists edits, which the engine then uses for real
@@ -39,11 +40,11 @@ export async function GET() {
   if (!user || user.disabled) {
     return NextResponse.json({ error: "not authenticated" }, { status: 401 });
   }
-  if (user.role !== "admin") {
-    return NextResponse.json({ error: "admins only" }, { status: 403 });
-  }
+  // PER-USER: every signed-in user reads their OWN settings (their prompt + model config,
+  // with the shared workspace default as the fallback). Not admin-gated — managing USERS
+  // is the only admin-only thing (see /api/admin/users).
   try {
-    return NextResponse.json(await getSettings());
+    return NextResponse.json(await runWithOwner(user.id, () => getSettings()));
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "failed to read settings" },
@@ -57,9 +58,7 @@ export async function PUT(req: Request) {
   if (!user || user.disabled) {
     return NextResponse.json({ error: "not authenticated" }, { status: 401 });
   }
-  if (user.role !== "admin") {
-    return NextResponse.json({ error: "admins only" }, { status: 403 });
-  }
+  // PER-USER: every user writes their OWN settings (not admin-gated).
   let body: Record<string, unknown>;
   try {
     body = await req.json();
@@ -90,6 +89,31 @@ export async function PUT(req: Request) {
     body.cloud_provider = p;
   }
   try {
+    // All writes run under THIS user's owner context → they persist to the user's own
+    // settings rows, never the shared default or another user's.
+    return await runWithOwner(user.id, async () => {
+    // ── BELT-AND-SUSPENDERS: block establishing a KEYLESS cloud provider ──────────────
+    // A non-default cloud provider needs a key to work. If this save would leave the
+    // workspace pointed at a provider with NO key (none submitted now AND none stored),
+    // reject it UPFRONT with a clear 400 — so the user is told to add the key at save
+    // time, rather than discovering later (via a failed ask) that the model can't run.
+    // (A blank "__clear__" of the key while keeping a non-default provider is also
+    // rejected: it would leave the keyless state.) The DEFAULT provider ("") needs no
+    // key (it uses the built-in env model), so it is never blocked.
+    if (typeof body.cloud_provider === "string" && (body.cloud_provider as string) !== "") {
+      const provider = body.cloud_provider as string;
+      const submitted =
+        typeof body.cloud_api_key === "string" ? (body.cloud_api_key as string).trim() : "";
+      const clearing = submitted === "__clear__";
+      const submittingKey = submitted.length > 0 && !clearing;
+      const storedKey = clearing ? "" : (await getSetting("cloud_api_key")).trim();
+      if (!submittingKey && storedKey.length === 0) {
+        return NextResponse.json(
+          { error: `Set a key for ${provider} — selecting a cloud provider with no API key would leave the model unable to run.` },
+          { status: 400 }
+        );
+      }
+    }
     for (const key of KEYS) {
       if (typeof body[key] === "string") {
         await setSetting(key, body[key] as string);
@@ -120,6 +144,7 @@ export async function PUT(req: Request) {
       // empty/whitespace → leave the stored hipaa key untouched.
     }
     return NextResponse.json(await getSettings());
+    });
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "failed to save settings" },

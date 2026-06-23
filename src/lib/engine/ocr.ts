@@ -75,6 +75,17 @@ export async function ocrLowTextPages(
   // heavy, so a failure to import/render is caught and degrades to "no OCR".
   // The converter returns { pageNumber, content?: Buffer } per page (content optional
   // in its types). We keep a tolerant local shape + skip any page with no buffer.
+  // CRITICAL: unpdf (run FIRST, in extractPdfPages) bundles pdf.js 4.6.82 and pollutes
+  // the PROCESS-GLOBAL worker (`globalThis.pdfjsWorker`). pdf-to-png-converter bundles a
+  // DIFFERENT pdf.js (6.0.227); when it reads that stale global it dies with
+  // "The API version 6.0.227 does not match the Worker version 4.6.82" — the render throws,
+  // OCR yields nothing, and a scanned PDF comes back "no extractable text" (the client's
+  // "scanned PDF wasn't read" bug). Fix: save + clear the global around the render so the
+  // converter's pdf.js sets up its OWN matching worker, then restore it for any later unpdf.
+  const glob = globalThis as Record<string, unknown>;
+  const savedWorker = glob.pdfjsWorker;
+  const savedGWO = glob.GlobalWorkerOptions;
+  glob.pdfjsWorker = undefined;
   let pngPages: { pageNumber: number; content?: Buffer }[];
   try {
     const { pdfToPng } = await import("pdf-to-png-converter");
@@ -90,6 +101,12 @@ export async function ocrLowTextPages(
         (e instanceof Error ? e.message : String(e))
     );
     return out;
+  } finally {
+    // RESTORE unpdf's global worker so a later warm-process unpdf call in the same
+    // instance isn't left with a wiped global (the converter set up its own during the
+    // render above).
+    glob.pdfjsWorker = savedWorker;
+    glob.GlobalWorkerOptions = savedGWO;
   }
 
   // Tesseract worker (eng + heb — the project's Hebrew-readiness seam). Created once,
@@ -102,8 +119,12 @@ export async function ocrLowTextPages(
   let worker: OcrWorker;
   try {
     const { createWorker } = await import("tesseract.js");
-    // eng+heb covers the corpus + the Hebrew Q&A requirement.
-    worker = (await createWorker(["eng", "heb"])) as unknown as OcrWorker;
+    // eng+heb covers the corpus + the Hebrew Q&A requirement. cachePath "/tmp" — on a
+    // serverless function the project dir is READ-ONLY, so the default cwd cache would fail
+    // to write the trained-data; /tmp is the only writable dir.
+    worker = (await createWorker(["eng", "heb"], 1, {
+      cachePath: "/tmp",
+    })) as unknown as OcrWorker;
   } catch (e) {
     console.warn(
       "[ocr] Tesseract unavailable in this environment — scanned pages will have no " +

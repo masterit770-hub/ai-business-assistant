@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
-import { ingestPdf, ingestCsv, ingestXlsx } from "@/lib/engine/ingest";
+import { ingestPdf, ingestCsv, ingestXlsx, ingestDocx } from "@/lib/engine/ingest";
+import { runWithOwner } from "@/lib/engine/request-context";
 import { supabaseEnabled } from "@/lib/engine/supabase";
 import { storeOriginalFile } from "@/lib/engine/doc-files";
 
@@ -18,7 +19,7 @@ export const runtime = "nodejs";
 export const maxDuration = 120;
 
 const MAX_BYTES = 15 * 1024 * 1024; // 15 MB upload cap
-const SUPPORTED_FORMATS = ["PDF", "CSV", "XLSX"] as const;
+const SUPPORTED_FORMATS = ["PDF", "Word", "Excel", "CSV"] as const;
 
 // The upload control reads the REAL cap + supported formats from here, so the limits it
 // shows up front always match what POST actually enforces (single source of truth).
@@ -73,11 +74,17 @@ export async function POST(req: Request) {
     file.type === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
   const isPdf = lower.endsWith(".pdf") || file.type === "application/pdf";
   const isCsv = lower.endsWith(".csv") || file.type === "text/csv";
+  const isDocx =
+    lower.endsWith(".docx") ||
+    file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
   // The uploader, straight from the session → tags the doc for per-user isolation.
   const ownerId = user.id;
 
   try {
+    // PER-USER settings: ingest classifies urgency with the uploader's OWN urgency prompt
+    // (read via the ALS owner inside the engine), so run it under their owner context.
+    return await runWithOwner(ownerId, async () => {
     let result;
     const backend: "pgvector" | "local" = supabaseEnabled() ? "pgvector" : "local";
     if (isCsv) {
@@ -87,9 +94,12 @@ export async function POST(req: Request) {
     } else if (isPdf) {
       const label = (form.get("label") as string) || name;
       result = await ingestPdf(buf, name, label, ownerId);
+    } else if (isDocx) {
+      const label = (form.get("label") as string) || name;
+      result = await ingestDocx(buf, name, label, ownerId);
     } else {
       return NextResponse.json(
-        { error: `unsupported file type: ${name} (supported: .pdf, .csv, .xlsx)` },
+        { error: `unsupported file type: ${name} (supported: PDF, Word .docx, Excel .xlsx, CSV)` },
         { status: 415 }
       );
     }
@@ -123,6 +133,7 @@ export async function POST(req: Request) {
       persistence,
       originalStored,
       zeroContent,
+    });
     });
   } catch (e) {
     console.error("ingest error:", e);

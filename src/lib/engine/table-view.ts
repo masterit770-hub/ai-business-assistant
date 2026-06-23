@@ -64,28 +64,30 @@ export type AccessDecision =
  * The per-user ISOLATION policy for reading a structured table. Fail-closed:
  *   • a HIDDEN (admin-deleted) table is never served            → 404 (as if absent).
  *   • a BUNDLED, non-hidden table is shared business data         → any authed user.
- *   • an UPLOADED table (introspectable but not bundled) carries no verifiable owner
- *     in the runtime store, so a member must NOT be able to read another member's
- *     upload. We therefore restrict uploaded tables to an ADMIN (who already sees all
- *     uploads). A member asking for one gets 404 — it does not exist FOR THEM.
- *   • a table that isn't in the catalog at all                   → 404.
- * This guarantees a member can never view/export an uploaded table that isn't theirs,
- * without depending on owner metadata the runtime store doesn't carry.
+ *   • an UPLOADED table now carries a verifiable owner (uploaded_rows.owner_id), and the
+ *     route introspects the catalog OWNER-SCOPED — so a member's catalog contains ONLY
+ *     their own uploaded tables. An uploaded table that appears in the caller's scoped
+ *     catalog is therefore, by construction, theirs (or, for an admin, any owner's) →
+ *     readable. A table that isn't in the caller's scoped catalog never reaches here as a
+ *     known `kind` (it resolves to null → 404), so a member still can't read another
+ *     member's upload. This is the durable-owner upgrade of the prior admin-only rule.
+ *   • a table that isn't in the (scoped) catalog at all          → 404.
  */
 export function decideAccess(opts: {
   table: string;
   isHidden: boolean;
-  kind: TableKind | null; // null = not in the catalog
+  kind: TableKind | null; // null = not in the caller's (scoped) catalog
   role: "user" | "admin";
 }): AccessDecision {
-  const { isHidden, kind, role } = opts;
+  const { isHidden, kind } = opts;
   if (isHidden || kind === null) {
     return { ok: false, status: 404, error: "table not found" };
   }
-  if (kind === "bundled") return { ok: true };
-  // uploaded → admin-only (member can't verify ownership → treat as absent for them)
-  if (role === "admin") return { ok: true };
-  return { ok: false, status: 404, error: "table not found" };
+  // Both bundled (shared) and uploaded tables that are PRESENT in the caller's scoped
+  // catalog are readable: presence already encodes ownership (the catalog was
+  // introspected for this caller's scope), so isolation is enforced upstream by the
+  // scope, not by a blanket admin-only rule here.
+  return { ok: true };
 }
 
 /** A safe download filename for a table's CSV export (citation-safe id + .csv). */

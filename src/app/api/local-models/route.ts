@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/supabase/auth";
 import { getSetting } from "@/lib/engine/settings";
+import { runWithOwner } from "@/lib/engine/request-context";
 import { ollamaTagsUrl, extractModelNames } from "@/lib/engine/local-models";
 
 // Detect the models actually installed on the OWNER's box, for the Settings →
@@ -22,11 +23,9 @@ export async function GET() {
   if (!user || user.disabled) {
     return NextResponse.json({ error: "not authenticated" }, { status: 401 });
   }
-  if (user.role !== "admin") {
-    return NextResponse.json({ error: "admins only" }, { status: 403 });
-  }
-
-  const endpoint = await getSetting("local_endpoint");
+  // PER-USER: each user has their OWN local endpoint, so each lists the models on their
+  // own box (not admin-gated).
+  const endpoint = await runWithOwner(user.id, () => getSetting("local_endpoint"));
   const url = ollamaTagsUrl(endpoint);
   if (!url) {
     return NextResponse.json({ models: [], reachable: false, reason: "no endpoint set" });

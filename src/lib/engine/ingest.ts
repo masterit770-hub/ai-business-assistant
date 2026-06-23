@@ -10,6 +10,7 @@ import { parseCsv } from "./csv.ts";
 import { embedPassage } from "./embeddings.ts";
 import type { DocSpec, VectorRecord } from "./documents.ts";
 import { storeDocument, storeRows, type Urgency } from "./doc-store.ts";
+import { storeUploadedRows, type StorableRow } from "./structured-rows-store.ts";
 import { classifyUrgency } from "./urgency.ts";
 import { ocrLowTextPages } from "./ocr.ts";
 import { storeDocChunks, type StorableChunk } from "./pgvector-store.ts";
@@ -151,9 +152,59 @@ export async function ingestPdf(
   };
 }
 
-// Turn one tabular row into a compact, human-readable line so it can be embedded
-// and retrieved by RAG (e.g. "Vendor: Acme | Amount: 5000 | Status: active"). A
-// blank/"error" cell is kept verbatim (graceful — see CLAUDE.md landmine #4).
+/**
+ * Ingest a Word (.docx) document. mammoth extracts the raw text — a .docx has no page
+ * structure, so it's treated as one logical page the chunker splits into citable chunks
+ * — then the SAME embed + hybrid-store path as a PDF runs, so a Word doc is retrieved
+ * and cited just like a PDF ([P:<doc>#1]). Legacy binary .doc isn't supported (save as
+ * .docx). NEVER throws on an empty result silently — it surfaces an honest error.
+ */
+export async function ingestDocx(
+  buf: Uint8Array,
+  filename: string,
+  label?: string,
+  ownerId?: string
+): Promise<IngestResult> {
+  const doc = docIdFromFilename(filename);
+  const docLabel = label || filename;
+  const mammoth = await import("mammoth");
+  const { value } = await mammoth.extractRawText({ buffer: Buffer.from(buf) });
+  const text = (value ?? "").replace(/​/g, "").trim();
+  const chunks = pagesToChunks([text], doc);
+  if (chunks.length === 0) {
+    throw new Error(
+      "no extractable text in this Word file. If it's a legacy .doc, re-save it as .docx; " +
+        "born-digital .docx, PDF, CSV, and Excel are supported."
+    );
+  }
+  const records: VectorRecord[] = [];
+  const storable: StorableChunk[] = [];
+  for (const c of chunks) {
+    const embedding = await embedPassage(c.text);
+    records.push({ doc: c.doc, page: c.page, text: c.text, embedding });
+    storable.push({ page: c.page, text: c.text, token: pdfToken(c.doc, c.page), embedding });
+  }
+  const urgency = await classifyUrgency(text, TODAY);
+  const spec: DocSpec = { doc, label: docLabel, file: filename };
+  const stored = await storeDocChunks(ownerId, doc, docLabel, storable, urgency);
+  await storeDocument(spec, records, ownerId, urgency);
+  return {
+    kind: "pdf", // a Word doc is a document source, shown + cited like a PDF
+    doc,
+    label: docLabel,
+    chunks: records.length,
+    pages: 1,
+    urgency,
+    persisted: supabaseEnabled() ? stored : undefined,
+  };
+}
+
+// Turn one tabular row into a compact, human-readable line — used ONLY to feed the
+// urgency classifier a readable sample of the spreadsheet's content (e.g. "Vendor: Acme
+// | Amount: 5000 | Status: active"). A blank cell is kept verbatim (graceful). NOTE: a
+// spreadsheet's rows are STRUCTURED data — they are answered by text-to-SQL over the
+// uploaded_rows table, NOT embedded as RAG/pgvector chunks; this text is only for the
+// dashboard urgency badge.
 function rowToText(data: Record<string, unknown>): string {
   return Object.entries(data)
     .filter(([k]) => k !== "id")
@@ -161,27 +212,36 @@ function rowToText(data: Record<string, unknown>): string {
     .join(" | ");
 }
 
-// Embed each tabular row as a citable doc chunk under `table`, so a question
-// about an uploaded spreadsheet/CSV gets a grounded, cited answer via the RAG
-// path — citation token [P:<table>#<rowId>]. (Structured-intent SQL over uploads
-// is a separate, larger feature; this makes the data answerable NOW.)
-async function rowsToChunks(table: string, rows: RuntimeSqlRow[]): Promise<VectorRecord[]> {
-  const records: VectorRecord[] = [];
-  for (const r of rows) {
-    const text = rowToText(r.data);
-    if (!text.trim()) continue;
-    const embedding = await embedPassage(text);
-    records.push({ doc: table, page: r.id, text, embedding });
-  }
-  return records;
+// Persist an uploaded table's rows to BOTH stores: the in-memory runtime store (the warm
+// fast-path, owner-tagged for isolation) AND the DURABLE uploaded_rows table (so the
+// text-to-SQL lane survives a Vercel serverless cold start — rehydrated owner-scoped by
+// structured-store.hydrateUploadedTables). Returns the durable row count (0 when
+// Supabase is off; the warm path still works). storeUploadedRows is FAIL-OPEN so a
+// Supabase blip can't break an ingest. Spreadsheets are NEVER written to doc_chunks —
+// that is the wrong (document/RAG) lane for structured data.
+async function persistStructuredRows(
+  table: string,
+  label: string,
+  rows: RuntimeSqlRow[],
+  ownerId?: string
+): Promise<number> {
+  // Warm path: owner-tagged runtime rows so the materialized SQLite catalog is
+  // owner-scoped (per-user isolation under Fluid Compute).
+  const tagged: RuntimeSqlRow[] = rows.map((r) => ({ ...r, owner: ownerId ?? null }));
+  await storeRows(table, tagged, ownerId);
+  // Durable path: persist to uploaded_rows (delete-then-insert, owner-scoped).
+  const storable: StorableRow[] = rows.map((r) => ({ table, rowId: r.id, data: r.data }));
+  return storeUploadedRows(ownerId, table, label, storable);
 }
 
 /**
- * Ingest a CSV buffer. Each row is stored BOTH as a structured row (for future
- * SQL-over-uploads) AND as a citable, embedded RAG chunk so the data is queryable
- * NOW with citations ([P:<table>#row]). Malformed cells are kept as-is (never
- * crash) — mirroring the build-time loader's graceful policy.
- * @param ownerId  the uploading user (Phase C); undefined = shared/single-user.
+ * Ingest a CSV buffer. Each row is stored as a STRUCTURED row — in the warm in-memory
+ * runtime store AND durably in uploaded_rows — so the text-to-SQL lane answers questions
+ * about it with real SQL (counts/sums/filters/lookups) cited to [S:<table>#row], and it
+ * survives a serverless cold start. A spreadsheet is structured data; it is NOT embedded
+ * as RAG/pgvector chunks. Malformed cells are kept as-is (never crash) — mirroring the
+ * build-time loader's graceful policy.
+ * @param ownerId  the uploading user; undefined = shared/single-user.
  */
 export async function ingestCsv(
   text: string,
@@ -189,32 +249,37 @@ export async function ingestCsv(
   ownerId?: string
 ): Promise<IngestResult> {
   const table = docIdFromFilename(filename);
+  const label = `${filename} (table)`;
   const parsed = parseCsv(text);
   const rows: RuntimeSqlRow[] = parsed.map((r, i) => ({
     table,
     id: i + 1,
     data: { id: i + 1, ...r },
   }));
-  await storeRows(table, rows, ownerId);
-  const records = await rowsToChunks(table, rows);
+  const persisted = await persistStructuredRows(table, label, rows, ownerId);
+  // Classify urgency from a readable sample for the dashboard badge (real LLM call).
   let urgency: Urgency | undefined;
-  if (records.length) {
-    urgency = await classifyUrgency(records.map((r) => r.text).join("\n"), TODAY);
-    await storeDocument(
-      { doc: table, label: `${filename} (table)`, file: filename },
-      records,
-      ownerId,
-      urgency
-    );
+  if (rows.length) {
+    const sample = rows.map((r) => rowToText(r.data)).filter((t) => t.trim()).join("\n");
+    if (sample) urgency = await classifyUrgency(sample, TODAY);
   }
-  return { kind: "csv", table, rows: rows.length, chunks: records.length, urgency };
+  return {
+    kind: "csv",
+    table,
+    rows: rows.length,
+    chunks: 0, // spreadsheets are structured, not RAG chunks
+    urgency,
+    persisted: supabaseEnabled() ? persisted : undefined,
+  };
 }
 
 /**
- * Ingest an Excel (.xlsx) buffer. Every sheet's rows are parsed (header row →
- * keyed objects), stored as structured rows, and embedded as citable RAG chunks
- * (same path as CSV). Multiple sheets are namespaced as <table>-<sheet>.
- * @param ownerId  the uploading user (Phase C); undefined = shared/single-user.
+ * Ingest an Excel (.xlsx) buffer. Every sheet's rows are parsed (header row → keyed
+ * objects) and stored as STRUCTURED rows — warm in-memory + durable uploaded_rows (same
+ * path as CSV) — so they're answered by text-to-SQL and survive a cold start. Multiple
+ * sheets are namespaced as <table>-<sheet>. A spreadsheet is structured data; it is NOT
+ * embedded as RAG/pgvector chunks.
+ * @param ownerId  the uploading user; undefined = shared/single-user.
  */
 export async function ingestXlsx(
   buf: Uint8Array,
@@ -225,7 +290,7 @@ export async function ingestXlsx(
   const wb = XLSX.read(buf, { type: "array" });
   const base = docIdFromFilename(filename);
   let totalRows = 0;
-  let totalChunks = 0;
+  let totalPersisted = 0;
   let lastUrgency: Urgency | undefined;
 
   for (const sheetName of wb.SheetNames) {
@@ -244,20 +309,15 @@ export async function ingestXlsx(
       id: i + 1,
       data: { id: i + 1, ...r },
     }));
-    await storeRows(table, rows, ownerId);
-    const records = await rowsToChunks(table, rows);
-    if (records.length) {
-      const u = await classifyUrgency(records.map((r) => r.text).join("\n"), TODAY);
+    const label = `${filename} · ${sheetName}`;
+    totalPersisted += await persistStructuredRows(table, label, rows, ownerId);
+    // Urgency badge from a readable sample of the sheet (first sheet sets the badge).
+    const sample = rows.map((r) => rowToText(r.data)).filter((t) => t.trim()).join("\n");
+    if (sample) {
+      const u = await classifyUrgency(sample, TODAY);
       if (!lastUrgency) lastUrgency = u;
-      await storeDocument(
-        { doc: table, label: `${filename} · ${sheetName}`, file: filename },
-        records,
-        ownerId,
-        u
-      );
     }
     totalRows += rows.length;
-    totalChunks += records.length;
   }
 
   if (totalRows === 0) {
@@ -267,8 +327,9 @@ export async function ingestXlsx(
     kind: "xlsx",
     table: base,
     rows: totalRows,
-    chunks: totalChunks,
+    chunks: 0, // spreadsheets are structured, not RAG chunks
     sheets: wb.SheetNames.length,
     urgency: lastUrgency,
+    persisted: supabaseEnabled() ? totalPersisted : undefined,
   };
 }
