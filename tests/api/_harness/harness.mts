@@ -62,6 +62,13 @@ export async function readJson(res: Response): Promise<{ status: number; body: a
 // member's read carries .eq("owner_id", <self>); an admin's does not). The terminal
 // result is whatever the test seeds per table+op. This lets the per-user-isolation
 // CONTRACT be asserted deterministically without a live DB.
+//
+// ⚠ FAITHFUL-FAKE TRIPWIRE — this fake does NOT filter by owner. `.eq()` only RECORDS the
+// filter into `rec.eq`; `result()` returns the SEEDED rows for the table+op regardless of
+// any recorded filters. So an owner-scoping test MUST assert `rec.eq["owner_id"]` (or drive
+// the catalog-scoping path) — NEVER infer isolation from the returned data shape alone (e.g.
+// "empty came back" / "only my row came back"). A test that asserts only the data shape would
+// pass even if the handler dropped its owner filter entirely: a silent faithful-fake hole.
 export type Recorded = { op: string; table: string; eq: Record<string, unknown>; args: unknown[] };
 
 export type SeedResult = { data?: unknown; error?: { message: string } | null };

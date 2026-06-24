@@ -1,4 +1,7 @@
 // JOURNEY 5 — ANSWER ACTIONS. Copy to clipboard; retry/regenerate; per-answer cost line.
+// SHAPE-ONLY BY DESIGN: this journey proves the answer-action CONTROLS work (copy/retry/cost
+// chip render + behave); it deliberately does NOT assert the answer's CONTENT correctness —
+// that golden-value guard lives in chat.mjs + citations.mjs (the $1,285 / Joni+Michael facts).
 import { launch, signIn, makeRecorder, askAndWait } from "./lib.mjs";
 
 export async function run() {

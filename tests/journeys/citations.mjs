@@ -1,6 +1,6 @@
 // JOURNEY 4 — CITATIONS. A citation chip is CLICKABLE and reveals the cited source text
 // (not an inert span). Fails if no clickable citation chip is present at all.
-import { launch, signIn, makeRecorder, askAndWait } from "./lib.mjs";
+import { launch, signIn, makeRecorder, askAndWait, hasAllFacts } from "./lib.mjs";
 
 export async function run() {
   const rec = makeRecorder("CITATIONS");
@@ -9,6 +9,15 @@ export async function run() {
     const { ctx, page } = await signIn(browser, "admin", "/dashboard");
     // Ask a question that draws on the bundled corpus so citations are produced.
     await askAndWait(page, "Who are the parties in the Carter family court case, and what was decided?");
+
+    // GOLDEN VALUE (not value-blind): a CITED answer is worthless if its prose is WRONG. The
+    // real parties are Joni Carter + Michael — assert them so a fluent-but-wrong-yet-cited
+    // answer FAILS here, not just "a chip exists". (Same golden facts the chat journey + the
+    // answer-reliability eval pin.)
+    const answer = await page.locator('[data-testid="answer"]').last().textContent().catch(() => "");
+    rec.check(hasAllFacts(answer, [/joni/i, /mich/i]),
+      "cited answer states the REAL parties (Joni Carter + Michael) — a wrong-but-cited answer fails",
+      `answer snippet: ${answer.trim().slice(0, 140).replace(/\n/g, " ")}`);
 
     const chip = page.locator('[data-testid="citation-chip"]').first();
     const chipCount = await page.locator('[data-testid="citation-chip"]').count();

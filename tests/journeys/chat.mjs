@@ -1,5 +1,5 @@
 // JOURNEY 2 — CHAT. Grounded cited answer; context follow-up; New chat clears; resume from history.
-import { launch, signIn, makeRecorder, askAndWait, BASE } from "./lib.mjs";
+import { launch, signIn, makeRecorder, askAndWait, BASE, hasAllFacts, hasGoldenNumber } from "./lib.mjs";
 
 const CITE_RE = /\[(?:S|P):[^\]#]+#\d+\]/;
 
@@ -24,10 +24,28 @@ export async function run() {
       "answer is CITED (citation chip / token present)",
       `chips=${chipCount}, tokenInText=${hasToken}`);
 
-    // 2b. Context follow-up: "what did I just ask?" should reference the prior turn.
+    // GOLDEN VALUE (not value-blind): the Carter parties are Joni Carter + Michael — the
+    // REAL fact from the bundled case file. A fluent-but-WRONG cited answer (wrong names)
+    // must FAIL here, not pass on "len>40 + a chip exists". (Golden source: the family-court
+    // case file; the answer-reliability eval pins the same /joni/ + /mich/ facts.)
+    rec.check(hasAllFacts(answer, [/joni/i, /mich/i]),
+      "answer states the REAL parties (Joni Carter + Michael) — not just any fluent text",
+      `answer snippet: ${answer.trim().slice(0, 140).replace(/\n/g, " ")}`);
+
+    // 2b. A second golden question whose CORRECT answer is a specific FIGURE — the child
+    // support amount is $1,285. This is the exact value-blindness guard the directive names:
+    // a fluent-but-WRONG amount ("$2,000/month") must FAIL, not pass on length + a chip.
+    await askAndWait(page, "What was the final child support amount in the Carter case?");
+    const csAnswer = await page.locator('[data-testid="answer"]').last().textContent().catch(() => "");
+    rec.check(hasGoldenNumber(csAnswer, "1285"),
+      "child-support answer states the REAL figure $1,285 (value-aware, not just cited)",
+      `answer snippet: ${csAnswer.trim().slice(0, 140).replace(/\n/g, " ")}`);
+
+    // 2c. Context follow-up: "what did I just ask?" should reference the prior turn (the
+    // child-support question). A correct context-carry recaps child support / the amount.
     await askAndWait(page, "What did I just ask you in my previous question?");
     const followup = (await page.locator('[data-testid="answer"]').last().textContent().catch(() => "") || "").toLowerCase();
-    const refsPrior = /carter|family court|previous|parties|earlier|you asked/.test(followup);
+    const refsPrior = /child support|1,?285|amount|carter|previous|earlier|you asked/.test(followup);
     rec.check(refsPrior,
       "context follow-up references the prior turn",
       `followup snippet: ${followup.slice(0, 120)}`);

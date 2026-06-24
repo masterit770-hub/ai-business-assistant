@@ -1,4 +1,7 @@
 // JOURNEY 3 — CHAT INPUT (component). Enter sends; Shift+Enter is a newline; arrow button sends.
+// SHAPE-ONLY BY DESIGN: this journey proves the INPUT plumbing (key handling + send wiring);
+// it deliberately does NOT assert answer content — the golden-value guard lives in chat.mjs +
+// citations.mjs (the $1,285 / Joni+Michael facts).
 import { launch, signIn, makeRecorder } from "./lib.mjs";
 
 export async function run() {

@@ -12,7 +12,7 @@ visible. A capability is "done" only when every cell it touches is green AND it 
 |---|---|---|---|---|
 | **Unit** | one pure function/module in isolation; fast, deterministic, no I/O | validator/parser/algorithm/logic bugs | the network, a DB, a browser | `tests/unit/*.test.mts` |
 | **Integration** | real seams wired together — engine pipeline (route→retrieve→generate→validate), API↔DB↔engine, text-to-SQL↔SQLite, the **real Supabase** path, cold-start | wiring/contract/data-flow bugs, owner-scoping, durability, grounding behavior | mocking the thing under test; the in-memory fallback when the real path is claimed | `tests/evals/*.mjs` |
-| **Component** | one **stateful UI component** rendered in isolation; props → state → interaction → render | UI-state bugs (the "Saved"-lie, greying, confirm flows, disabled states) | hitting the real backend (mock the fetch, assert the state machine) | `tests/components/*.test.tsx` **← does not exist yet** |
+| **Component** | one **stateful UI component** rendered in isolation; props → state → interaction → render | UI-state bugs (the "Saved"-lie, greying, confirm flows, disabled states) | hitting the real backend (mock the fetch, assert the state machine) | `tests/components/*.test.tsx` (16 files / 149 tests) |
 | **API contract** | one **route handler** driven directly (the real handler runs); only its I/O seams (auth resolver, the Supabase client/stores, `NextResponse`) are `mock.module`'d | HTTP-contract bugs the client hits — wrong status/validation order, auth/role gating, **per-user owner-scoping**, the write-only-key protection, self-lockout guards, demo-gating, error→status mapping, the never-500 contracts | mocking the handler itself; a live DB/network (assert the handler's decisions, not the store) | `tests/api/*.test.mts` |
 | **E2E / Journey** | the real user flow through the **deployed** app in a real browser | the integration of *everything* + the deployed env (keys/config) + what the user actually sees | demo-mode shortcuts standing in for the real deployed run | `tests/journeys/*.mjs` + `evals/golden-evals.mjs` (Playwright) |
 
@@ -48,7 +48,7 @@ is guarded (auth/role, validation, owner-scoping, error mapping).
 | 15 | UI render (chat / sources / inspector / citations / account) | 🟢 answer-helpers | — | — | 🟢 console, rail, account, table-viewer | 🟢 chat, rail-render, citations, account | — |
 
 **What the matrix says now (honest):** unit + integration are strong; the **API contract layer** (§6) closed
-the route-handler gap — 119 tests across all 11 handlers, every guarded branch RED-first; the **Component**
+the route-handler gap — 119 tests across 12 handler test files, every guarded branch RED-first; the **Component**
 column went from 0 → **16 stateful components / 149 tests** (the prompt-save-lie class — Save-only-on-real-
 success, confirm-gated destructive actions, owner/role UI boundaries — is now guarded). Genuinely
 presentational components (answer-view, inspector-panels render-only; theme-toggle/simple-tabs/app-sidebar)
@@ -78,14 +78,32 @@ and `tsc` + the full unit suite are green. The verifier gates against **this doc
 ## 5. Run
 ```
 npx tsc --noEmit
-npm test                                                       # unit + api + component (the deterministic gate)
+npm test                                                       # unit + api + component — the FAST DETERMINISTIC gate (no creds, no answer-quality)
 npm run test:unit                                              # unit only
 npm run test:api                                               # API route-handler contracts (tests/api/*) — see §6
 npm run test:components                                        # component (vitest) only
-for f in tests/evals/*.mjs; do node --experimental-strip-types "$f"; done   # integration (serial; creds)
+CI_STRICT=1 npm run test:gate                                  # CREDS-GATED ANSWER-QUALITY gate — see below
+for f in tests/evals/*.mjs; do node --experimental-strip-types "$f"; done   # full integration (serial; creds)
 # E2E: Playwright via chromium-1223 vs nucleus-woad (or a preview)
 ```
 Checklists: [README.md](./README.md) (45 journeys) · [count-coverage.md](./count-coverage.md) (24 count rows).
+
+**Two gates, two jobs (why `npm test` is not enough):** `npm test` is fast, deterministic, and runs
+everywhere — but it touches **zero answer-quality** (no live LLM/Supabase), so a green `npm test` does NOT
+prove a real user gets a correct grounded answer. `npm run test:gate`
+([`scripts/answer-quality-gate.mjs`](../../scripts/answer-quality-gate.mjs)) is the **creds-gated companion
+gate**: when creds are present it runs a REPRESENTATIVE answer-quality shard — `answer-reliability.mjs`
+sharded to the high-value rows (the Carter golden-VALUE child-support answer, the maintenance aggregate, and
+the SCHED cell-tally count rows: system-wide max, per-month, specific-person count, the adversarial
+no-fabrication guard), each at the strict 5/5 bar, **plus** `cold-start-durability.mjs` (uploaded sheet
+survives a cold start, owner-scoped, cited) — and **FAILS LOUD (exit 1) on any real miss**.
+
+**Skip honesty (CI vs human):** every `tests/evals/*.mjs` shard SKIPS LOUDLY when creds are absent. The
+skip's EXIT CODE is now mode-dependent, decided in one place ([`tests/evals/_skip.mjs`](../../tests/evals/_skip.mjs)):
+default (a human, no flag) exits 0 (benign — the loud "NOT a pass" banner still prints); under **`CI_STRICT=1`
+or `REQUIRE_CREDS=1`** a creds-skip exits **NON-ZERO** — in CI a skip is a FAILURE, never a silent pass. So
+`CI_STRICT=1 npm run test:gate` is the real answer-quality gate (creds-skip ⇒ fail); a human without creds
+runs `npm run test:gate` and gets a clear "this proved nothing — run with creds" notice instead of a false green.
 
 ## 6. The API contract layer (`tests/api/*`)
 Every route handler under `src/app/api/*` is driven directly — the **real handler runs**; only its I/O
@@ -96,6 +114,8 @@ deterministically: auth/role gating (401/403), input validation + status codes, 
 protection (a blank submit must not wipe a stored key; `__clear__` clears it), the **self-lockout** guards
 (an admin can't deactivate/demote themselves), demo-gating of the bundled corpus, the friendly/redacted
 error mapping (a provider key never reaches the client), and the **never-500** contracts (local-models
-probe, history with the store off). 100 cases across all 9 handlers; every guarded branch proven RED-first
-by removing the guard and watching exactly its test fail. Harness: `tests/api/_harness/` (the `@/`-alias +
-`next/server` resolve hook, and a recording fake Supabase builder that captures the owner-scoping).
+probe, history with the store off). **119 cases across 12 handler test files** (every `src/app/api/*`
+route handler except the `history/[session_id]` per-session sub-route, which the main `history` handler test
+covers); every guarded branch proven RED-first by removing the guard and watching exactly its test fail.
+Harness: `tests/api/_harness/` (the `@/`-alias + `next/server` resolve hook, and a recording fake Supabase
+builder that captures the owner-scoping).

@@ -99,6 +99,23 @@ export function makeRecorder(journey) {
   };
 }
 
+// ── GOLDEN-VALUE matchers ────────────────────────────────────────────────────────
+// A journey that only asserts "an answer came back, >40 chars, a cite chip exists" is
+// VALUE-BLIND: a fluent but WRONG answer ("custody to Bob, $999/mo") sails through. These
+// assert the answer contains the REAL fact from the source corpus, so a wrong-but-cited
+// answer FAILS. The number matcher tolerates comma/space/no-separator + an optional $/₪
+// (so "1,285" / "1285" / "$1,285" / "1 285" all match the same golden figure) but still
+// pins the exact digits — it is NOT a loose substring.
+export const goldenNumber = (digits) =>
+  new RegExp(`[$₪]?\\s?${String(digits).split("").join("[\\s,]?")}(?!\\d)`);
+// True iff `text` contains the golden figure as a real number (not a fragment of a longer one).
+export const hasGoldenNumber = (text, digits) => goldenNumber(digits).test(text || "");
+// True iff EVERY required fact (string → case-insensitive substring; RegExp → test) is present.
+export const hasAllFacts = (text, facts) => {
+  const t = text || "";
+  return facts.every((f) => (f instanceof RegExp ? f.test(t) : t.toLowerCase().includes(String(f).toLowerCase())));
+};
+
 // Ask one question in the assistant console and wait for a new answered turn to appear.
 // Returns the index of the new turn. Throws if neither an answer nor an error card shows.
 export async function askAndWait(page, question, { timeout = 90000 } = {}) {

@@ -18,7 +18,8 @@
     "eval:prompt-save": "node tests/evals/prompt-save-roundtrip.mjs",
     "eval:recommendation": "node tests/evals/recommendation-substance.mjs",
     "eval:keyless": "node tests/evals/keyless-model-error.mjs",
-    "eval:reliability": "node tests/evals/answer-reliability.mjs"
+    "eval:reliability": "node tests/evals/answer-reliability.mjs",
+    "test:gate": "node scripts/answer-quality-gate.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.8.0",
