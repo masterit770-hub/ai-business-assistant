@@ -45,6 +45,20 @@ export function canSearchOwner(ownerId: string | undefined, isAdmin: boolean): b
   return isAdmin || !!ownerId;
 }
 
+// The VERIFIED-WRITE decision (task #82), as a pure function so the false-green-prevention
+// rule is unit-tested directly: given how many chunks we asked to write (`requested`) and
+// how many a post-insert read-back found committed (`verified`), the count we REPORT as
+// `persisted` is ALWAYS the verified one — never the requested one. The old code returned
+// `requested` (rows.length), so a silent row-drop (RLS/constraint with error null) reported
+// a full write that never landed → route=[] → fabrication. `dropped()` flags the mismatch
+// so ingest can log it loudly instead of lying. `verified` is clamped to >= 0.
+export function reportedPersistCount(requested: number, verified: number): number {
+  return Math.max(0, verified);
+}
+export function persistDropped(requested: number, verified: number): boolean {
+  return Math.max(0, verified) < requested;
+}
+
 // pgvector accepts a vector literal as a bracketed, comma-joined list: "[0.1,0.2,...]".
 // supabase-js sends it as a JSON string param; Postgres casts text → vector(384). We
 // format it ourselves (rather than rely on driver coercion) so the on-wire shape is
@@ -61,8 +75,17 @@ export function toVectorLiteral(embedding: number[]): string {
  * A re-upload of the same doc REPLACES its prior chunks first (delete-then-insert), so
  * re-ingesting doesn't double-count. owner_id tags every row for per-user isolation.
  *
- * FAIL-OPEN: returns the count inserted, or 0 on any failure (logged) — never throws
- * into ingest. The doc registry / dashboard listing is independent of this.
+ * VERIFIED COUNT (task #82): the returned number is a READ-BACK count — after the insert
+ * we re-query how many of this (owner, doc) chunks actually landed and return THAT, not
+ * `rows.length` (the intent). Reporting the intended count meant a silent write failure
+ * (an RLS policy or a column constraint that drops rows with `error: null`) would report
+ * `persisted = N` while ZERO rows committed — a false-green that made every uploaded-doc
+ * question fabricate (the "route=[] → general → Beyoncé" bug) while the ingest log claimed
+ * success. A read-back makes `persisted = N` MEAN "N rows are committed for this owner",
+ * so a drop surfaces as persisted < requested (logged) instead of a confident lie.
+ *
+ * FAIL-OPEN: returns the VERIFIED count, or 0 on any failure (logged) — never throws into
+ * ingest. The doc registry / dashboard listing is independent of this.
  */
 export async function storeDocChunks(
   ownerId: string | undefined,
@@ -104,7 +127,36 @@ export async function storeDocChunks(
       console.error("[pgvector-store] insert failed:", error.message);
       return 0;
     }
-    return rows.length;
+    // VERIFIED WRITE (task #82): re-read how many chunks ACTUALLY committed for this
+    // (owner, doc) and return that count — never the requested `rows.length`. If a row-
+    // dropping policy/constraint silently ate the insert (error null but nothing landed),
+    // this read-back returns the true (smaller) number, so a downstream "persisted=N"
+    // can never claim a write that didn't happen. Scoped to (owner, doc) so a concurrent
+    // ingest of another doc/owner can't inflate the count; head:true keeps it a cheap
+    // COUNT(*) with no row transfer.
+    const verify = db
+      .from("doc_chunks")
+      .select("id", { count: "exact", head: true })
+      .eq("doc_id", docId);
+    const { count, error: verr } = await (ownerId
+      ? verify.eq("owner_id", ownerId)
+      : verify.is("owner_id", null));
+    if (verr) {
+      // The insert reported success but we couldn't confirm it — report 0 rather than an
+      // unverified number, so ingest never over-claims a write it couldn't prove landed.
+      console.error("[pgvector-store] insert succeeded but read-back failed:", verr.message);
+      return 0;
+    }
+    const verified = count ?? 0;
+    if (persistDropped(rows.length, verified)) {
+      // Surfacing a partial/dropped write loudly — this is the exact silent-failure mode
+      // (#82) that produced a false-green. The ingest result will carry the true count.
+      console.error(
+        `[pgvector-store] VERIFIED WRITE MISMATCH: requested ${rows.length} chunks for ` +
+          `doc=${docId} owner=${ownerId ?? "null"}, but only ${verified} committed.`
+      );
+    }
+    return reportedPersistCount(rows.length, verified);
   } catch (e) {
     console.error(
       "[pgvector-store] storeDocChunks failed:",

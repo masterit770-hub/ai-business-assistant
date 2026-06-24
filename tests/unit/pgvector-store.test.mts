@@ -6,6 +6,8 @@ import {
   canSearchOwner,
   hybridSearch,
   searchDocChunks,
+  reportedPersistCount,
+  persistDropped,
 } from "../../src/lib/engine/pgvector-store.ts";
 
 // The uploaded-doc pgvector lane. These tests cover the two things that must be exactly
@@ -36,6 +38,37 @@ test("toQueryText never returns null/undefined (empty → '')", () => {
   // The SQL side guards on query_text <> '' so an empty string is a safe no-lexical-lane.
   assert.equal(toQueryText(undefined as unknown as string), "");
   assert.equal(toQueryText(""), "");
+});
+
+// ── reportedPersistCount / persistDropped: the VERIFIED-WRITE rule (task #82) ───────
+// THE BUG these pin: storeDocChunks used to return `rows.length` (the INTENT) after an
+// insert that reported error=null. A silent row-drop (an RLS policy or a column constraint
+// that swallows the write with no error) meant it reported "persisted = 11" while ZERO rows
+// committed — a false-green that made every uploaded-PDF question fabricate (route=[] →
+// general → "Beyoncé"). The fix returns a post-insert READ-BACK count instead. These tests
+// pin that the reported count is ALWAYS the verified one, never the requested one.
+test("reportedPersistCount returns the VERIFIED count, never the requested count", () => {
+  // The exact #82 failure shape: asked to write 11, the read-back found 0 committed.
+  // The OLD code returned 11 (the lie). The reported count MUST be the verified 0.
+  assert.equal(reportedPersistCount(11, 0), 0);
+  // A partial drop: asked 11, only 7 landed → report 7, not 11.
+  assert.equal(reportedPersistCount(11, 7), 7);
+  // The healthy path: all 11 landed → report 11.
+  assert.equal(reportedPersistCount(11, 11), 11);
+});
+
+test("reportedPersistCount clamps a negative/garbage verified count to 0", () => {
+  // A read-back that somehow yields a negative/NaN count must never report below 0.
+  assert.equal(reportedPersistCount(11, -3), 0);
+  assert.equal(reportedPersistCount(0, 0), 0);
+});
+
+test("persistDropped flags a write that committed FEWER rows than requested", () => {
+  // This is what trips the loud log — the silent-failure detector.
+  assert.equal(persistDropped(11, 0), true);   // total drop (the #82 bug)
+  assert.equal(persistDropped(11, 7), true);   // partial drop
+  assert.equal(persistDropped(11, 11), false); // healthy full write
+  assert.equal(persistDropped(0, 0), false);   // nothing requested, nothing dropped
 });
 
 // ── canSearchOwner: the FAIL-CLOSED per-user isolation gate (the hard requirement) ──
