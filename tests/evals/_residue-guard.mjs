@@ -104,6 +104,25 @@ function banner(evalName, r, phase) {
 }
 
 /**
+ * FK-SETTLE a freshly-created throwaway owner: wait until auth.admin.getUserById confirms the new
+ * auth.users row is VISIBLE before the caller ingests. admin.createUser() can RETURN before the row
+ * is consistent for the doc_chunks / uploaded_rows owner_id FK; an immediate ingest then throws
+ * "violates foreign key constraint ..._owner_id_fkey" → 0 rows persist → empty catalog → a flaky
+ * false FAILURE (the FK-race that confounded grade after grade). Shared so every eval settles the
+ * same way. Product is unaffected — a real user exists long before they upload; this only bites the
+ * throwaway create-then-immediately-ingest test pattern. Returns the id (so it can wrap a return).
+ */
+export async function settleOwner(id) {
+  const client = await db();
+  for (let i = 0; i < 15; i++) {
+    const g = await client.auth.admin.getUserById(id);
+    if (!g.error && g.data?.user?.id === id) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return id;
+}
+
+/**
  * Pre-flight: ABORT (exit 1) if the DB already has throwaway residue from a prior leaked
  * run. We never run a real-data eval over a polluted catalog — the result would be a false
  * green. Returns the clean count on success.

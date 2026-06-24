@@ -43,7 +43,7 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { skip as skipShared } from "./_skip.mjs";
-import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
+import { assertCleanBefore, assertCleanAfter, settleOwner } from "./_residue-guard.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -233,7 +233,7 @@ async function newOwner(tag) {
     email, password: crypto.randomUUID(), email_confirm: true,
   });
   if (error || !data?.user?.id) throw new Error(`could not create throwaway owner: ${error?.message ?? "no id"}`);
-  return data.user.id;
+  return settleOwner(data.user.id);
 }
 
 // ── REAL-ARTIFACT BLOCK: the client's ACTUAL uploaded file "bluefalcon" ───────────

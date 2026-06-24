@@ -19,7 +19,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { skip as skipShared } from "./_skip.mjs";
-import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
+import { assertCleanBefore, assertCleanAfter, settleOwner } from "./_residue-guard.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const WANT = new Set([
@@ -74,7 +74,7 @@ async function newOwner() {
   const email = `cleantable-${crypto.randomUUID().slice(0, 8)}@nucleus-eval.invalid`;
   const { data, error } = await admin().auth.admin.createUser({ email, password: crypto.randomUUID(), email_confirm: true });
   if (error || !data?.user?.id) throw new Error(`could not create throwaway owner: ${error?.message ?? "no id"}`);
-  return data.user.id;
+  return settleOwner(data.user.id);
 }
 // Ask as a MEMBER over ONLY this throwaway owner's synthetic CSV (the real client path).
 async function ask(q) {

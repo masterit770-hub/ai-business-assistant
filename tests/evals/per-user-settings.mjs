@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { skip as skipShared } from "./_skip.mjs";
-import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
+import { assertCleanBefore, assertCleanAfter, settleOwner } from "./_residue-guard.mjs";
 
 const ROOT = "/home/codex/Projects/nucleus";
 const WANT = new Set(["SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]);
@@ -59,7 +59,7 @@ async function newOwner(tag) {
     email_confirm: true,
   });
   if (error || !data?.user?.id) throw new Error(`createUser failed: ${error?.message ?? "no id"}`);
-  return data.user.id;
+  return settleOwner(data.user.id);
 }
 
 let A = null, B = null, C = null;

@@ -37,7 +37,7 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { skip as skipShared } from "./_skip.mjs";
-import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
+import { assertCleanBefore, assertCleanAfter, settleOwner } from "./_residue-guard.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -136,7 +136,7 @@ async function newOwner(tag) {
   });
   if (error || !data?.user?.id) throw new Error(`could not create throwaway owner: ${error?.message ?? "no id"}`);
   OWNERS.push(data.user.id);
-  return data.user.id;
+  return settleOwner(data.user.id);
 }
 // A non-demo member asks over ONLY their own content (bundled demo corpus excluded).
 const askAs = (q, owner) => answerQuestion(q, { ownerId: owner, isDemo: false, role: "member" });

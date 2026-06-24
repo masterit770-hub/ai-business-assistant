@@ -35,7 +35,7 @@
 // echoes, logs, or commits any secret value. It only ever SETS a bogus throwaway key.
 
 import fs from "node:fs";
-import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
+import { assertCleanBefore, assertCleanAfter, settleOwner } from "./_residue-guard.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
@@ -95,7 +95,7 @@ async function makeOwner() {
       email: `keyless-${crypto.randomUUID().slice(0, 8)}@nucleus-eval.invalid`,
       password: crypto.randomUUID(), email_confirm: true,
     });
-    if (!error && data?.user?.id) { createdRealUser = true; return data.user.id; }
+    if (!error && data?.user?.id) { createdRealUser = true; return settleOwner(data.user.id); }
     console.log("  ℹ could not create a throwaway user — using a synthetic owner against the in-memory settings store.");
   }
   return crypto.randomUUID();
