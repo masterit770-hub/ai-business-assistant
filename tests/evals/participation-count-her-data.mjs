@@ -103,7 +103,20 @@ async function newOwner() {
   const email = `participation-${crypto.randomUUID().slice(0, 8)}@nucleus-eval.invalid`;
   const { data, error } = await admin().auth.admin.createUser({ email, password: crypto.randomUUID(), email_confirm: true });
   if (error || !data?.user?.id) throw new Error(`could not create throwaway owner: ${error?.message ?? "no id"}`);
-  return data.user.id;
+  const id = data.user.id;
+  // FK-SETTLE (the verifier's "1/8 cold-start miss" — diagnosed as a HARNESS race, not a product gap):
+  // createUser() can RETURN before the new auth.users row is visible to the uploaded_rows owner_id FK.
+  // An immediate ingestXlsx then hits "violates foreign key constraint uploaded_rows_owner_id_fkey" →
+  // 0 rows persist → empty catalog → route=[] → general → a spurious MISS on the first question. We
+  // wait until getUserById confirms the user is FK-visible before ingesting. Proven: 8/8 (was ~7/8).
+  // (Product is unaffected — a real user exists long before they upload; this is purely the throwaway
+  // create-then-immediately-ingest pattern.)
+  for (let i = 0; i < 15; i++) {
+    const g = await admin().auth.admin.getUserById(id);
+    if (!g.error && g.data?.user?.id === id) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return id;
 }
 // Reset the in-memory stores ONCE before the first question (a cold-start simulation: the answer
 // pipeline must rehydrate the owner's durable rows). We do NOT reset between every question: doing a
@@ -134,8 +147,20 @@ async function main() {
 
   for (const p of [JUNE, AUGUST]) {
     const buf = new Uint8Array(fs.readFileSync(p));
-    const r = await ingestXlsx(buf, path.basename(p), OWNER);
-    console.log(`  ingested ${path.basename(p).normalize("NFC").slice(0, 18)}… → ${r.rows} rows, ${r.sheets} sheet(s)`);
+    // Ingest, and VERIFY the durable write landed (persisted > 0). If a residual FK-visibility race
+    // still ate the insert (persisted === 0 despite the settle above), retry a couple of times — a
+    // silent 0-row ingest is exactly what produced the spurious "first-call MISS". Fail loudly if it
+    // never lands, rather than running the gate over an empty catalog (a false result).
+    let r;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      r = await ingestXlsx(buf, path.basename(p), OWNER);
+      if ((r.persisted ?? 0) > 0 || !supabaseEnabled()) break;
+      await new Promise((rr) => setTimeout(rr, 400));
+    }
+    if ((r.persisted ?? 0) === 0 && supabaseEnabled()) {
+      throw new Error(`ingest of ${path.basename(p)} persisted 0 rows after retries (FK race not settled)`);
+    }
+    console.log(`  ingested ${path.basename(p).normalize("NFC").slice(0, 18)}… → ${r.rows} rows, ${r.sheets} sheet(s), persisted ${r.persisted}`);
   }
   // ingestXlsx returns ONE base name, but a multi-sheet workbook persists several real tables under
   // sanitized names. Enumerate the owner's ACTUAL uploaded tables so cleanup deletes every one (no
