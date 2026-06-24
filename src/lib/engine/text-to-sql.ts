@@ -26,9 +26,12 @@ import type { TableSchema } from "./sql-guard.ts";
 import {
   isCellTallyQuestion,
   isCellCountQuestion,
+  isCellFilterByCountQuestion,
+  filterTargetCount,
   isGridShaped,
   tallyCellOccurrencesAcross,
   countNamedEntityAcross,
+  filterEntitiesAtCountAcross,
   tableScopeForTally,
   selectTallyGridsByKind,
 } from "./cell-tally.ts";
@@ -391,6 +394,40 @@ export async function answerStructured(
       }
     }
     // If the count lane couldn't pin the named value, the grid tables fall through to SQL below.
+  }
+
+  // ── CELL-FILTER-BY-COUNT LANE (DV5: "who is scheduled EXACTLY N times") ────────────────────
+  // Asks for the SET of entities whose occurrence frequency EQUALS a specific N — not a ranking,
+  // not one named value's count. A single guarded SELECT can't express "count a value across the
+  // grid's many columns AND keep those == N", so we use the cell machinery: tally occurrences,
+  // classify the asked-for kind, keep those at exactly N. An empty result is an HONEST "no one is
+  // scheduled exactly N times" (never fabricated). Runs only for grids the tally/count didn't take.
+  const filterTarget = filterTargetCount(question);
+  const filterGrids =
+    filterTarget != null
+      ? familyGrids((c) => isCellFilterByCountQuestion(question, c)).filter((t) => !handledByTally.has(t))
+      : [];
+  if (filterTarget != null && filterGrids.length > 0) {
+    const scopeTables = tableScopeForTally(question, filterGrids);
+    const f = await filterEntitiesAtCountAcross(question, filterTarget, scopeTables, catalog, scope);
+    for (const u of f.usages) usages.push(u);
+    if (f.ok) {
+      for (const tbl of scopeTables) handledByTally.add(tbl);
+      if (!primaryTable) {
+        primaryTable = f.tables[0] ?? scopeTables[0];
+        primarySql = `cell-filter-by-count = ${filterTarget} across ${scopeTables.length} grid sheet(s) — ${f.members.length} entity(ies) at exactly ${filterTarget}`;
+      }
+      if (f.members.length > 0) {
+        allRows.push(...f.rows);
+        // AUTHORITATIVE: the exact set at N, code-computed. The generator names them all, cited.
+        verifiedTally = `[exactly ${filterTarget}] ${f.members.map((m) => m.entity).join(", ")}`;
+      } else {
+        // HONEST empty: nobody occurs exactly N times. Carry a note so the generator says so plainly.
+        countZeroNote = `no one in the spanned scheduling sheet(s) is scheduled exactly ${filterTarget} time(s)`;
+        verifiedTally = `[exactly ${filterTarget}] (none)`;
+      }
+    }
+    // If the filter lane couldn't apply, the grid tables fall through to SQL below.
   }
 
   for (const table of plan.tables) {

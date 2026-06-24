@@ -28,7 +28,7 @@ grids (June/July/Aug/Dec; Aug top = 7 people @5, Dec top = 7 @10, "gift room"/ח
 | DV2 | synonyms / language: `מי הכי פעילה?`, `who is scheduled the most?`, `who's most active?` | same correct answer as CA1 | 🟢 eval `EN/sched-most-active` 5/5 (the EN false-deflect RED is fixed) |
 | DV3 | inverse: `מי משובצת הכי מעט?` (least) | correct **minimum**, tie group if tied | 🟢 eval `HE/sched-least` 5/5 (direction-aware lane) + unit `LEAST picks the MIN group` |
 | DV4 | specific person: `כמה פעמים משובצת <real name>?` | that person's **exact count**, cited | 🟢 **FIXED** — new cell-count lane (`countNamedEntityAcross`). Evals `HE/sched-count-rina-system` (15 across sheets) + `HE/sched-count-rina-august` (5 in-month) 5/5; unit `isCellCountQuestion`. (The RED: SQL lane answered "0" via a one-column COUNT.) |
-| DV5 | filter-by-count: `מי משובצת בדיוק 5 פעמים?` | the exact set at that count | ⬜ (still routes to the SQL lane → honest mode=general floor, no fabrication; a dedicated filter-by-count lane is the NEXT slice) |
+| DV5 | filter-by-count: `מי משובצת בדיוק 5 פעמים?` | the exact set at that count | 🟢 **FIXED** — new cell-filter-by-count lane (`filterEntitiesAtCountAcross` + `entitiesAtCount`/`isCellFilterByCountQuestion`/`filterTargetCount`). Eval `HE/sched-exactly-5-august` 5/5 (the 7 people @5, activity excluded, all cited); units in `cell-tally-coverage.test.mts`. Empty set when none match (honest). |
 | DV6 | cross-month: `בכל החודשים מי משובצת הכי הרבה?` | correct **aggregate across sheets** | 🟢 same unified cross-sheet path as CA2 (=29) |
 
 ## C — Edge cases (derived)
@@ -37,7 +37,7 @@ grids (June/July/Aug/Dec; Aug top = 7 people @5, Dec top = 7 @10, "gift room"/ח
 | EG1 | the top is a **tie** (the real case) | name the FULL group; **never collapse to one**; never demote a tied member to a lower count | 🟢 unit `a genuine TIE … returned IN FULL` + gate test + Aug/Jul/Dec evals |
 | EG2 | highest raw value is an **activity/room** (gift-room=8) | excluded when ranking PEOPLE; and when the question RANKS activities, it IS the answer | 🟢 unit `excludes the activity label`; people-grader forbids `AUG_ACTIVITIES`; **activity-ranking eval `HE/sched-activity-top` 5/5 (חדר מתנות=8, never a person)** — the classifier is now QUESTION-DRIVEN (ranks the kind the question asks for) |
 | EG3 | a genuine **single** leader exists | name just that one — don't fabricate a tie | 🟢 unit `MOST picks the true max group` + **June eval (sole leader) 5/5** + the prompt's no-fabricated-tie rule |
-| EG4 | sparse / no determinable ranking | honest about it — don't guess | ⬜ (lane fail-soft → honest-limit floor exists; no dedicated guard this round) |
+| EG4 | sparse / no determinable ranking | honest about it — don't guess | 🟢 eval `HE/sched-no-ranking-intake` 5/5 — over her intake/assessment grids (no recurrence to rank) the engine honestly says "no metric to rank activity by", never crowns a fabricated winner; units pin `gridRecurrenceProfile` (sparse → maxCount 1 / no recurring values → not a rankable grid) + empty-grid → empty extreme group |
 
 ## D — Adversarial: must NOT fabricate
 | id | input | expected | status |
@@ -45,7 +45,7 @@ grids (June/July/Aug/Dec; Aug top = 7 people @5, Dec top = 7 @10, "gift room"/ח
 | AD1 | a fact NOT in the sheet: `מה הטלפון/הכתובת של <real name>?` | honest "not in your file" — **never invent** | 🟢 eval `HE/sched-adv-phone` 5/5 — honest (no phone in her sheet), never a fabricated number |
 | AD2 | superlative over a **non-existent field**: `מי הכי מבוגרת?` (no ages) | honest; no fabricated ranking | 🟢 eval `HE/sched-adv-oldest` 5/5 — honestly flags no age data, never crowns an "oldest" |
 | AD3 | **false premise**: `<name> משובצת 20 פעמים, מי עוד?` | reject the false count; correct from the data | 🟢 eval `HE/sched-adv-false-premise` 5/5 — never confirms/echoes the false "20 times" |
-| AD4 | **non-existent name**: `כמה פעמים משובצת <made-up name>?` | honest "not in your file" / 0 — never invent a count | ⬜ (the cell-count lane returns an HONEST 0 for an absent value by design, but no dedicated eval row added this round) |
+| AD4 | **non-existent name**: `כמה פעמים משובצת <made-up name>?` | honest "not in your file" / 0 — never invent a count | 🟢 eval `HE/sched-count-nonexistent` 5/5 — a made-up name yields an honest "not in your file" / 0, never a fabricated count; units pin that an absent value's occurrence count is 0 and the filter can never return a ghost member |
 
 ## E — Self-consistency & validation (the dangerous green-check class)
 | id | input | expected | status |
@@ -76,9 +76,20 @@ grids (June/July/Aug/Dec; Aug top = 7 people @5, Dec top = 7 @10, "gift room"/ח
 > picked grid's name-FAMILY (`shareNameFamily`, month-word excluded) then narrow by the question's scope.
 > Safety bar HELD across all adversarial probes: no fabricated missing facts, no activity-as-person.
 >
-> **Still ⬜ (NOT guarded — open gaps, honestly flagged):** DV5 (filter-by-count "who has exactly 5" — still
-> the SQL lane → honest mode=general floor, no fabrication), EG4 (sparse), AD4 (non-existent-name count —
-> the count lane returns an honest 0 by design, but no dedicated eval row). These are the next slice, not closed.
+> **Third round (close the last 3 rows):** the previously-open rows are now guarded — EVERY row of this matrix
+> is 🟢:
+> **DV5** filter-by-count "who is scheduled EXACTLY N times" → new cell-FILTER lane (`filterEntitiesAtCountAcross`):
+> tally occurrences, classify the asked-for kind, keep those at exactly N; returns the full SET cited, or an
+> honest empty when none match. Eval `HE/sched-exactly-5-august` 5/5 (the 7 people @5).
+> **EG4** sparse / no-determinable-ranking → over her intake/assessment grids (no recurrence) the engine
+> honestly says there is no metric to rank by, never crowns a fabricated winner. Eval `HE/sched-no-ranking-intake`
+> 5/5; pinned deterministically via `gridRecurrenceProfile`.
+> **AD4** non-existent-name → honest "not in your file" / 0, never a fabricated count. Eval
+> `HE/sched-count-nonexistent` 5/5; pinned: an absent value's count is 0, the filter never returns a ghost.
+>
+> **OPEN GAPS: none in this matrix.** Earned by an adversarial re-pass (phone/age/false-premise/non-existent-
+> name/activity-as-person/wrong-corpus all held). Cross-corpus EN routing (the bundled `contracts` leak) was a
+> separate live RED fixed by `selectTallyGridsByKind` (entity-kind grid selection) — guarded by `EN/sched-most-active`.
 >
 > **Status legend note:** 🟢 = guard green (unit/eval on this box). NONE are ✅ yet — ✅ requires the
 > **verifier's** independent LIVE re-test on nucleus-woad (the engineer does not self-certify or deploy).

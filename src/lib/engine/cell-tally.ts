@@ -549,6 +549,83 @@ export async function countNamedEntityAcross(
   return { entity: value, count, rows, tables: present, ok: true, usages };
 }
 
+export type CellFilterResult = {
+  // The target count the question filters on (N).
+  targetCount: number;
+  // The classified entities (the asked-for KIND) whose occurrence count EQUALS N, sorted. Empty
+  // when none match — an HONEST empty set ("no one is scheduled exactly N times"), never fabricated.
+  members: { entity: string; count: number; anchors: { table: string; id: number }[] }[];
+  // One citable row per member (so [S:table#rowid] resolves).
+  rows: SqlRow[];
+  tables: string[];
+  ok: boolean;
+  note?: string;
+  usages: ChatUsage[];
+};
+
+/**
+ * FILTER-BY-COUNT over the grid ("who is scheduled EXACTLY N times" / "מי משובצת בדיוק N פעמים").
+ * Accumulates occurrences across the spanned tables, asks the kind classifier which distinct values
+ * are the asked-for ENTITY KIND (people vs activities/places), then keeps ONLY those whose exact
+ * occurrence count EQUALS N. Returns the full matching SET, cited. Honest: an empty set when no
+ * entity of the kind hits N (never fabricated). Fail-soft: any error → {ok:false}.
+ */
+export async function filterEntitiesAtCountAcross(
+  question: string,
+  targetCount: number,
+  tables: string[],
+  catalog: TableSchema[],
+  scope?: CatalogScope
+): Promise<CellFilterResult> {
+  const usages: ChatUsage[] = [];
+  const present = tables.filter((t) => catalog.some((c) => c.table === t));
+  if (present.length === 0) {
+    return { targetCount, members: [], rows: [], tables: [], ok: false, note: "no table in catalog", usages };
+  }
+  // 1. Accumulate occurrences across every spanned table (same machinery as the tally/count).
+  const occ: OccMap = new Map();
+  let totalRows = 0;
+  for (const table of present) {
+    let rows: SqlRow[];
+    try {
+      rows = selectWithIds(`SELECT * FROM "${table}" LIMIT ${HARD_ROW_CAP}`, table, catalog, scope);
+    } catch {
+      usages.push({ live: false, provider: "—", model: "—" } as ChatUsage);
+      continue;
+    }
+    totalRows += rows.length;
+    accumulateOccurrences(occ, table, rows);
+  }
+  if (totalRows === 0) return { targetCount, members: [], rows: [], tables: present, ok: false, note: "no rows", usages };
+
+  // 2. MODEL: which distinct values are the asked-for ENTITY KIND (people vs activities/places)?
+  //    We classify only the values that actually hit the target count — the only ones that could be
+  //    members — to keep the classification focused (and exclude an activity that happens to hit N).
+  const distinct = [...occ.keys()];
+  const atTarget = distinct.filter((v) => (occ.get(v)?.count ?? 0) === targetCount);
+  if (atTarget.length === 0) {
+    // HONEST empty: nothing occurs exactly N times. ok:true (a real, code-verified empty answer).
+    return { targetCount, members: [], rows: [], tables: present, ok: true, note: `no value occurs exactly ${targetCount} times`, usages };
+  }
+  const { entities, usage } = await classifyEntities(question, atTarget);
+  usages.push(usage);
+  // 3. CODE: keep only the classified entities at exactly N (the pure, unit-pinned filter).
+  const members = entitiesAtCount(occ, entities, targetCount);
+  const rows: SqlRow[] = members.map((m) => ({
+    table: m.anchors[0].table,
+    id: m.anchors[0].id,
+    data: { entity: m.entity, occurrences: m.count },
+  }));
+  return {
+    targetCount,
+    members: members.map((m) => ({ entity: m.entity, count: m.count, anchors: m.anchors })),
+    rows,
+    tables: present,
+    ok: true,
+    usages,
+  };
+}
+
 // Extract the single DISTINCT cell value the question names (the value to count). Returns a verbatim
 // member of `distinct` or null. JSON, temperature 0. Kept null-safe: the model must pick from the
 // real list (it cannot invent a value), so the count is always over a value that truly exists.
