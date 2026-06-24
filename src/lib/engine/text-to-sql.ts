@@ -30,6 +30,7 @@ import {
   tallyCellOccurrencesAcross,
   countNamedEntityAcross,
   tableScopeForTally,
+  selectTallyGridsByKind,
 } from "./cell-tally.ts";
 
 // `||` (not `??`) so an empty env value ("") falls through to the real date instead
@@ -288,7 +289,27 @@ export async function answerStructured(
     // (or its picks share no family with the matching grids).
     return (inFamily.length > 0 ? inFamily : matching).map((c) => c.table);
   };
-  const gridTables = familyGrids((c) => isCellTallyQuestion(question, c));
+  // EVERY catalog grid matching a predicate, IGNORING the planner's family narrowing — the full
+  // candidate pool the entity-kind selector chooses from. Needed because the planner can land on a
+  // WRONG-CORPUS grid (the live RED: an English "most active person" routed to the bundled
+  // `contracts` grid), which would make familyGrids narrow to that wrong corpus. We pool all the
+  // matching grids and let selectTallyGridsByKind pick the corpus whose recurring values are the
+  // question's entity KIND. GENERAL — table SHAPE + predicate, never a dataset name.
+  const allMatchingGrids = (predicate: (s: TableSchema) => boolean): string[] =>
+    catalog.filter((c) => predicate(c)).map((c) => c.table);
+  // The tally candidate pool: the planner-family grids UNION every matching grid, so the right
+  // corpus is always IN the pool even when the planner picked the wrong one. selectTallyGridsByKind
+  // then narrows to the corpus matching the question's entity kind (the cross-corpus fix); when only
+  // one corpus/family is present this is a no-op fast-path (the normal Hebrew scheduling path).
+  const tallyCandidates = [
+    ...new Set([
+      ...familyGrids((c) => isCellTallyQuestion(question, c)),
+      ...allMatchingGrids((c) => isCellTallyQuestion(question, c)),
+    ]),
+  ];
+  const kindSel = await selectTallyGridsByKind(question, tallyCandidates, catalog, scope);
+  for (const u of kindSel.usages) usages.push(u);
+  const gridTables = kindSel.tables;
   const handledByTally = new Set<string>();
   if (gridTables.length > 0) {
     const scopeTables = tableScopeForTally(question, gridTables);

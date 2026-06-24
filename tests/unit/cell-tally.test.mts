@@ -8,6 +8,7 @@ import {
   tableScopeForTally,
   accumulateOccurrences,
   computeExtremeTally,
+  gridRecurrenceProfile,
   type OccMap,
 } from "../../src/lib/engine/cell-tally.ts";
 import type { TableSchema } from "../../src/lib/engine/sql-guard.ts";
@@ -91,8 +92,28 @@ test("FIRES on the live-regression natural variations over a grid table", () => 
   assert.equal(isCellTallyQuestion("מי משובץ הכי הרבה?", grid), true); // no month — RED #1
   assert.equal(isCellTallyQuestion("מי משובץ הכי הרבה במערכת", grid), true); // system-wide — RED #2
   assert.equal(isCellTallyQuestion("who is the most active person in the schedules?", grid), true);
+  // The EXACT bare live-failing phrasing (NO "in the schedules" scheduling-context cue) — the
+  // planner punted on this and the lane never fired live; it MUST trigger the tally now.
+  assert.equal(isCellTallyQuestion("who is the most active person", grid), true);
   assert.equal(isCellTallyQuestion("מי משובץ הכי מעט בשיבוצים?", grid), true); // least
   assert.equal(isCellTallyQuestion("who is scheduled the least?", grid), true);
+});
+
+// ── ATTRIBUTE-SUPERLATIVE EXCLUSION (the AD2 regression) ───────────────────────────────────────
+// Broadening the lane to fire even when the planner punts re-exposed a fabrication risk: an
+// INTRINSIC-ATTRIBUTE superlative ("who is the OLDEST/youngest/tallest in the schedules?") is a
+// ranking by a PROPERTY of the person (age/height), NOT by how often they occur — her grid holds
+// no ages, so the tally must NOT fire and crown the most-scheduled person as "the oldest" (the
+// recorded AD2 RED). The bare dataset noun "schedules"/"שיבוצים" is a context word, not a
+// frequency cue. The lane stays OFF for attribute superlatives so the honest "no age data" path
+// answers. GENERAL — a linguistic class of superlative, not a dataset-specific block-list.
+test("does NOT fire on an INTRINSIC-ATTRIBUTE superlative (oldest/youngest), HE+EN — AD2 guard", () => {
+  assert.equal(isCellTallyQuestion("מי הבת הכי מבוגרת בשיבוצים?", grid), false); // oldest — the live AD2 RED
+  assert.equal(isCellTallyQuestion("מי הצעירה ביותר בשיבוצים?", grid), false); // youngest
+  assert.equal(isCellTallyQuestion("who is the oldest person in the schedules?", grid), false);
+  assert.equal(isCellTallyQuestion("who is the tallest girl scheduled?", grid), false);
+  // The cell-COUNT lane must also stay off for an attribute superlative (defense-in-depth).
+  assert.equal(isCellCountQuestion("מי הבת הכי מבוגרת בשיבוצים?", grid), false);
 });
 
 // ── SPECIFIC-VALUE COUNT (DV4) — "how many times is <X> scheduled" over a grid ──────────────────
@@ -234,4 +255,37 @@ test("fixture tally: LEAST picks the MIN group, not the max (direction is honore
   const { extremeGroup } = computeExtremeTally(occ, PEOPLE, "least");
   assert.deepEqual(extremeGroup.map((t) => t.entity), ["Cara"]); // unique min @1
   assert.equal(extremeGroup[0].count, 1);
+});
+
+// ── GRID RECURRENCE PROFILE — the CODE half of the cross-corpus grid SELECTION fix (the EN
+// "most active person" mis-routed to the bundled `contracts` grid). selectTallyGridsByKind is
+// LLM-driven (the entity-kind classifier), but its grid-qualification rests on this PURE profile:
+// a grid only ranks "most X" if some value RECURS (count > 1). A normalized relational roster
+// (every person listed once) has NO recurrence — so it can never be picked as a "most active"
+// frequency grid, no matter that its values ARE person-names. The scheduling grid (a person
+// spread across many day cells) DOES recur. This pins that separation deterministically.
+test("gridRecurrenceProfile: a recurring scheduling grid surfaces recurring values + the max", () => {
+  // Two people recur across cells (the calendar layout): Alice 4×, Bob 3×, Cara 1× (summed A+B).
+  const occ = buildOcc(sheetA, sheetB);
+  const { recurringValues, maxCount } = gridRecurrenceProfile(occ);
+  assert.equal(maxCount, 4); // Alice's cross-sheet max (Gift Room also 4, but it still recurs)
+  // Alice/Bob/Dora/Gift Room recur (>1); Cara (1×) does NOT.
+  assert.ok(recurringValues.includes("Alice"));
+  assert.ok(recurringValues.includes("Bob"));
+  assert.ok(!recurringValues.includes("Cara"), "a once-only value must not count as recurring");
+});
+
+test("gridRecurrenceProfile: a normalized roster (every value once) has NO recurrence — not a frequency grid", () => {
+  // A `people`/`payroll`-style roster: each name appears exactly once. There is no "most" to rank,
+  // so the profile reports no recurring values and a max of 1 → selectTallyGridsByKind drops it.
+  const roster = rowsOf("people", [
+    { rowid_anchor: "1", first_name: "Ann", last_name: "Lee" },
+    { rowid_anchor: "2", first_name: "Ben", last_name: "Roy" },
+    { rowid_anchor: "3", first_name: "Cyd", last_name: "Fox" },
+  ]);
+  const occ: OccMap = new Map();
+  accumulateOccurrences(occ, "people", roster);
+  const { recurringValues, maxCount } = gridRecurrenceProfile(occ);
+  assert.equal(maxCount, 1);
+  assert.deepEqual(recurringValues, []);
 });

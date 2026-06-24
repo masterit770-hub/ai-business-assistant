@@ -76,6 +76,26 @@ function hasOccurrenceCue(question: string): boolean {
   return OCCURS_RE.test(question.normalize("NFC").toLowerCase()) || OCCURS_HE.test(question);
 }
 
+// An INTRINSIC-ATTRIBUTE superlative (oldest/youngest/tallest/shortest/biggest…/most senior) —
+// a ranking by a property of the PERSON (age, height, seniority), NOT by how often they occur in
+// the grid. The cell-tally lane answers ONLY frequency-of-occurrence ("appears/scheduled the
+// most"); an attribute ranking it cannot answer (her grid holds no ages/heights), so the engine
+// must fall through to the honest "there is no age data to rank by" — NOT crown the most-scheduled
+// person as "the oldest" (the recorded AD2 RED). This fires even though the dataset is NAMED
+// "schedules" (the bare noun שיבוצים/"schedules" is a dataset/context word, not a frequency cue),
+// so an attribute superlative over the scheduling grid is correctly excluded. GENERAL — a
+// linguistic class of superlative the occurrence tally never answers, not a dataset-specific list.
+const ATTRIBUTE_SUPERLATIVE_RE =
+  /\b(oldest|youngest|tallest|shortest|biggest|smallest|largest|eldest|most senior|most experienced|highest paid|best paid)\b/;
+const ATTRIBUTE_SUPERLATIVE_HE =
+  /(הכי מבוגר|המבוגר|הכי צעיר|הצעיר|הכי גבוה|הגבוה|הכי נמוך|הנמוך|הכי ותיק|הוותיק|הכי מנוסה|הכי גדול|הכי קטן)/;
+function isAttributeSuperlative(question: string): boolean {
+  return (
+    ATTRIBUTE_SUPERLATIVE_RE.test(question.normalize("NFC").toLowerCase()) ||
+    ATTRIBUTE_SUPERLATIVE_HE.test(question)
+  );
+}
+
 /**
  * GRID SHAPE: many columns, most free-text (not numeric) — the layout where a value recurs ACROSS
  * columns (a calendar/scheduling grid). A narrow or mostly-numeric table is a normal SQL aggregate,
@@ -104,6 +124,10 @@ export function isCellTallyQuestion(question: string, table: TableSchema): boole
     /\b(most|fewest|least|top|highest|lowest|busiest|rank|ranked|first)\b/.test(q) ||
     /(הכי|הרבה ביותר|הכי הרבה|הכי מעט|המשובצת|משובצת הכי|הכי משובץ|הנפוץ|השכיח|התדירות|ביותר)/.test(question);
   if (!(ranks && hasOccurrenceCue(question))) return false;
+  // An INTRINSIC-ATTRIBUTE superlative (oldest/youngest/tallest…) is NOT a frequency ranking — the
+  // tally cannot answer it (no age/height data), so it must NOT fire even though the question
+  // mentions the scheduling grid. Excluding it keeps the honest "no age data" path for AD2.
+  if (isAttributeSuperlative(question)) return false;
   return isGridShaped(table);
 }
 
@@ -131,6 +155,64 @@ export function isCellCountQuestion(question: string, table: TableSchema): boole
   if (isRanking) return false;
   if (!hasOccurrenceCue(question)) return false;
   return isGridShaped(table);
+}
+
+/**
+ * Decide whether THIS question is a FILTER-BY-COUNT over a grid: "who is scheduled EXACTLY N times"
+ * / "מי משובצת בדיוק N פעמים" / "which people appear N times". It asks for the SET of entities whose
+ * occurrence frequency EQUALS a specific number N — not a ranking, not one named value's count. A
+ * single guarded SELECT can't express it (the count is across the grid's many columns), so it needs
+ * the cell machinery: tally occurrences, then keep the classified entities whose count == N. The
+ * target N is extracted by `filterTargetCount` below. Conservative: requires an EXACT-COUNT cue
+ * (exactly/בדיוק/precisely) + a bare integer + an occurrence cue + a grid shape, and must NOT be a
+ * ranking. Pure + exported (no LLM).
+ */
+export function isCellFilterByCountQuestion(question: string, table: TableSchema): boolean {
+  const q = question.normalize("NFC").toLowerCase();
+  // An EXACT-COUNT cue (EN + HE): "exactly N", "precisely N", "בדיוק N".
+  const exact = /\b(exactly|precisely|just)\b/.test(q) || /(בדיוק|בדיוק־|במדויק)/.test(question);
+  if (!exact) return false;
+  // Must NAME a target integer to filter by (the N).
+  if (filterTargetCount(question) == null) return false;
+  // Not a superlative ranking (those go to the tally lane).
+  const isRanking =
+    /\b(most|fewest|least|top|highest|lowest|busiest)\b/.test(q) ||
+    /(הכי הרבה|הכי מעט|הרבה ביותר|הכי|ביותר)/.test(question);
+  if (isRanking) return false;
+  if (!hasOccurrenceCue(question)) return false;
+  return isGridShaped(table);
+}
+
+/**
+ * Extract the TARGET integer N a filter-by-count question filters on ("exactly 5 times" → 5). We
+ * take the first bare integer in the question (the count words "exactly/בדיוק" sit beside it). A
+ * money/decimal/year is not a plain occurrence count. Returns null when there is no plain integer.
+ * Pure + exported so the parse is unit-tested.
+ */
+export function filterTargetCount(question: string): number | null {
+  // First standalone 1–3 digit integer not part of a larger number/decimal/currency.
+  const m = question.match(/(?<![\d.,$])\d{1,3}(?![\d.,])/);
+  if (!m) return null;
+  const n = Number(m[0]);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * THE PURE FILTER-BY-COUNT (no LLM, no DB). Given the accumulated occurrences, the classified
+ * entity set (the asked-for KIND), and a target count N, return the entities whose occurrence count
+ * EQUALS N, sorted, each with its real table-qualified anchors for citation. Empty when none match
+ * (an HONEST "no one is scheduled exactly N times" — never fabricated). Pure + exported.
+ */
+export function entitiesAtCount(occ: OccMap, entities: string[], n: number): TallyEntry[] {
+  const entitySet = new Set(entities);
+  return [...occ.keys()]
+    .filter((v) => entitySet.has(v) && (occ.get(v)?.count ?? 0) === n)
+    .map((entity) => {
+      const e = occ.get(entity)!;
+      const anchors = [...e.anchors.values()].sort((a, b) => a.table.localeCompare(b.table) || a.id - b.id);
+      return { entity, count: e.count, rowIds: anchors.map((a) => a.id), anchors };
+    })
+    .sort((a, b) => a.entity.localeCompare(b.entity));
 }
 
 /**
@@ -166,6 +248,135 @@ export function tableScopeForTally(question: string, gridTables: string[]): stri
   // If the user named one/some specific sheet(s), scope to those; otherwise span them ALL
   // (the system-wide / no-month default — the TRUE cross-sheet max).
   return named.length > 0 ? named : gridTables;
+}
+
+/**
+ * A candidate grid's RECURRENCE PROFILE for a tally question: the distinct cell values that
+ * RECUR (occur more than once across the grid's cells), with their max occurrence. Computed in
+ * CODE (deterministic). A grid where NOTHING recurs (every value occurs once — a normalized
+ * relational table like a `people`/`payroll` roster) has no "most frequent X" to rank, so it is
+ * NOT a frequency grid for a tally question and must not be selected. Pure (no LLM).
+ */
+export type GridRecurrence = { table: string; recurringValues: string[]; maxCount: number };
+export function gridRecurrenceProfile(occ: OccMap): { recurringValues: string[]; maxCount: number } {
+  let maxCount = 0;
+  const recurringValues: string[] = [];
+  for (const [value, e] of occ) {
+    if (e.count > 1) recurringValues.push(value);
+    if (e.count > maxCount) maxCount = e.count;
+  }
+  return { recurringValues, maxCount };
+}
+
+/**
+ * GRID SELECTION BY ENTITY KIND — the fix for the cross-corpus mis-routing.
+ *
+ * THE RECORDED MISS (live RED): an English superlative "who is the most active PERSON" over a
+ * DEMO account (whose catalog holds BOTH her uploaded scheduling sheets AND the bundled demo
+ * corpus — contracts/payroll/people) tallied the WRONG grid. The Hebrew phrasing narrows to her
+ * scheduling family via a Hebrew name cue; the English phrasing has no such cue, so candidate-grid
+ * selection fell to ALL grid-shaped tables and the planner+family-narrowing landed on the bundled
+ * `contracts` grid — answering with COMPANY names ("Blogspan and Brainsphere") instead of the
+ * most-scheduled PERSON (נגה מאירסון @29).
+ *
+ * THE GENERAL FIX: the candidate grid must match the QUESTION'S ENTITY KIND. We already have the
+ * question-driven classifier (it reads the question to decide PERSON vs ACTIVITY/PLACE). Here we
+ * use it to SCORE/SELECT the candidate grid, not just to classify within an already-chosen one:
+ *   • A grid qualifies only if some value the classifier judges to be the asked-for KIND actually
+ *     RECURS (count > 1). This rejects `contracts` (its recurring values are COMPANIES, not the
+ *     asked-for PERSON kind) AND rejects a normalized `people`/`payroll` roster (person-names, but
+ *     each appears once → no recurrence → no "most").
+ *   • Among the qualifying grids we keep the strongest recurrence family — but a grid only enters
+ *     "strongest" if it qualified on KIND, so a contracts grid with a high company recurrence can
+ *     never win a PERSON question.
+ * So an English "most active person" lands on the people-scheduling grid the same way the Hebrew
+ * family-narrowing does — keyed off the question's entity kind + the grid's CONTENT, never a
+ * hardcoded table or corpus name. When all candidates already share one family (the normal Hebrew
+ * path), this is a no-op fast-path: nothing to disambiguate, no extra LLM call.
+ *
+ * Fail-open: if the kind classifier can't decide for any grid, return the candidates unchanged
+ * (the prior behaviour) — selection narrows, it never sinks an answerable question.
+ */
+export async function selectTallyGridsByKind(
+  question: string,
+  candidateTables: string[],
+  catalog: TableSchema[],
+  scope?: CatalogScope
+): Promise<{ tables: string[]; usages: ChatUsage[] }> {
+  const usages: ChatUsage[] = [];
+  // Fast-path: 0/1 candidate, or all candidates already in ONE name-family → nothing to
+  // disambiguate. The single-corpus (normal Hebrew) path pays no extra LLM cost.
+  if (candidateTables.length <= 1) return { tables: candidateTables, usages };
+
+  // Per-grid recurrence profile (pure, deterministic) — the distinct values that recur + the max.
+  const profiles: { table: string; occ: OccMap; recurringValues: string[]; maxCount: number }[] = [];
+  for (const table of candidateTables) {
+    if (!catalog.some((c) => c.table === table)) continue;
+    let rows: SqlRow[];
+    try {
+      rows = selectWithIds(`SELECT * FROM "${table}" LIMIT ${HARD_ROW_CAP}`, table, catalog, scope);
+    } catch {
+      continue;
+    }
+    const occ: OccMap = new Map();
+    accumulateOccurrences(occ, table, rows);
+    const { recurringValues, maxCount } = gridRecurrenceProfile(occ);
+    profiles.push({ table, occ, recurringValues, maxCount });
+  }
+  if (profiles.length <= 1) return { tables: profiles.map((p) => p.table), usages };
+
+  // ONE classifier call over the UNION of every grid's RECURRING values — which of them are the
+  // asked-for KIND? We classify only recurring values (the ones that could ever be a "most"), and
+  // only ONCE for the whole pool, so the cost is a single LLM call regardless of how many grids the
+  // demo catalog holds (the cross-corpus case has ~10+ grids — per-grid calls would be too slow).
+  const unionRecurring = [...new Set(profiles.flatMap((p) => p.recurringValues))];
+  if (unionRecurring.length === 0) return { tables: candidateTables, usages };
+  const { entities, usage } = await classifyEntities(question, unionRecurring);
+  usages.push(usage);
+  if (entities.length === 0) return { tables: candidateTables, usages }; // classifier hiccup → fail-open
+  const kindSet = new Set(entities);
+  // A grid qualifies iff some value the classifier judged to be the asked-for KIND actually RECURS
+  // (count > 1) IN THAT GRID. The strongest such recurrence is the grid's real "most X" signal.
+  const qualifying: { table: string; kindRecurrence: number }[] = [];
+  for (const p of profiles) {
+    let kindRecurrence = 0;
+    for (const v of p.recurringValues) {
+      if (!kindSet.has(v)) continue;
+      const c = p.occ.get(v)?.count ?? 0;
+      if (c > kindRecurrence) kindRecurrence = c;
+    }
+    if (kindRecurrence > 1) qualifying.push({ table: p.table, kindRecurrence });
+  }
+
+  // Fail-open: if NO grid qualified on kind (the classifier couldn't separate them), keep all the
+  // candidates — never sink an answerable question on a classifier hiccup.
+  if (qualifying.length === 0) return { tables: candidateTables, usages };
+
+  // Select the qualifying grids in the SAME name-family as the strongest-recurrence qualifier — so
+  // a multi-sheet scheduling family is tallied together (the true cross-sheet max), while the
+  // wrong-corpus grids (contracts/payroll) are dropped. Family = shared distinguishing name segment.
+  qualifying.sort((a, b) => b.kindRecurrence - a.kindRecurrence);
+  const best = qualifying[0].table;
+  const chosen = qualifying
+    .filter((q) => q.table === best || shareGridFamily(best, q.table, question))
+    .map((q) => q.table);
+  return { tables: chosen.length > 0 ? chosen : [best], usages };
+}
+
+// Do two grid table names share a distinguishing name segment (the same family of sheets), with
+// any segment the QUESTION itself mentions excluded (a scope word, not a family identifier)? Mirror
+// of text-to-sql's shareNameFamily, kept local so grid SELECTION stays inside the tally module.
+// Pure. Splits each sanitized identifier on `_`/digits, keeps segments of length ≥ 3.
+function shareGridFamily(a: string, b: string, question: string): boolean {
+  const q = question.normalize("NFC").toLowerCase();
+  const segs = (t: string) =>
+    t.normalize("NFC").toLowerCase().split(/[_\d]+/).filter((s) => s.length >= 3);
+  const sb = new Set(segs(b));
+  for (const s of segs(a)) {
+    if (q.includes(s)) continue;
+    if (sb.has(s)) return true;
+  }
+  return false;
 }
 
 /**

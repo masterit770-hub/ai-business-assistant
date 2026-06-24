@@ -709,6 +709,85 @@ const QUESTIONS = [
     },
   },
 
+  // ── DV5 FILTER-BY-COUNT — "who is scheduled EXACTLY N times" ──────────────────────────────────
+  {
+    // Ground truth (exact cell tally over her real August sheet, owner 3d1ca025): the PEOPLE at
+    // exactly 5 occurrences are the 7 AUG_TOP_LEADERS (the activity "הרכב + ימי הולדת" is also @5 but
+    // is a place/activity, never a person). The filter-by-count lane must return that exact SET,
+    // cited — never a fabricated member, never an activity-as-person.
+    id: "HE/sched-exactly-5-august", ctx: SCHED, mustGround: false,
+    q: "מי משובצת בדיוק 5 פעמים באוגוסט?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded exact-count set, got mode=${res.mode}` };
+      // States the target count 5.
+      if (!/(?<![\d.,])5(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state the target count (5)" };
+      // Names the real exactly-5 people: require a strong majority (≥5 of 7) so a paraphrase that
+      // drops one isn't false-failed, but a near-empty/wrong answer is. No activity-as-person.
+      const named = AUG_TOP_LEADERS.filter((n) => a.includes(n));
+      if (named.length < 5) return { ok: false, why: `named only ${named.length}/7 of the exactly-5 people` };
+      const act = AUG_ACTIVITIES.find((x) => a.includes(x));
+      if (act) return { ok: false, why: `named an ACTIVITY/PLACE ("${act}") as a person scheduled 5 times` };
+      return { ok: true };
+    },
+  },
+
+  // ── EG4 SPARSE / NO DETERMINABLE RANKING — honest, no fabricated winner ───────────────────────
+  {
+    // Her intake/assessment grids (עותק_של_שם_צעיר…) are NOT recurrence grids — names appear once,
+    // there is no "most scheduled" to rank. A ranking question scoped to that kind of content must
+    // be HONEST ("there's no schedule-count to rank by here"), never crown a fabricated winner.
+    // This is the sparse/no-determinable-ranking row: the honest floor (no ungrounded fabrication)
+    // plus "does not fabricate a single crowned leader with a count it can't support."
+    id: "HE/sched-no-ranking-intake", ctx: SCHED, mustGround: false,
+    q: "מי הכי פעילה בתיק הצעיר במסלול דניאלי?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      // If it grounded a frequency ranking, it MUST be self-consistent (its cited rows back the
+      // stated leader/count). If it can't determine a ranking, it must say so honestly — never crown
+      // a single name with an invented frequency. A confident "X היא הכי פעילה, N פעמים" with no
+      // self-consistent backing is the fabrication we forbid.
+      if (isGroundedClean(res)) {
+        const sc = selfConsistencyCheck(res, "most");
+        if (!sc.ok) return sc;
+        return { ok: true };
+      }
+      // Not grounded → must be an honest limit, not a fabricated crowning.
+      if (!saysNotInDocs(a) && !ACKNOWLEDGES_FILE_HE.test(stripMd(a)) && !ACKNOWLEDGES_FILE_EN.test(stripMd(a))) {
+        return { ok: false, why: "neither grounded nor an honest acknowledgment of her file" };
+      }
+      return { ok: true };
+    },
+  },
+
+  // ── AD4 NON-EXISTENT NAME → HONEST 0, never invent a count ────────────────────────────────────
+  {
+    // A made-up name that is in NONE of her sheets. The cell-count lane must report an HONEST 0 /
+    // "not in your file" — NEVER a fabricated non-zero count. (The name below is invented; if it
+    // ever appears in real data this asserts the honest-absence behavior regardless.)
+    id: "HE/sched-count-nonexistent", ctx: SCHED, mustGround: false,
+    q: "כמה פעמים משובצת זלדה נונאקזיסטנט?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (DENIES_UPLOAD.test(stripMd(a))) return { ok: false, why: "denied her file exists" };
+      // A fabricated non-zero count for the made-up name. Honest answers say 0 / not found.
+      const claimsNonZero = /([1-9]\d*)\s*(פעמים|times)/.test(a);
+      const saysZeroOrAbsent =
+        /(?<![\d.,])0(?!\d)\s*(פעמים|times)/.test(a) ||
+        /(לא נמצא|אינה מופיע|לא מופיע|אינה משובצת|לא משובצת|not (found|in|present)|does not appear|no (record|mention|occurrence))/i.test(a) ||
+        saysNotInDocs(a);
+      if (claimsNonZero && !saysZeroOrAbsent) {
+        return { ok: false, why: "fabricated a non-zero count for a name that is not in her sheets" };
+      }
+      if (!saysZeroOrAbsent) return { ok: false, why: "did not honestly state the name is absent / count 0" };
+      return { ok: true };
+    },
+  },
+
   // ─────────────── MERIDIAN DEMO — Carter case file (bundled) ───────────────
   {
     id: "EN/child-support", ctx: DEMO_ADMIN, mustGround: true,
