@@ -16,7 +16,13 @@ import { supabaseEnabled } from "./supabase.ts";
 import { embedQuery } from "./embeddings.ts";
 import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable, isHipaaNotConfigured, isCloudProviderNotConfigured, isCloudProviderAuth, isModelRunFailure } from "./llm.ts";
 import { sqlToken, pdfToken, extractCitationTokens, resolvableTokenSet } from "./citations.ts";
-import { validateAnswer, salvageGroundedAnswer, type Evidence } from "./validate-answer.ts";
+import {
+  validateAnswer,
+  validateCellTallyAnswer,
+  salvageGroundedAnswer,
+  type Evidence,
+  type VerifiedTopGroup,
+} from "./validate-answer.ts";
 import { DOCUMENTS } from "./documents.ts";
 import { runtimeDocs } from "./runtime-store.ts";
 import { getSetting } from "./settings.ts";
@@ -296,6 +302,9 @@ async function runAnswerPipeline(
   // The cell-tally lane's VERIFIED top-group summary (exact counts), passed to grounded
   // generation as authoritative evidence so the answer names every co-leader with its real count.
   let verifiedTally: string | undefined;
+  // Its STRUCTURED form (exact max + full tie), used by the content-fidelity gate below to FAIL a
+  // tie-collapsed or non-max-as-max count answer (a wrong count must never get a green check).
+  let verifiedTopGroup: VerifiedTopGroup | undefined;
   if (route.sources.includes("structured")) {
     try {
       const structured = await answerStructured(question, includeBundled, structuredScope);
@@ -304,6 +313,7 @@ async function runAnswerPipeline(
       rows.push(...structured.rows);
       structuredSql = structured.sql;
       verifiedTally = structured.verifiedTally;
+      verifiedTopGroup = structured.verifiedTopGroup;
       if (!structured.ok || structured.rows.length === 0) structuredNote = structured.note;
     } catch (e) {
       // A MODEL-RUN FAILURE (keyless/bad-key/unreachable backend) must NOT be swallowed
@@ -817,6 +827,48 @@ async function runAnswerPipeline(
         topScore,
       }),
     };
+  }
+
+  // ── CELL-TALLY CONTENT-FIDELITY GATE (the count-regression fix) ───────────────────
+  // The general gate above only checks CITATION fidelity, so a COUNT answer that collapses a tie
+  // (crowns one leader, demotes the co-leaders) or reports a NON-MAX as the max passes it — the
+  // wrong number is itself a real evidence value. That is the dangerous green-check the live
+  // regression exposed. When the answer came from the cell-tally lane (verifiedTopGroup present),
+  // we additionally require the restatement to be FAITHFUL to the code-computed tally: it must
+  // state the verified MAX count and name EVERY tied leader. If it isn't, we regenerate ONCE with
+  // the verified tally re-emphasized; if it STILL isn't faithful, we FAIL the gate so the user
+  // sees the honest warning instead of a confidently-wrong count with a green check.
+  if (verifiedTopGroup && verifiedTally) {
+    let tallyReasons = validateCellTallyAnswer(answer, verifiedTopGroup).reasons;
+    if (tallyReasons.length > 0) {
+      const regenStart = now();
+      const regen = await generateGrounded(
+        question,
+        evRows,
+        evChunks,
+        structuredNote,
+        TODAY,
+        stylePreamble,
+        convo,
+        verifiedTally
+      );
+      tel.generationMs += now() - regenStart;
+      tel.usages.push(regen.usage);
+      const regenAnswer = parseSourceFlag(regen.text).text;
+      const regenTallyReasons = validateCellTallyAnswer(regenAnswer, verifiedTopGroup).reasons;
+      // Adopt the regenerated answer iff it is now tally-faithful AND still citation-clean.
+      if (regenTallyReasons.length === 0 && validateAnswer(regenAnswer, evidence).ok) {
+        answer = regenAnswer;
+        tallyReasons = [];
+        reasons = [];
+        validationOk = true;
+      } else {
+        // Still unfaithful → do NOT show a green check on a wrong/collapsed count. Surface the
+        // fidelity failure so the answer is flagged (red banner) rather than trusted.
+        reasons = [...reasons, ...regenTallyReasons];
+        validationOk = false;
+      }
+    }
   }
 
   return {
@@ -1640,7 +1692,7 @@ GROUNDING RULES (these apply whenever the SOURCE flag is "documents", and cannot
   const user = `Today's date is ${today}. Any filtering in the structured evidence (e.g. "next 90 days") was already computed relative to today, so the rows below are the answer set — do not say the date is unknown.
 ${convo ? `\n${convo}\n` : ""}
 Question: ${question}
-${structuredNote ? `\nSTRUCTURED LANE NOTE: ${structuredNote}. (If this means the data has no column for what's asked, say so honestly and report what the data DOES contain.)\n` : ""}${verifiedTally ? `\nVERIFIED TALLY (exact occurrence counts computed by code over EVERY cell of the table; the listed entities were already filtered to the kind the question asks about — these ARE the ranking figures, state the top group with these exact counts, cited to the structured rows): ${verifiedTally}\n` : ""}
+${structuredNote ? `\nSTRUCTURED LANE NOTE: ${structuredNote}. (If this means the data has no column for what's asked, say so honestly and report what the data DOES contain.)\n` : ""}${verifiedTally ? `\nVERIFIED TALLY (THE AUTHORITATIVE ANSWER — exact occurrence counts computed by code over EVERY cell of the relevant sheet(s), summed per entity; the listed entities were already filtered to the kind the question asks about). The leading tag is the DIRECTION: "[most]" = the question asks who is scheduled the MOST (highest count); "[fewest]" = who is scheduled the LEAST (lowest count). This block IS the ranking — you MUST restate it FAITHFULLY and you MUST NOT re-count, re-rank, or override it from the individual structured rows below:\n  ${verifiedTally}\nRULES FOR USING THE TALLY (mandatory):\n  • The entities listed BEFORE the first "; next:" are THE answer (the most-scheduled for [most], the least-scheduled for [fewest]) — ALL of them, at the SAME count. Name EVERY one of them with that exact count, and cite each to a structured row token from the evidence below.\n  • If MORE THAN ONE entity is listed before "; next:", they are a genuine TIE — say so explicitly and do NOT crown a single winner or demote any co-leader. If EXACTLY ONE entity is listed before "; next:", that ONE is the sole answer — do NOT invent a tie, and do NOT describe the lower "next:" entities as tied with it; they are runners-up at a different count.\n  • State the answer count EXACTLY as written in this block. NEVER substitute a different number from some other sheet/row — this tally already summed across the relevant sheets, so its count IS the true extreme. The STRUCTURED EVIDENCE rows are per-occurrence citation anchors only; the TALLY is the verdict.\n` : ""}
 STRUCTURED EVIDENCE (SQLite query result rows):
 ${structuredEvidence}
 

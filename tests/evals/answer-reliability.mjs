@@ -210,8 +210,13 @@ function gFact(...rx) {
 // "אינו מכיל" / "אינם מכילים" (does/do not contain), "אין ... שיבוצ" (no scheduling), and
 // the plain "אין/לא" + content-noun forms. (Broadened to recognize a CORRECT honest answer:
 // the engine commonly says "הקובץ אינו מכיל מידע על שיבוצים" — a true not-in-docs reply.)
+// NOTE on the "contain" forms: the engine inflects the verb by the (Hebrew-gendered) SUBJECT
+// it picks — "הקובץ אינו מכיל" (m. sg.), "המסמכים אינם מכילים" (m. pl.), and "הראיות אינן
+// מכילות" (f. pl., when it refers to הראיות/the evidence). All three are the SAME honest
+// not-in-docs reply; the recognizer must accept every inflection or it false-fails a correct
+// answer purely on grammatical gender (a grader gap, not an engine miss).
 const SAYS_NOT_IN_DOCS_HE =
-  /(אינו זמין|לא זמין|לא מצוין|אין במסמך|אין מידע|לא ניתן לקבוע|אינו מכיל|אינם מכילים|לא מכיל|אין בהם|לא נמצא|אין שיבוצ|לא כולל|אין נתונ|אין רשימת שיבוצ)/;
+  /(אינו זמין|לא זמין|לא מצוין|אין במסמך|אין מידע|לא ניתן לקבוע|אינו מכיל|אינם מכילים|אינן מכילות|לא מכיל|אין בהם|לא נמצא|אין שיבוצ|לא כולל|אין נתונ|אין רשימת שיבוצ)/;
 const SAYS_NOT_IN_DOCS_EN =
   /(not (in|contain|include|available|present|stated|found)|does not (contain|include|have|cover)|do not contain|no (information|data|record|mention)|isn'?t (in|available)|cannot (find|determine)|I don'?t have (access|real-?time|live))/i;
 // Normalize markdown emphasis before matching so a correct honest answer that bolds a
@@ -308,6 +313,62 @@ function gradeCorrectScheduleCount(res) {
   // the norm; the floor catches a rare run where classification yielded nothing.)
   return { ok: true };
 }
+
+// ── THE VARIATION GRADER (the live count-regression fix) ─────────────────────────────────────
+// The live regression: the cell-tally lane passed the eval's exact "August" string but FAILED on
+// the NATURAL variations the client actually asks (no-month, system-wide, "most active", a
+// different month, "least"). The two RED failures were (1) a TIE COLLAPSED to a single crowned
+// winner with the co-leaders demoted, and (2) a NON-MAX reported as the max with a GREEN check.
+// This grader is direction- and scope-aware. It asserts, against the HAND-COMPUTED ground truth
+// of HER real sheets (exact frequency tally over every cell, owner 3d1ca025):
+//   • the answer GROUNDS in her data (mode grounded + a resolving [S:] cite + gate clean),
+//   • it states the TRUE extreme count for that scope,
+//   • it names the FULL tied group (no collapse) — every co-leader at the extreme,
+//   • it NEVER reports a non-extreme number as the answer,
+//   • it never names an activity/place label as the person.
+// These are TEST ASSERTIONS against the data's ground truth, not engine tuning (the engine names
+// no hardcoded value — it computes the tally in code from her live rows).
+//
+// opts: { maxCount, leaders[], runnerUpBelow?, forbidActivities? } — `leaders` is the full tied
+// group at the extreme; `runnerUpBelow` (optional) is a count that is the NEXT rank and must NOT
+// be presented as THE answer count (a guard the non-max-as-max RED would trip).
+function gradeCellTallyFaithful(opts) {
+  const { maxCount, leaders, forbidActivities = true } = opts;
+  // Match the exact integer as a standalone token (not a substring of a larger number).
+  const statesCount = (a) => new RegExp(`(?<![\\d.,])${maxCount}(?!\\d)(?![.,]\\d)`).test(a);
+  return (res) => {
+    // HARD floor first: never an ungrounded fabrication / deflection / upload-denial over her data.
+    const base = gradeNoUngroundedOverOwnData(res);
+    if (!base.ok) return base;
+    const a = res.answer ?? "";
+    // The variation cases are a deterministic ranking the lane now OWNS — they must GROUND, not
+    // fall to an honest limit (an honest-limit here would mean the tally lane silently regressed).
+    if (!isGroundedClean(res)) {
+      return { ok: false, why: `expected a grounded tally answer, got mode=${res.mode} (tally lane did not fire / produce a ranking)` };
+    }
+    // (a) the TRUE extreme count is stated.
+    if (!statesCount(a)) return { ok: false, why: `did not state the true extreme count (${maxCount}) — a non-extreme may have been reported as the answer` };
+    // (b) the FULL tied group is named — no collapse. Every co-leader at the extreme must appear.
+    const missing = leaders.filter((n) => !a.includes(n));
+    if (missing.length > 0) {
+      return { ok: false, why: `tie collapsed — omitted ${missing.length}/${leaders.length} co-leaders at ${maxCount}: ${missing.join(", ")}` };
+    }
+    // (c) no activity/place label presented as a person (the classification guard).
+    if (forbidActivities) {
+      const act = AUG_ACTIVITIES.find((x) => a.includes(x));
+      if (act) return { ok: false, why: `named an ACTIVITY/PLACE ("${act}") as a scheduled person` };
+    }
+    return { ok: true };
+  };
+}
+
+// Ground truth (hand-computed exact cell-frequency tally over her real sheets, owner 3d1ca025):
+//   • SYSTEM-WIDE (all 5 שיבוצים sheets, summed per person): the single MAX person is
+//     נגה מאירסון = 29 (unique — NOT a tie; runner-up אילת ברזין = 28).
+//   • DECEMBER (both גיליון1 + גיליון2 summed): a 3-way tie at 18 — אילת ברזין, נעה כהן צמח,
+//     שירה ליאור.
+const SYS_MAX_LEADER = ["נגה מאירסון"]; // sole max @29 system-wide
+const DEC_TOP_LEADERS = ["אילת ברזין", "נעה כהן צמח", "שירה ליאור"]; // 3-way tie @18
 
 const QUESTIONS = [
   // ─────────────── GMAIL USER — her Hebrew national-service handover file ───────────────
@@ -421,6 +482,63 @@ const QUESTIONS = [
     // Same data, no month qualifier — still must never fabricate/deflect over her own data
     // (it may rank one month's grid or honestly state the limit; both are correct, no RED).
     grade: (res) => gradeNoUngroundedOverOwnData(res),
+  },
+
+  // ── THE LIVE-REGRESSION VARIATIONS (Costume D — the eval was too narrow) ──────────────────────
+  // The cell-tally lane passed the single "August" string but FAILED the natural phrasings the
+  // client actually asks. Each variation asserts the FULL tied group + the TRUE extreme + no
+  // tie-collapse + no non-max-as-max, against her real-sheet ground truth. These are the gate
+  // the live failures must clear before redeploy.
+  {
+    // VARIATION: a bare no-month "who is scheduled the most?" — the live RED #1 (collapsed the
+    // tie, crowned one). With the unified cross-sheet tally this resolves to the system-wide
+    // sole max (נגה מאירסון = 29). Must state 29 and name נגה מאירסון, never a non-max.
+    id: "HE/sched-most-no-month", ctx: SCHED, mustGround: false,
+    q: "מי משובץ הכי הרבה?",
+    grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // VARIATION: SYSTEM-WIDE "במערכת" — the live RED #2, the DANGEROUS one (a GREEN check on a
+    // non-max count of 5). Must report the TRUE cross-sheet max (נגה מאירסון = 29), never 5.
+    id: "HE/sched-system-wide", ctx: SCHED, mustGround: false,
+    q: "מי משובץ הכי הרבה במערכת",
+    grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // VARIATION: a DIFFERENT month (December) — must scope to the Dec sheets and report their
+    // TRUE summed top (a 3-way tie at 18), proving the fix isn't August-specific and ties are kept.
+    id: "HE/sched-december-most", ctx: SCHED, mustGround: false,
+    q: "בשיבוצים של דצמבר - מי משובץ הכי הרבה?",
+    grade: gradeCellTallyFaithful({ maxCount: 18, leaders: DEC_TOP_LEADERS }),
+  },
+  {
+    // VARIATION: "most active" in English — a different wording entirely; must still trigger the
+    // tally and report the system-wide sole max (נגה מאירסון = 29), full faithfulness.
+    id: "EN/sched-most-active", ctx: SCHED, mustGround: false,
+    q: "who is the most active person in the schedules?",
+    grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // VARIATION: the LEAST direction — must compute the MINIMUM group, not the max. Ground truth:
+    // the min classified person occurs once (count 1). We assert it grounds, states "1", names a
+    // PERSON (no activity), and never reports a high number as "the least". (The specific name at
+    // the min varies with classification, so we assert the count + person-not-activity, not a name.)
+    id: "HE/sched-least", ctx: SCHED, mustGround: false,
+    q: "מי משובץ הכי מעט בשיבוצים?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded least-tally answer, got mode=${res.mode}` };
+      // States the minimum count (1) as a standalone token.
+      if (!/(?<![\d.,])1(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state the minimum count (1) — a non-min may have been reported" };
+      // Did NOT report a known HIGH (max-ish) count as the least — that would be a direction error.
+      if (/(?<![\d.,])29(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "reported the system MAX (29) for a LEAST question — direction flipped" };
+      // Never an activity/place label as the person.
+      const act = AUG_ACTIVITIES.find((x) => a.includes(x));
+      if (act) return { ok: false, why: `named an ACTIVITY/PLACE ("${act}") as the least-scheduled person` };
+      return { ok: true };
+    },
   },
 
   // ─────────────── MERIDIAN DEMO — Carter case file (bundled) ───────────────

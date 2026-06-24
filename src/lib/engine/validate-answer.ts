@@ -356,3 +356,66 @@ function parseNumber(s: string): number | null {
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
+
+// ── CELL-TALLY CONTENT-FIDELITY GATE ────────────────────────────────────────────
+// The general validateAnswer() above checks CITATION fidelity (does every cited figure
+// appear somewhere in the evidence) — it cannot tell that a COUNT answer collapsed a tie or
+// reported a NON-MAX as the max, because the wrong number (5) is itself a real evidence value.
+// That is exactly the dangerous green-check the live regression exposed: "Rina = 5" passed the
+// citation gate while the true max was 10 and the top was a 7-way tie.
+//
+// This gate closes that gap. It runs ONLY for an answer produced by the cell-tally lane (when a
+// `verifiedTopGroup` is present — the exact code-computed max count + the FULL list of tied
+// leaders). It FAILS the answer unless the restatement is FAITHFUL to that verified tally:
+//   • The verified MAX COUNT must be stated as the leaders' count (so a non-max number can never
+//     be presented as the maximum — the system-wide "5 is the most" lie fails).
+//   • EVERY tied leader must be named (so a tie is never collapsed to a single crowned winner —
+//     the "Rina, 5 / the rest 4 each" lie fails).
+// It is deliberately CONTENT-level (names + the max number), not phrasing-level, so it is
+// language-agnostic (the leaders/counts are matched verbatim against the answer text, which works
+// for Hebrew and English alike) and does not over-reject a faithful restatement that adds prose.
+//
+// Pure + exported so it is unit-tested deterministically without an LLM: pass a crafted answer
+// string + a verified top group, assert a tie-collapsed / non-max answer FAILS and a faithful
+// one PASSES.
+export type VerifiedTopGroup = { maxCount: number; leaders: string[] };
+
+export function validateCellTallyAnswer(
+  answer: string,
+  top: VerifiedTopGroup
+): ValidationResult {
+  const reasons: string[] = [];
+  // Empty/degenerate verified group → nothing to enforce (defensive; the lane never sets this).
+  if (!top || top.leaders.length === 0 || !Number.isFinite(top.maxCount)) {
+    return { ok: true, reasons, unresolved: [] };
+  }
+  const norm = answer.normalize("NFC");
+
+  // (1) The verified EXTREME COUNT must appear as a standalone number in the answer (the max for a
+  //     "most" question, the min for a "least" question — `maxCount` holds the asked-for extreme).
+  //     The lane's whole job is to state that real extreme count; an answer that never states it
+  //     (because it concluded with some other number as the winner) is unfaithful. We match the
+  //     exact integer as a token (not a substring of a larger number) so "10" isn't met by "100".
+  // Match the exact integer as a standalone number: not preceded by a digit (or a decimal/thousand
+  // separator that is itself attached to digits), and not followed by a digit or by a separator
+  // THAT IS FOLLOWED BY A DIGIT (so "29." at a sentence end still matches, while "291" and
+  // "29.5" do not). A bare trailing period/comma is punctuation, not a number boundary.
+  const maxRe = new RegExp(`(?<![\\d.,])${top.maxCount}(?!\\d)(?![.,]\\d)`);
+  if (!maxRe.test(norm)) {
+    reasons.push(
+      `cell-tally answer does not state the verified extreme occurrence count (${top.maxCount}) — a different count was reported as the answer`
+    );
+  }
+
+  // (2) EVERY verified tied leader must be named verbatim. Collapsing a tie — crowning one leader
+  //     and demoting the co-leaders (or omitting them) — is the reported failure. We require all of
+  //     them to appear; a faithful answer names the whole tied group.
+  const missing = top.leaders.filter((name) => !norm.includes(name.normalize("NFC")));
+  if (missing.length > 0) {
+    reasons.push(
+      `cell-tally answer omits ${missing.length} of the ${top.leaders.length} tied leaders at the maximum count (${missing.join(", ")}) — the tie was collapsed`
+    );
+  }
+
+  return { ok: reasons.length === 0, reasons, unresolved: [] };
+}

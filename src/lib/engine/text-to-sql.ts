@@ -23,7 +23,11 @@ import {
   type SqlRow,
 } from "./structured-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
-import { isCellTallyQuestion, tallyCellOccurrences } from "./cell-tally.ts";
+import {
+  isCellTallyQuestion,
+  tallyCellOccurrencesAcross,
+  tableScopeForTally,
+} from "./cell-tally.ts";
 
 // `||` (not `??`) so an empty env value ("") falls through to the real date instead
 // of producing a broken date filter like date('', '+90 days') → NULL.
@@ -50,6 +54,13 @@ export type StructuredResult = {
   // signal): this is AUTHORITATIVE evidence the grounded generator restates so it names every
   // co-leader, not just the one cited row. Undefined when the tally lane didn't run.
   verifiedTally?: string;
+  // The STRUCTURED form of that verified top group — the exact max count and the FULL list of
+  // tied leaders (entity names). The content-fidelity gate (validateCellTallyAnswer) uses this to
+  // FAIL any answer whose stated max/leaders don't match the code-computed tally (a collapsed tie
+  // or a non-max-as-max). Undefined when the cell-tally lane didn't run. The two fields move
+  // together: `verifiedTally` is what the model restates; `verifiedTopGroup` is what the gate
+  // checks the restatement AGAINST.
+  verifiedTopGroup?: { maxCount: number; leaders: string[] };
   usages: ChatUsage[];
 };
 
@@ -209,33 +220,61 @@ export async function answerStructured(
   let primaryTable: string | null = null;
   let primarySql: string | null = null;
   let verifiedTally: string | undefined;
+  let verifiedTopGroup: { maxCount: number; leaders: string[] } | undefined;
   const failures: string[] = [];
 
-  for (const table of plan.tables) {
-    const schema = catalog.find((c) => c.table === table);
-    // CELL-TALLY LANE: a "which <entity> recurs the MOST" question over a WIDE/GRID table that
-    // a single SELECT can't express (e.g. a scheduling grid: a person spread across many day
-    // columns). Run it FIRST for such a table — exact code-tally + model classification — so we
-    // return the real top group rather than a wrong one-column GROUP BY row. If it can't apply,
-    // fall through to the normal SQL path. GENERAL: keyed off the question shape + table shape.
-    if (schema && isCellTallyQuestion(question, schema)) {
-      const t = await tallyCellOccurrences(question, table, catalog, scope);
-      for (const u of t.usages) usages.push(u);
-      if (t.ok && t.rows.length > 0) {
-        if (!primaryTable) { primaryTable = table; primarySql = `cell-tally over "${table}" (occurrence frequency across cells)`; }
-        allRows.push(...t.rows);
-        // Summarize the FULL verified top group so the grounded generator names every co-leader,
-        // not just the one cited row. Counts are EXACT (code-computed), entities model-classified.
-        const top = t.tally.filter((x) => x.count === t.tally[0].count);
-        verifiedTally = `${top.map((x) => `${x.entity} = ${x.count}`).join(", ")}${
-          t.tally.length > top.length
-            ? `; next: ${t.tally.slice(top.length, top.length + 3).map((x) => `${x.entity} = ${x.count}`).join(", ")}`
-            : ""
-        }`;
-        continue;
-      }
-      // tally couldn't apply (no entities classified, empty table) — fall through to SQL.
+  // ── CELL-TALLY LANE (UNIFIED, runs ONCE across all the grid tables it spans) ──────────────
+  // A "which <entity> recurs the MOST" question over a WIDE/GRID table that a single SELECT can't
+  // express (a scheduling grid: a person spread across many day columns). The OLD code ran the
+  // tally PER TABLE inside the loop below, overwriting one `verifiedTally` while accumulating each
+  // sheet's local top group into the rows — so the stated leader/count and the cited rows
+  // disagreed (a tie collapsed to one name; a non-max sheet reported as the max). We now run it
+  // ONCE over ALL the grid tables the question spans and aggregate, so the tally and the cited
+  // rows are consistent and a no-month / system-wide question surfaces the TRUE cross-sheet max.
+  // GENERAL — keyed off the question shape + table shape, never a specific dataset.
+  const gridTables = plan.tables.filter((t) => {
+    const s = catalog.find((c) => c.table === t);
+    return s && isCellTallyQuestion(question, s);
+  });
+  const handledByTally = new Set<string>();
+  if (gridTables.length > 0) {
+    const scopeTables = tableScopeForTally(question, gridTables);
+    const t = await tallyCellOccurrencesAcross(question, scopeTables, catalog, scope);
+    for (const u of t.usages) usages.push(u);
+    if (t.ok && t.rows.length > 0) {
+      for (const tbl of scopeTables) handledByTally.add(tbl);
+      primaryTable = t.table ?? scopeTables[0];
+      primarySql =
+        scopeTables.length > 1
+          ? `cell-tally across ${scopeTables.length} grid sheets (${scopeTables.join(", ")}) — occurrence frequency across cells, summed per entity`
+          : `cell-tally over "${scopeTables[0]}" (occurrence frequency across cells)`;
+      allRows.push(...t.rows);
+      // Summarize the FULL verified EXTREME group so the grounded generator names EVERY co-leader,
+      // not just one — and append the NEXT few (toward the other end) so the LLM can never re-rank
+      // a tie. Counts are EXACT (code-computed, summed across the sheets); entities are
+      // model-classified. The `tally` is sorted DESCENDING, so the extreme group is the FIRST few
+      // for "most" and the LAST few for "least"; the "next:" entries step one rank inward.
+      const least = t.direction === "least";
+      const extremeCount = least ? t.tally[t.tally.length - 1].count : t.tally[0].count;
+      const extreme = t.tally.filter((x) => x.count === extremeCount);
+      const rest = least
+        ? t.tally.filter((x) => x.count !== extremeCount).slice(-3).reverse()
+        : t.tally.filter((x) => x.count !== extremeCount).slice(0, 3);
+      const label = least ? "fewest" : "most";
+      verifiedTally = `[${label}] ${extreme.map((x) => `${x.entity} = ${x.count}`).join(", ")}${
+        rest.length > 0 ? `; next: ${rest.map((x) => `${x.entity} = ${x.count}`).join(", ")}` : ""
+      }`;
+      // The structured extreme group the GATE checks the answer against (exact extreme count + full
+      // tie). `maxCount` here means "the count at the asked-for extreme" (max for most, min for
+      // least) — the value the answer MUST state as the winner's count.
+      verifiedTopGroup = { maxCount: extreme[0].count, leaders: extreme.map((x) => x.entity) };
     }
+    // If the tally couldn't apply (no entities classified, empty tables) the grid tables fall
+    // through to the normal SQL path below (handledByTally stays empty for them).
+  }
+
+  for (const table of plan.tables) {
+    if (handledByTally.has(table)) continue; // already answered by the unified cell-tally
     const outcome = await runForTable(question, table, catalog, samples, usages, scope);
     if (outcome.ok && outcome.rows.length > 0) {
       if (!primaryTable) { primaryTable = table; primarySql = outcome.sql; }
@@ -252,7 +291,8 @@ export async function answerStructured(
   if (allRows.length > 0) {
     // verifiedTally (when set) is the cell-tally lane's authoritative top-group summary, passed
     // to the grounded generator so it restates every co-leader's exact count, not just one row.
-    return { table: primaryTable, sql: primarySql, rows: allRows, ok: true, verifiedTally, usages };
+    // verifiedTopGroup is its structured form, used by the content-fidelity gate downstream.
+    return { table: primaryTable, sql: primarySql, rows: allRows, ok: true, verifiedTally, verifiedTopGroup, usages };
   }
   // No rows cited. If a table was chosen + a valid query ran but matched nothing, that
   // is an honest empty result (ok:true, zero rows) — the generation layer states "no

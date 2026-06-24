@@ -38,12 +38,31 @@ export type CellTallyResult = {
   // and the table#rowid anchors where it occurs. Empty when the lane couldn't apply.
   rows: SqlRow[];
   // The exact tally the grounded generator can restate (entity → count), top group first.
-  tally: { entity: string; count: number; rowIds: number[] }[];
+  // `rowIds` are LEGACY (single-table) anchors; `anchors` carries the table-qualified
+  // anchors so a cross-table tally cites the right table for each occurrence.
+  tally: { entity: string; count: number; rowIds: number[]; anchors: { table: string; id: number }[] }[];
+  // The table(s) the tally spanned (one for a month-scoped question; many for system-wide).
   table: string | null;
+  tables: string[];
+  // Which extreme the question asked for: "most" (the default — highest occurrence count) or
+  // "least" (lowest). The top group + cited rows are the entities at THAT extreme. The grounded
+  // generator + the content-fidelity gate use this so a "who is scheduled the LEAST" question is
+  // answered (and checked) against the MINIMUM group, never the maximum.
+  direction: "most" | "least";
   ok: boolean;
   note?: string;
   usages: ChatUsage[];
 };
+
+// Does the question ask for the LEAST/FEWEST rather than the MOST? EN + HE. Conservative: only
+// an explicit fewest/least cue flips direction; the default is "most". Pure + exported for tests.
+export function tallyDirection(question: string): "most" | "least" {
+  const q = question.normalize("NFC").toLowerCase();
+  if (/\b(least|fewest|lowest)\b/.test(q) || /(הכי מעט|הכי פחות|המעט ביותר|הפחות)/.test(question)) {
+    return "least";
+  }
+  return "most";
+}
 
 // Columns that are bookkeeping, never tallied.
 const ANCHOR_COLS = new Set(["rowid_anchor", "id"]);
@@ -57,15 +76,19 @@ const ANCHOR_COLS = new Set(["rowid_anchor", "id"]);
  * exported for unit testing (no LLM): keyed off the question's wording + the table's shape.
  */
 export function isCellTallyQuestion(question: string, table: TableSchema): boolean {
-  const q = question.toLowerCase();
+  const q = question.normalize("NFC").toLowerCase();
   // A frequency/ranking-by-occurrence intent in EN or HE. We require BOTH a superlative/ranking
-  // cue AND an occurrence/appearance/scheduling cue, so a plain "how many rows" doesn't match.
+  // cue AND an occurrence/appearance/scheduling/activity cue, so a plain "how many rows" doesn't
+  // match. The cue lists are broadened to the NATURAL phrasings the client actually types (not
+  // just the one eval string): "who is scheduled the MOST", a no-month "מי משובץ הכי הרבה", a
+  // system-wide "מי משובץ הכי הרבה במערכת", "who is the MOST ACTIVE / BUSIEST person", "who is
+  // scheduled the LEAST". GENERAL — keyed off the question's words + the table SHAPE below.
   const ranks =
-    /\b(most|fewest|least|top|highest|lowest|rank|ranked)\b/.test(q) ||
-    /(הכי|הרבה ביותר|הכי הרבה|המשובצת|משובצת הכי|הכי משובץ|הנפוץ|השכיח|התדירות)/.test(question);
+    /\b(most|fewest|least|top|highest|lowest|busiest|rank|ranked|first)\b/.test(q) ||
+    /(הכי|הרבה ביותר|הכי הרבה|הכי מעט|המשובצת|משובצת הכי|הכי משובץ|הנפוץ|השכיח|התדירות|ביותר)/.test(question);
   const occurs =
-    /\b(appear|appears|scheduled|recur|recurs|frequent|frequency|occurr?ence|times|listed|assigned)\b/.test(q) ||
-    /(משובץ|משובצת|שיבוצ|מופיע|מופיעה|פעמים|הופעות|שובץ|שובצה|תדירות)/.test(question);
+    /\b(appear|appears|scheduled|schedule|recur|recurs|frequent|frequency|occurr?ence|times|listed|assigned|active|busy)\b/.test(q) ||
+    /(משובץ|משובצת|משובצים|שיבוצ|מופיע|מופיעה|פעמים|הופעות|שובץ|שובצה|תדירות|פעיל|עסוק)/.test(question);
   if (!(ranks && occurs)) return false;
   // GRID SHAPE: many columns, and most are free-text (not numeric) — the layout where a value
   // recurs ACROSS columns. A narrow or mostly-numeric table is a normal SQL aggregate, not this.
@@ -76,10 +99,43 @@ export function isCellTallyQuestion(question: string, table: TableSchema): boole
 }
 
 /**
- * Run the cell-tally lane over one table. Fetches every row, has the model classify which
- * distinct cell values are the entity being ranked, tallies them EXACTLY in code, and returns
- * the top group as citable rows. Fail-soft: any error returns {ok:false} (the caller then
- * falls back to the honest grounded-limit path) — it never throws or fabricates.
+ * Decide which grid table(s) a cell-tally question should span, from the relevant tables the
+ * planner already chose. The default is "tally EVERY grid table the planner picked and aggregate
+ * across them" — so a no-month, system-wide ("across all", "in the system", "overall"), or
+ * multi-sheet question reports the TRUE max across her sheets instead of one sheet's local max.
+ * If the question NAMES a specific month/sheet keyword that matches some of those tables, we
+ * narrow to the matching ones (so "who is scheduled most in August" tallies only August). This
+ * is GENERAL: it keys off the question's words vs. the table NAMES, never a specific dataset.
+ *
+ * Pure + exported so the scoping boundary is unit-tested without an LLM or a DB.
+ */
+export function tableScopeForTally(question: string, gridTables: string[]): string[] {
+  if (gridTables.length <= 1) return gridTables;
+  const q = question.normalize("NFC").toLowerCase();
+  const segsOf = (t: string) =>
+    t.normalize("NFC").toLowerCase().split(/[_\d]+/).filter((s) => s.length >= 2);
+  // A segment that appears in EVERY candidate table's name is a COMMON STEM (e.g. "שיבוצים"
+  // ("schedules") / "גיליון" ("sheet") shared by all her monthly sheets) — it is NOT a
+  // distinguishing month/sheet word, so matching it would select every table and defeat the
+  // scoping. We exclude such all-common segments; only a DISTINGUISHING segment (a month name,
+  // a sheet number's word) narrows the scope.
+  const counts = new Map<string, number>();
+  for (const t of gridTables) for (const s of new Set(segsOf(t))) counts.set(s, (counts.get(s) ?? 0) + 1);
+  const distinctive = (s: string) => (counts.get(s) ?? 0) < gridTables.length;
+  // A table is "named by the question" when one of its DISTINGUISHING segments appears verbatim
+  // in the question. This matches a month/sheet word the user typed (in the sheet's own language)
+  // against the table's own name — no hardcoded month list.
+  const named = gridTables.filter((t) =>
+    segsOf(t).some((s) => distinctive(s) && q.includes(s))
+  );
+  // If the user named one/some specific sheet(s), scope to those; otherwise span them ALL
+  // (the system-wide / no-month default — the TRUE cross-sheet max).
+  return named.length > 0 ? named : gridTables;
+}
+
+/**
+ * Run the cell-tally lane over ONE table (compat wrapper). Delegates to the cross-table
+ * implementation with a single-table list, so a one-table tally is identical to before.
  */
 export async function tallyCellOccurrences(
   question: string,
@@ -87,65 +143,132 @@ export async function tallyCellOccurrences(
   catalog: TableSchema[],
   scope?: CatalogScope
 ): Promise<CellTallyResult> {
-  const usages: ChatUsage[] = [];
-  const schema = catalog.find((c) => c.table === table);
-  if (!schema) return { rows: [], tally: [], table: null, ok: false, note: "table not in catalog", usages };
-  // 1. Fetch ALL rows (read-only, capped). selectWithIds tags each row with its citation id.
-  let rows: SqlRow[];
-  try {
-    rows = selectWithIds(`SELECT * FROM "${table}" LIMIT ${HARD_ROW_CAP}`, table, catalog, scope);
-  } catch (e) {
-    return { rows: [], tally: [], table, ok: false, note: e instanceof Error ? e.message : String(e), usages };
-  }
-  if (rows.length === 0) return { rows: [], tally: [], table, ok: false, note: "no rows to tally", usages };
+  return tallyCellOccurrencesAcross(question, [table], catalog, scope);
+}
 
-  // 2. CODE: exact frequency of every distinct non-empty cell value, with the row ids it occurs
-  //    in (for citation). A value seen twice in one row counts twice (a real double-booking).
-  const freq = new Map<string, { count: number; rowIds: Set<number> }>();
+/**
+ * Run the cell-tally lane across ONE OR MORE grid tables and aggregate into a SINGLE coherent
+ * ranking. Fetches every row of every table, has the model classify which distinct cell values
+ * are the entity being ranked (one call over the UNION of distinct values), tallies them EXACTLY
+ * in code SUMMED ACROSS the tables, and returns the FULL top tie group as citable rows whose
+ * table-qualified anchors AGREE with the tally. This is the fix for the multi-sheet bug: the old
+ * per-table loop overwrote a single `verifiedTally` while accumulating disjoint per-table top
+ * groups, so the stated leader/count and the cited rows disagreed (a tie collapsed to one name,
+ * a non-max reported as the max). Aggregating once makes the tally and the citations consistent
+ * and surfaces the real cross-sheet maximum. Fail-soft: any error → {ok:false}.
+ */
+export async function tallyCellOccurrencesAcross(
+  question: string,
+  tables: string[],
+  catalog: TableSchema[],
+  scope?: CatalogScope
+): Promise<CellTallyResult> {
+  const usages: ChatUsage[] = [];
+  const direction = tallyDirection(question);
+  const present = tables.filter((t) => catalog.some((c) => c.table === t));
+  if (present.length === 0) {
+    return { rows: [], tally: [], table: null, tables: [], direction, ok: false, note: "no table in catalog", usages };
+  }
+
+  // 1. Fetch ALL rows of EVERY table (read-only, capped per table). Each occurrence keeps the
+  //    table it came from so a cross-sheet tally cites the correct sheet for each anchor.
+  const occ = new Map<string, { count: number; anchors: Map<string, { table: string; id: number }> }>();
+  let totalRows = 0;
+  for (const table of present) {
+    let rows: SqlRow[];
+    try {
+      rows = selectWithIds(`SELECT * FROM "${table}" LIMIT ${HARD_ROW_CAP}`, table, catalog, scope);
+    } catch (e) {
+      // One unreadable sheet must not sink the whole tally — skip it, keep the others.
+      usages.push({ live: false, provider: "—", model: "—" } as ChatUsage);
+      void e;
+      continue;
+    }
+    totalRows += rows.length;
+    accumulateOccurrences(occ, table, rows);
+  }
+  if (totalRows === 0) return { rows: [], tally: [], table: present[0], tables: present, direction, ok: false, note: "no rows to tally", usages };
+  const distinct = [...occ.keys()];
+  if (distinct.length === 0) {
+    return { rows: [], tally: [], table: present[0], tables: present, direction, ok: false, note: "all cells empty", usages };
+  }
+
+  // 2. MODEL: which distinct values are the entity the question ranks vs noise (day-headers,
+  //    dates, activity/event/place labels)? ONE JSON call over the union of distinct values.
+  const { entities, usage } = await classifyEntities(question, distinct);
+  usages.push(usage);
+  if (entities.length === 0) {
+    return { rows: [], tally: [], table: present[0], tables: present, direction, ok: false, note: "no entities classified to rank", usages };
+  }
+
+  // 3. CODE: tally ONLY the classified entities (exact counts SUMMED across tables) and take the
+  //    extreme group. This arithmetic is the pure `computeExtremeTally` (unit-pinned with a fixed
+  //    entity set, no LLM/DB), so a deterministic ground-truth tally can't silently drift.
+  const { tally: tallied, extremeGroup } = computeExtremeTally(occ, entities, direction);
+  if (tallied.length === 0) {
+    return { rows: [], tally: [], table: present[0], tables: present, direction, ok: false, note: "no classified entity had a tally", usages };
+  }
+
+  // Synthetic citable rows: each extreme entity → a row whose data IS the verified count, anchored
+  // to a real table#rowid where that entity appears (so [S:table#rowid] resolves to a row with it).
+  const citeRows: SqlRow[] = extremeGroup.map((t) => ({
+    table: t.anchors[0].table,
+    id: t.anchors[0].id,
+    data: { entity: t.entity, occurrences: t.count },
+  }));
+
+  return { rows: citeRows, tally: tallied, table: present[0], tables: present, direction, ok: true, usages };
+}
+
+// The per-entity occurrence accumulator: distinct cell value → its total count + the
+// table-qualified row anchors it occurs in. Exported shape so the pure tally can be tested.
+export type OccMap = Map<string, { count: number; anchors: Map<string, { table: string; id: number }> }>;
+
+// Accumulate one table's rows into the cross-table occurrence map. A value seen twice in one row
+// counts twice (a real double-booking); the anchor for a (table,row) is recorded once. Pure
+// (mutates the passed map) — the counting half of the lane, split out so it is testable.
+export function accumulateOccurrences(occ: OccMap, table: string, rows: SqlRow[]): void {
   for (const r of rows) {
     for (const [k, v] of Object.entries(r.data)) {
       if (ANCHOR_COLS.has(k.toLowerCase())) continue;
       const s = String(v ?? "").trim();
       if (!s) continue;
-      const e = freq.get(s) ?? { count: 0, rowIds: new Set<number>() };
+      const e = occ.get(s) ?? { count: 0, anchors: new Map() };
       e.count += 1;
-      e.rowIds.add(r.id);
-      freq.set(s, e);
+      const key = `${table}#${r.id}`;
+      if (!e.anchors.has(key)) e.anchors.set(key, { table, id: r.id });
+      occ.set(s, e);
     }
   }
-  const distinct = [...freq.keys()];
-  if (distinct.length === 0) return { rows: [], tally: [], table, ok: false, note: "all cells empty", usages };
+}
 
-  // 3. MODEL: which distinct values are the entity the question ranks (a person/name/etc.) vs
-  //    noise (day-headers, dates, activity/event/place labels)? One JSON call, temperature 0.
-  const { entities, usage } = await classifyEntities(question, distinct);
-  usages.push(usage);
-  if (entities.length === 0) {
-    return { rows: [], tally: [], table, ok: false, note: "no entities classified to rank", usages };
-  }
+export type TallyEntry = { entity: string; count: number; rowIds: number[]; anchors: { table: string; id: number }[] };
 
-  // 4. CODE: tally ONLY the classified entities (exact counts from step 2), sort, take the top
-  //    group (all entities tied at the max count). Build a citable synthetic row per top entity.
+/**
+ * THE PURE TALLY (no LLM, no DB). Given the accumulated occurrences, the classified entity set,
+ * and the direction, produce the full DESCENDING-sorted tally AND the extreme group (the max-count
+ * group for "most", the min-count group for "least"). This is the CORRECTNESS core: a fixture grid
+ * + a fixed entity set pins exactly which names tie at the extreme and at what count, so the
+ * deterministic tally can't silently drift (the verifier's request). Pure + exported.
+ */
+export function computeExtremeTally(
+  occ: OccMap,
+  entities: string[],
+  direction: "most" | "least"
+): { tally: TallyEntry[]; extremeGroup: TallyEntry[] } {
   const entitySet = new Set(entities);
-  const tallied = distinct
+  const tally: TallyEntry[] = [...occ.keys()]
     .filter((v) => entitySet.has(v))
-    .map((entity) => ({ entity, count: freq.get(entity)!.count, rowIds: [...freq.get(entity)!.rowIds].sort((a, b) => a - b) }))
+    .map((entity) => {
+      const e = occ.get(entity)!;
+      const anchors = [...e.anchors.values()].sort((a, b) => a.table.localeCompare(b.table) || a.id - b.id);
+      return { entity, count: e.count, rowIds: anchors.map((a) => a.id), anchors };
+    })
     .sort((a, b) => b.count - a.count || a.entity.localeCompare(b.entity));
-  if (tallied.length === 0) {
-    return { rows: [], tally: [], table, ok: false, note: "no classified entity had a tally", usages };
-  }
-  const maxCount = tallied[0].count;
-  const topGroup = tallied.filter((t) => t.count === maxCount);
-
-  // Synthetic citable rows: each top entity → a row whose data IS the verified count, anchored to
-  // a real rowid where that entity appears (so [S:table#rowid] resolves to a row that contains it).
-  const citeRows: SqlRow[] = topGroup.map((t) => ({
-    table,
-    id: t.rowIds[0],
-    data: { entity: t.entity, occurrences: t.count },
-  }));
-
-  return { rows: citeRows, tally: tallied, table, ok: true, usages };
+  if (tally.length === 0) return { tally, extremeGroup: [] };
+  const extremeCount = direction === "least" ? tally[tally.length - 1].count : tally[0].count;
+  const extremeGroup = tally.filter((t) => t.count === extremeCount);
+  return { tally, extremeGroup };
 }
 
 /**
