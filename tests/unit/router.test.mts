@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizePlan, guardEmptyCatalogs } from "../../src/lib/engine/router.ts";
+import { normalizePlan, guardEmptyCatalogs, guardGridCellOverOwnData } from "../../src/lib/engine/router.ts";
+import type { TableSchema } from "../../src/lib/engine/sql-guard.ts";
 
 // The router's LLM call is integration-tested by the journey suite. Here we pin the
 // PURE plan-normalization contract: only valid sources kept, safe defaults. (The
@@ -105,5 +106,51 @@ test("guard is a NO-OP when every chosen source is accessible", () => {
 
 test("guard leaves an already-empty route empty (a greeting stays empty)", () => {
   const p = guardEmptyCatalogs({ sources: [], docFilter: null, rationale: "greeting" }, true, true);
+  assert.deepEqual(p.sources, []);
+});
+
+// ── guardGridCellOverOwnData: the GRID-CELL routing net (the live participation RED) ──────────────
+// The router LLM intermittently strands a grid occurrence-ranking/count question over her cryptic
+// Hebrew sheet names — returning sources:[] (general) or documents-only — so the cell-tally lane never
+// runs and the answer falls to ungrounded GENERAL mode (the exact "names not in the excel / unable to
+// find participation counts" Jenny reported). This guard ADDS "structured" when the (phrasing-
+// independent) intent classifier judges the question to be a grid occurrence lane over a grid the
+// caller owns. The TRIGGER is now an LLM call, so the "rescues a stranded occurrence question" proof
+// lives in the LIVE eval (participation-count-her-data.mjs, PHASE 2 forces the router empty). What is
+// DETERMINISTIC (no LLM call) — and pinned here — is the two short-circuits that must hold regardless
+// of the model: it never disturbs an already-structured route, and it never fires when the caller has
+// no grid-shaped table.
+const gridSheet: TableSchema = {
+  table: "שיבוצים_אוגוסט_2024_גיליון1",
+  columns: [
+    { name: "rowid_anchor", type: "INTEGER" },
+    { name: "empty", type: "TEXT" },
+    { name: "empty_1", type: "TEXT" },
+    { name: "empty_2", type: "TEXT" },
+    { name: "empty_3", type: "TEXT" },
+    { name: "empty_4", type: "TEXT" },
+  ],
+};
+// A clean, narrow table — NOT a grid; an ordinary aggregate goes through normal SQL routing.
+const cleanTable: TableSchema = {
+  table: "contracts",
+  columns: [
+    { name: "id", type: "INTEGER" },
+    { name: "vendor", type: "TEXT" },
+    { name: "annual_cost", type: "REAL" },
+  ],
+};
+
+test("grid-cell guard: NO-OP when 'structured' is already routed (no LLM call, short-circuit)", async () => {
+  const already = { sources: ["structured"] as ("structured" | "documents")[], docFilter: null, rationale: "ok" };
+  const p = await guardGridCellOverOwnData(already, "who participates the most?", [gridSheet]);
+  assert.equal(p, already, "returns the same object unchanged when structured is already present");
+});
+
+test("grid-cell guard: NO-OP when the caller has NO grid-shaped table (no LLM call, short-circuit)", async () => {
+  const stranded = { sources: [] as ("structured" | "documents")[], docFilter: null, rationale: "greeting" };
+  // With only a clean table, the cell-tally lane can't apply → the guard returns the plan unchanged
+  // WITHOUT calling the intent classifier (the grid-shape short-circuit runs first).
+  const p = await guardGridCellOverOwnData(stranded, "who participates the most?", [cleanTable]);
   assert.deepEqual(p.sources, []);
 });

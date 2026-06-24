@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  isCellTallyQuestion,
-  isCellCountQuestion,
   isGridShaped,
   tallyDirection,
   tableScopeForTally,
+  filterTargetCount,
+  entitiesAtCount,
   accumulateOccurrences,
   computeExtremeTally,
   gridRecurrenceProfile,
@@ -14,11 +14,18 @@ import {
 import type { TableSchema } from "../../src/lib/engine/sql-guard.ts";
 import type { SqlRow } from "../../src/lib/engine/structured-store.ts";
 
-// The cell-tally lane answers "which <entity> recurs the MOST" over a WIDE/GRID table that a
-// single SELECT can't express (a scheduling grid: a person spread across many day columns).
-// isCellTallyQuestion is the PURE trigger (no LLM) — it must fire for an occurrence-ranking
-// question on a grid-shaped table, and NOT fire for an ordinary aggregate or a narrow table,
-// so normal text-to-SQL keeps owning the cases it handles well. These pin that boundary.
+// The cell-tally lane answers occurrence questions ("which <entity> recurs the MOST", "how many
+// times is X scheduled", "who is scheduled exactly N times") over a WIDE/GRID table that a single
+// SELECT can't express (a scheduling grid: a person spread across many day columns).
+//
+// PHRASING-INDEPENDENT TRIGGER: the lane no longer fires off a hand-maintained cue regex (the
+// rejected band-aid — "who participates the most" / "who is more active" / "מי הכי פעילה" broke it).
+// An LLM intent classifier (classifyOccurrenceIntent) reads the question + the grid schemas and emits
+// {ranking | specific-count | filter | none}; CODE then runs the matching pure lane. The INTENT step
+// is an LLM call, proven by the LIVE evals (participation-count-her-data.mjs, RED-first + serial), NOT
+// unit-tested here. These unit tests pin the DETERMINISTIC pieces that survive: the grid-shape
+// discriminator, the direction parse, the table scoping, the integer parse, and the pure tally/filter
+// arithmetic (the correctness core that must never silently drift).
 
 // A grid-shaped table: many sparse TEXT columns (the calendar layout).
 const grid: TableSchema = {
@@ -33,111 +40,16 @@ const grid: TableSchema = {
   ],
 };
 
-// A normal narrow/numeric table — ordinary SQL aggregate territory.
-const contracts: TableSchema = {
-  table: "contracts",
-  columns: [
-    { name: "id", type: "INTEGER" },
-    { name: "vendor", type: "TEXT" },
-    { name: "annual_cost", type: "REAL" },
-  ],
-};
-
-test("FIRES on a Hebrew 'who is scheduled most' question over a grid table", () => {
-  assert.equal(isCellTallyQuestion("מי הכי משובץ באוגוסט?", grid), true);
-  assert.equal(isCellTallyQuestion("מי הבת שמשובצת הכי הרבה?", grid), true);
+// ── FILTER-TARGET integer parse (the deterministic half of the DV5 filter lane) ────────────────
+test("filterTargetCount: extracts the first plain integer, ignores money/decimal/year", () => {
+  assert.equal(filterTargetCount("who is scheduled exactly 5 times?"), 5);
+  assert.equal(filterTargetCount("מי משובצת בדיוק 3 פעמים?"), 3);
+  assert.equal(filterTargetCount("who participates the most?"), null); // no integer
+  assert.equal(filterTargetCount("which sessions cost $1,200?"), null); // currency, not a count
+  assert.equal(filterTargetCount("who is scheduled in 2024?"), null); // a 4-digit year, not 1–3 digit count
 });
 
-test("FIRES on an English 'who appears the most / scheduled most often' over a grid table", () => {
-  assert.equal(isCellTallyQuestion("who is scheduled the most this month?", grid), true);
-  assert.equal(isCellTallyQuestion("which person appears most frequently?", grid), true);
-});
-
-test("does NOT fire on an ordinary aggregate question (total/count) — SQL owns it", () => {
-  assert.equal(isCellTallyQuestion("what is the total annual cost?", grid), false);
-  assert.equal(isCellTallyQuestion("how many rows are there?", grid), false);
-});
-
-test("does NOT fire on a NARROW table even for a 'most' question (not a grid)", () => {
-  // "which vendor has the most contracts" is a real GROUP BY — SQL handles it; not a cell grid.
-  assert.equal(isCellTallyQuestion("which vendor appears the most?", contracts), false);
-});
-
-test("does NOT fire when the ranking cue is absent (a plain lookup over the grid)", () => {
-  assert.equal(isCellTallyQuestion("who is scheduled on August 1st?", grid), false);
-  assert.equal(isCellTallyQuestion("מתי משובצת אדירה סגל?", grid), false);
-});
-
-test("does NOT fire on a mostly-numeric wide table (a real metrics table, not a name grid)", () => {
-  const metrics: TableSchema = {
-    table: "metrics",
-    columns: [
-      { name: "rowid_anchor", type: "INTEGER" },
-      { name: "jan", type: "REAL" },
-      { name: "feb", type: "REAL" },
-      { name: "mar", type: "REAL" },
-      { name: "apr", type: "REAL" },
-      { name: "label", type: "TEXT" },
-    ],
-  };
-  // Only 1 text column among 5 data columns → not a name grid → SQL aggregate territory.
-  assert.equal(isCellTallyQuestion("which month appears most?", metrics), false);
-});
-
-// ── BROADENED TRIGGER: the NATURAL phrasings the live regression exposed ──────────────────────
-// The lane passed the eval's exact "August" string but missed the variations the client actually
-// types. These pin that the broadened trigger fires for a NO-MONTH "מי משובץ הכי הרבה", a
-// SYSTEM-WIDE "במערכת", an English "most active", and a "LEAST" — all over a grid table.
-test("FIRES on the live-regression natural variations over a grid table", () => {
-  assert.equal(isCellTallyQuestion("מי משובץ הכי הרבה?", grid), true); // no month — RED #1
-  assert.equal(isCellTallyQuestion("מי משובץ הכי הרבה במערכת", grid), true); // system-wide — RED #2
-  assert.equal(isCellTallyQuestion("who is the most active person in the schedules?", grid), true);
-  // The EXACT bare live-failing phrasing (NO "in the schedules" scheduling-context cue) — the
-  // planner punted on this and the lane never fired live; it MUST trigger the tally now.
-  assert.equal(isCellTallyQuestion("who is the most active person", grid), true);
-  assert.equal(isCellTallyQuestion("מי משובץ הכי מעט בשיבוצים?", grid), true); // least
-  assert.equal(isCellTallyQuestion("who is scheduled the least?", grid), true);
-});
-
-// ── ATTRIBUTE-SUPERLATIVE EXCLUSION (the AD2 regression) ───────────────────────────────────────
-// Broadening the lane to fire even when the planner punts re-exposed a fabrication risk: an
-// INTRINSIC-ATTRIBUTE superlative ("who is the OLDEST/youngest/tallest in the schedules?") is a
-// ranking by a PROPERTY of the person (age/height), NOT by how often they occur — her grid holds
-// no ages, so the tally must NOT fire and crown the most-scheduled person as "the oldest" (the
-// recorded AD2 RED). The bare dataset noun "schedules"/"שיבוצים" is a context word, not a
-// frequency cue. The lane stays OFF for attribute superlatives so the honest "no age data" path
-// answers. GENERAL — a linguistic class of superlative, not a dataset-specific block-list.
-test("does NOT fire on an INTRINSIC-ATTRIBUTE superlative (oldest/youngest), HE+EN — AD2 guard", () => {
-  assert.equal(isCellTallyQuestion("מי הבת הכי מבוגרת בשיבוצים?", grid), false); // oldest — the live AD2 RED
-  assert.equal(isCellTallyQuestion("מי הצעירה ביותר בשיבוצים?", grid), false); // youngest
-  assert.equal(isCellTallyQuestion("who is the oldest person in the schedules?", grid), false);
-  assert.equal(isCellTallyQuestion("who is the tallest girl scheduled?", grid), false);
-  // The cell-COUNT lane must also stay off for an attribute superlative (defense-in-depth).
-  assert.equal(isCellCountQuestion("מי הבת הכי מבוגרת בשיבוצים?", grid), false);
-});
-
-// ── SPECIFIC-VALUE COUNT (DV4) — "how many times is <X> scheduled" over a grid ──────────────────
-// A specific-value occurrence COUNT (not a ranking, not a row count) needs the cell-count lane: a
-// single guarded GROUP BY on one column can't count a value across the grid's many columns (the
-// live RED: the SQL lane answered "0" for a name that appears 15×). isCellCountQuestion is the pure
-// trigger — it must fire for "how many times" / "כמה פעמים", and NOT for a ranking or a row count.
-test("isCellCountQuestion FIRES on a specific-value occurrence count over a grid", () => {
-  assert.equal(isCellCountQuestion("כמה פעמים רינה אנטוב משובצת?", grid), true);
-  assert.equal(isCellCountQuestion("כמה פעמים רינה אנטוב משובצת באוגוסט?", grid), true);
-  assert.equal(isCellCountQuestion("how many times is Rina scheduled?", grid), true);
-});
-test("isCellCountQuestion does NOT fire on a RANKING (that's the tally lane) or a row count", () => {
-  // A superlative ranking → the tally lane owns it, not the count lane.
-  assert.equal(isCellCountQuestion("מי משובץ הכי הרבה פעמים?", grid), false);
-  assert.equal(isCellCountQuestion("who is scheduled the most times?", grid), false);
-  // A plain row count is an ordinary SQL aggregate, not a cell occurrence count.
-  assert.equal(isCellCountQuestion("how many rows are there?", grid), false);
-  // No grid shape → not this lane.
-  const narrow: TableSchema = { table: "t", columns: [{ name: "id", type: "INTEGER" }, { name: "name", type: "TEXT" }] };
-  assert.equal(isCellCountQuestion("how many times is X listed?", narrow), false);
-});
-
-// ── GRID SHAPE predicate (shared by both lanes) ────────────────────────────────────────────────
+// ── GRID SHAPE predicate (shared by all lanes) ────────────────────────────────────────────────
 test("isGridShaped: a wide free-text table is a grid; a narrow/numeric one is not", () => {
   assert.equal(isGridShaped(grid), true);
   assert.equal(isGridShaped({ table: "c", columns: [{ name: "id", type: "INTEGER" }, { name: "vendor", type: "TEXT" }, { name: "cost", type: "REAL" }] }), false);

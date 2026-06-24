@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  isCellFilterByCountQuestion,
   filterTargetCount,
   entitiesAtCount,
   gridRecurrenceProfile,
@@ -33,19 +32,9 @@ function rowsOf(table: string, g: Record<string, string>[]): SqlRow[] {
 }
 
 // ── DV5: FILTER-BY-COUNT ("who is scheduled EXACTLY N times") ─────────────────────────────────
-test("DV5 trigger: isCellFilterByCountQuestion FIRES on an exact-count question over a grid", () => {
-  assert.equal(isCellFilterByCountQuestion("מי משובצת בדיוק 5 פעמים באוגוסט?", grid), true);
-  assert.equal(isCellFilterByCountQuestion("who is scheduled exactly 3 times?", grid), true);
-  assert.equal(isCellFilterByCountQuestion("which people appear exactly 10 times?", grid), true);
-});
-test("DV5 trigger: does NOT fire without an exact-count cue, without a number, or on a ranking", () => {
-  // No "exactly/בדיוק" cue → it's a plain count or lookup, not a filter-by-count.
-  assert.equal(isCellFilterByCountQuestion("כמה פעמים רינה משובצת?", grid), false);
-  // "exactly" but no integer to filter on.
-  assert.equal(isCellFilterByCountQuestion("who is scheduled exactly as often?", grid), false);
-  // A superlative ranking → the tally lane owns it, never the filter lane.
-  assert.equal(isCellFilterByCountQuestion("who is scheduled the most, exactly?", grid), false);
-});
+// The TRIGGER (is this a filter-by-count question?) is now the LLM intent classifier (kind:"filter")
+// — phrasing-independent, proven by the live evals, not unit-tested. What stays deterministic and
+// MUST not drift is the integer parse + the pure filter arithmetic, pinned here.
 test("DV5 parse: filterTargetCount extracts the target integer, ignoring money/decimals/years", () => {
   assert.equal(filterTargetCount("מי משובצת בדיוק 5 פעמים?"), 5);
   assert.equal(filterTargetCount("exactly 12 times"), 12);

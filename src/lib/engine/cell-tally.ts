@@ -54,6 +54,110 @@ export type CellTallyResult = {
   usages: ChatUsage[];
 };
 
+// ── OCCURRENCE-INTENT CLASSIFIER (the phrasing-independent trigger) ───────────────────────────────
+// WHY THIS REPLACED THE REGEX CUE-GATE (the recorded miss): the cell lanes used to fire only when a
+// hand-maintained cue regex (OCCURS_RE/OCCURS_HE: "scheduled|appears|times|…") matched the question.
+// That is a treadmill — the client asked "who participates the most" and "who is more active" and
+// "מי הכי פעילה" in words the list didn't have, so the lane never fired and the answer fell to a
+// general "I can't find participation counts" (the live RED). Maintaining a synonym list is endless.
+//
+// THE FIX (per CLAUDE.md "let the model decide via an explicit flag"): a SINGLE LLM intent call reads
+// the QUESTION + the grid table SCHEMAS and emits a structured flag — is this an occurrence-frequency
+// RANKING ("who recurs most/least"), a SPECIFIC-VALUE count ("how many times is X scheduled"), a
+// FILTER-by-count ("who is scheduled exactly N times"), or NONE — then CODE executes deterministically
+// (the existing pure tally/count/filter lanes). The model decides INTENT (phrasing-independent); CODE
+// does the COUNTING (deterministic). No maintained phrase list, in any language.
+//
+// The two guards that MUST survive are expressed as explicit prompt rules AND a code post-check:
+//   • ATTRIBUTE superlatives (oldest/tallest/most-senior — a property of the person, not how often
+//     they occur) are NOT occurrence rankings → kind:"none" (the AD2 fabrication guard). A code
+//     post-check forces "none" if the deterministic isAttributeSuperlative still fires, so a model
+//     slip can't reopen AD2.
+//   • A PLAIN LOOKUP ("who is scheduled on Aug 1", "when is X scheduled") is NOT a ranking/count → none.
+export type OccurrenceKind = "ranking" | "specific-count" | "filter" | "none";
+export type OccurrenceIntent = { kind: OccurrenceKind; direction: "most" | "least"; usage?: ChatUsage };
+
+// A compact, language-neutral schema description for the intent prompt: each grid table + its columns.
+function describeGridCatalog(tables: TableSchema[]): string {
+  return tables
+    .map((t) => `- ${t.table} (columns: ${t.columns.map((c) => c.name).join(", ")})`)
+    .join("\n");
+}
+
+/**
+ * Classify the question's OCCURRENCE intent over the caller's GRID tables. ONE LLM call (temp 0,
+ * JSON). Returns {kind, direction}. Fail-OPEN to "none" on any parse/empty error (the lane simply
+ * doesn't fire — text-to-SQL still runs — so a classifier hiccup never fabricates). The caller only
+ * invokes this when ≥1 grid-shaped table exists, so it never runs for a pure non-grid catalog.
+ * Pure-ish (the only effect is the LLM call). Exported for the live evals; the kind→lane wiring is
+ * in text-to-sql. The deterministic attribute-superlative guard is applied AFTER the model here.
+ */
+export async function classifyOccurrenceIntent(
+  question: string,
+  gridTables: TableSchema[]
+): Promise<OccurrenceIntent> {
+  const direction = tallyDirection(question);
+  // Deterministic AD2 backstop: an intrinsic-attribute superlative is NEVER an occurrence ranking —
+  // short-circuit BEFORE the model so a model slip can't crown the most-scheduled person as "oldest".
+  if (isAttributeSuperlative(question)) return { kind: "none", direction };
+  // Run the classifier; RETRY ONCE on "none". A "none" can mean a genuine non-occurrence question OR a
+  // degraded/garbled completion from a momentarily-overloaded provider (a 429-retried-but-truncated
+  // response that parsed to {} → "none"). A genuine "none" is STABLE — a plain lookup / attribute
+  // superlative says "none" both times — so the retry only recovers a flaky false-none, it never
+  // flips a true none into a lane. (Mirrors the classifyEntities retry-once-on-empty already used by
+  // the tally.) The AD2 short-circuit above already removed the one false-positive risk.
+  const system = `You classify a USER QUESTION about one or more SPREADSHEET tables. The tables are messy calendar/scheduling GRIDS: a value (a person's name, an activity, a day header) recurs across many cells. Your ONE job: decide whether the question is asking about HOW OFTEN a value OCCURS across the grid — something a plain SQL GROUP BY on one column cannot answer because the value is spread across many columns.
+
+THINK in two steps, then output JSON {"reasoning": "<your 1-2 step reasoning>", "kind": "<one value>"}:
+STEP 1 — Is the question comparing/ranking PEOPLE (or activities) by how MUCH / how OFTEN they appear, participate, are scheduled, are active, are busy, show up? A scheduling grid lists people across days; "who is busiest / most active / participates most / is scheduled most / shows up most / appears most" ALL mean the SAME thing: whose name RECURS most across the grid cells. This is the core concept — match it by MEANING, in ANY language, not by specific words ("active", "פעילה", "busy", "involved", "comes most" all qualify).
+STEP 2 — pick the kind:
+- "ranking": ranks entities by how often they occur (most OR least / busiest / most active / participates most / scheduled most / fewest). Examples: "who participates the most", "who is more active", "who is busiest", "who shows up most", "מי משתתפת הכי הרבה", "מי הכי פעילה", "מי הכי עסוקה", "who is scheduled the most across the schedules", "who appears the fewest times".
+- "specific-count": HOW MANY TIMES one NAMED value occurs — "how many times is Rina scheduled", "כמה פעמים X משובצת".
+- "filter": WHICH entities occur EXACTLY N times — "who is scheduled exactly 5 times".
+- "none": NOT about frequency-of-occurrence. Use "none" ONLY for:
+   • an INTRINSIC-ATTRIBUTE superlative — ranking by a PROPERTY of the person (oldest, youngest, tallest, most senior, highest paid). The grid has no ages/heights. → "none".
+   • a PLAIN LOOKUP of one slot — "who is scheduled on August 1st", "when is X scheduled", "is X free Tuesday". → "none".
+   • an ordinary total/sum/average over a numeric column, a greeting, or a pure general-knowledge question. → "none".
+
+IMPORTANT: when in doubt between "ranking" and "none" for a who-is-most/who-is-more question about PEOPLE over a scheduling grid, choose "ranking" — a comparative/superlative about people on a schedule is almost always an occurrence ranking. Do NOT answer "none" just because the wording is casual ("who is more active" IS a ranking).`;
+  const user = `GRID TABLES:
+${describeGridCatalog(gridTables)}
+
+QUESTION: ${question}
+
+Return the JSON now.`;
+  const callOnce = async (): Promise<{ kind: OccurrenceKind; usage: ChatUsage }> => {
+    const { content, usage } = await chatWithUsage(
+      [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      { json: true, temperature: 0 }
+    );
+    let kind: OccurrenceKind = "none";
+    try {
+      const parsed = JSON.parse(content);
+      if (parsed.kind === "ranking" || parsed.kind === "specific-count" || parsed.kind === "filter") {
+        kind = parsed.kind;
+      }
+    } catch {
+      kind = "none"; // fail-open: classifier hiccup → no cell lane, text-to-SQL still runs
+    }
+    return { kind, usage };
+  };
+  let { kind, usage } = await callOnce();
+  if (kind === "none") {
+    // Retry once — a flaky false-none (degraded/truncated provider response) recovers; a real none
+    // (lookup / attribute superlative) stays none. We keep the first usage for telemetry.
+    const retry = await callOnce();
+    if (retry.kind !== "none") kind = retry.kind;
+  }
+  // Post-check (defense in depth): a "filter" must actually name a target integer; if it doesn't,
+  // treat it as a ranking ("who is scheduled the most/least") rather than a broken filter.
+  if (kind === "filter" && filterTargetCount(question) == null) kind = "ranking";
+  return { kind, direction, usage };
+}
+
 // Does the question ask for the LEAST/FEWEST rather than the MOST? EN + HE. Conservative: only
 // an explicit fewest/least cue flips direction; the default is "most". Pure + exported for tests.
 export function tallyDirection(question: string): "most" | "least" {
@@ -67,14 +171,6 @@ export function tallyDirection(question: string): "most" | "least" {
 // Columns that are bookkeeping, never tallied.
 const ANCHOR_COLS = new Set(["rowid_anchor", "id"]);
 
-// An occurrence/appearance/scheduling/activity cue (EN + HE) — a value RECURS across the grid's
-// cells. Shared by the ranking-tally and the specific-value-count detectors below.
-const OCCURS_RE =
-  /\b(appear|appears|scheduled|schedule|recur|recurs|frequent|frequency|occurr?ence|times|listed|assigned|active|busy)\b/;
-const OCCURS_HE = /(משובץ|משובצת|משובצים|שיבוצ|מופיע|מופיעה|פעמים|הופעות|שובץ|שובצה|תדירות|פעיל|עסוק)/;
-function hasOccurrenceCue(question: string): boolean {
-  return OCCURS_RE.test(question.normalize("NFC").toLowerCase()) || OCCURS_HE.test(question);
-}
 
 // An INTRINSIC-ATTRIBUTE superlative (oldest/youngest/tallest/shortest/biggest…/most senior) —
 // a ranking by a property of the PERSON (age, height, seniority), NOT by how often they occur in
@@ -134,81 +230,6 @@ export function isGridShaped(table: TableSchema): boolean {
   // read/query the real columns (exact COUNT/GROUP BY), do NOT route to the occurrence-tally.
   const placeholderCols = dataCols.filter((c) => isPlaceholderColumnName(c.name));
   return placeholderCols.length >= Math.ceil(dataCols.length / 2);
-}
-
-/**
- * Decide whether THIS question over THIS table is a cell-tally RANKING case: a "which/who recurs
- * the MOST / appears most often / is scheduled most / is the most frequent" ranking-by-occurrence
- * question over a WIDE table whose values are spread across many text columns. Conservative by
- * design — it only fires for an occurrence-frequency RANKING on a genuinely grid-shaped table, so
- * an ordinary aggregate ("total cost", "count of contracts") still goes through SQL. Pure +
- * exported for unit testing (no LLM): keyed off the question's wording + the table's shape.
- */
-export function isCellTallyQuestion(question: string, table: TableSchema): boolean {
-  const q = question.normalize("NFC").toLowerCase();
-  // A superlative/ranking cue (EN or HE). We require BOTH a ranking cue AND an occurrence cue, so a
-  // plain "how many rows" doesn't match. Broadened to the NATURAL phrasings the client types.
-  const ranks =
-    /\b(most|fewest|least|top|highest|lowest|busiest|rank|ranked|first)\b/.test(q) ||
-    /(הכי|הרבה ביותר|הכי הרבה|הכי מעט|המשובצת|משובצת הכי|הכי משובץ|הנפוץ|השכיח|התדירות|ביותר)/.test(question);
-  if (!(ranks && hasOccurrenceCue(question))) return false;
-  // An INTRINSIC-ATTRIBUTE superlative (oldest/youngest/tallest…) is NOT a frequency ranking — the
-  // tally cannot answer it (no age/height data), so it must NOT fire even though the question
-  // mentions the scheduling grid. Excluding it keeps the honest "no age data" path for AD2.
-  if (isAttributeSuperlative(question)) return false;
-  return isGridShaped(table);
-}
-
-/**
- * Decide whether THIS question is a SPECIFIC-VALUE OCCURRENCE COUNT over a grid: "HOW MANY TIMES is
- * <X> scheduled / listed / does <X> appear". This is NOT a ranking (no superlative) and NOT a row
- * count — it asks for ONE named value's frequency ACROSS the grid's many columns, which a single
- * guarded GROUP BY on one column cannot express (the live RED: the SQL lane wrote a one-column
- * COUNT and answered "0" for a name that appears 15× across the sheets). We count it in code, like
- * the tally. Conservative: requires a "how many / count" cue AND an occurrence cue AND a grid
- * shape. Pure + exported (no LLM). The NAMED value itself is extracted later by the model.
- */
-export function isCellCountQuestion(question: string, table: TableSchema): boolean {
-  const q = question.normalize("NFC").toLowerCase();
-  // A "how many / how many times / count of" cue (EN + HE), WITHOUT a superlative (that's the
-  // ranking case above). "כמה פעמים" = how many times; "כמה פעמים משובצת" = how many times scheduled.
-  const counts =
-    /\b(how many times|how often|number of times|count of)\b/.test(q) ||
-    /(כמה פעמים|כמה פעם|מספר הפעמים|כמה משמרות|בכמה)/.test(question);
-  if (!counts) return false;
-  // Must NOT also be a superlative ranking (those go to the tally lane).
-  const isRanking =
-    /\b(most|fewest|least|top|highest|lowest|busiest)\b/.test(q) ||
-    /(הכי הרבה|הכי מעט|הרבה ביותר|הכי|ביותר)/.test(question);
-  if (isRanking) return false;
-  if (!hasOccurrenceCue(question)) return false;
-  return isGridShaped(table);
-}
-
-/**
- * Decide whether THIS question is a FILTER-BY-COUNT over a grid: "who is scheduled EXACTLY N times"
- * / "מי משובצת בדיוק N פעמים" / "which people appear N times". It asks for the SET of entities whose
- * occurrence frequency EQUALS a specific number N — not a ranking, not one named value's count. A
- * single guarded SELECT can't express it (the count is across the grid's many columns), so it needs
- * the cell machinery: tally occurrences, then keep the classified entities whose count == N. The
- * target N is extracted by `filterTargetCount` below. Conservative: requires an EXACT-COUNT cue
- * (exactly/בדיוק/precisely) + a bare integer + an occurrence cue + a grid shape, and must NOT be a
- * ranking. Pure + exported (no LLM).
- */
-export function isCellFilterByCountQuestion(question: string, table: TableSchema): boolean {
-  const q = question.normalize("NFC").toLowerCase();
-  // An EXACT-COUNT cue (EN + HE): "exactly N", "precisely N", "בדיוק N".
-  const exact = /\b(exactly|precisely|just)\b/.test(q) || /(בדיוק|בדיוק־|במדויק)/.test(question);
-  if (!exact) return false;
-  // Must NAME a target integer to filter by (the N).
-  if (filterTargetCount(question) == null) return false;
-  // Not a superlative ranking (those go to the tally lane).
-  const isRanking =
-    /\b(most|fewest|least|top|highest|lowest|busiest)\b/.test(q) ||
-    /(הכי הרבה|הכי מעט|הרבה ביותר|הכי|ביותר)/.test(question);
-  if (isRanking) return false;
-  if (!hasOccurrenceCue(question)) return false;
-  return isGridShaped(table);
 }
 
 /**

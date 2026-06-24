@@ -24,9 +24,8 @@ import {
 } from "./structured-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
 import {
-  isCellTallyQuestion,
-  isCellCountQuestion,
-  isCellFilterByCountQuestion,
+  classifyOccurrenceIntent,
+  type OccurrenceIntent,
   filterTargetCount,
   isGridShaped,
   tallyCellOccurrencesAcross,
@@ -228,10 +227,25 @@ export async function answerStructured(
   // we let the lanes fire on the full-grid fallback. A non-grid question (the planner's empty
   // pick is genuinely correct) still returns the honest "no relevant table". GENERAL — keyed off
   // table SHAPE + the question's tally/count shape, never a dataset.
-  const anyGrid = catalog.some((c) => isGridShaped(c));
-  const isGridTallyOrCount =
-    anyGrid &&
-    catalog.some((c) => isCellTallyQuestion(question, c) || isCellCountQuestion(question, c));
+  // OCCURRENCE INTENT — the PHRASING-INDEPENDENT trigger (replaced the regex cue-gate). ONE LLM call
+  // reads the question + the grid schemas and emits {kind: ranking|specific-count|filter|none}. CODE
+  // then runs the matching deterministic lane. We only pay for it when a grid-shaped table actually
+  // exists (the only place these lanes can apply); a pure non-grid catalog skips it entirely and
+  // behaves exactly as before. Fail-open to "none" → text-to-SQL still runs. The model decides intent;
+  // code does the counting (the existing pure tally/count/filter lanes), so no maintained phrase list.
+  const gridCatalog = catalog.filter((c) => isGridShaped(c));
+  const anyGrid = gridCatalog.length > 0;
+  const intent: OccurrenceIntent = anyGrid
+    ? await classifyOccurrenceIntent(question, gridCatalog)
+    : { kind: "none", direction: "most" };
+  if (intent.usage) usages.push(intent.usage);
+  // Per-lane predicates now key off table SHAPE (deterministic) × the model's INTENT flag (phrasing-
+  // independent) — the regex predicates are gone. A grid table is a tally/count/filter candidate iff
+  // it is grid-shaped AND the intent matches that lane.
+  const isTally = (c: TableSchema): boolean => isGridShaped(c) && intent.kind === "ranking";
+  const isCount = (c: TableSchema): boolean => isGridShaped(c) && intent.kind === "specific-count";
+  const isFilter = (c: TableSchema): boolean => isGridShaped(c) && intent.kind === "filter";
+  const isGridTallyOrCount = anyGrid && (intent.kind === "ranking" || intent.kind === "specific-count");
   if (plan.tables.length === 0 && !isGridTallyOrCount) {
     return { table: null, sql: null, rows: [], ok: false, note: "no relevant table for this question", usages };
   }
@@ -306,8 +320,8 @@ export async function answerStructured(
   // one corpus/family is present this is a no-op fast-path (the normal Hebrew scheduling path).
   const tallyCandidates = [
     ...new Set([
-      ...familyGrids((c) => isCellTallyQuestion(question, c)),
-      ...allMatchingGrids((c) => isCellTallyQuestion(question, c)),
+      ...familyGrids(isTally),
+      ...allMatchingGrids(isTally),
     ]),
   ];
   const kindSel = await selectTallyGridsByKind(question, tallyCandidates, catalog, scope);
@@ -369,7 +383,7 @@ export async function answerStructured(
   // same scope the tally would. Runs only when the tally did NOT already handle these tables.
   // Candidate grids (via the same family-or-all fallback as the tally, so a flaky planner pick
   // doesn't gate the lane off), excluding any the tally already handled.
-  const countGrids = familyGrids((c) => isCellCountQuestion(question, c)).filter(
+  const countGrids = familyGrids(isCount).filter(
     (t) => !handledByTally.has(t)
   );
   if (countGrids.length > 0) {
@@ -405,7 +419,7 @@ export async function answerStructured(
   const filterTarget = filterTargetCount(question);
   const filterGrids =
     filterTarget != null
-      ? familyGrids((c) => isCellFilterByCountQuestion(question, c)).filter((t) => !handledByTally.has(t))
+      ? familyGrids(isFilter).filter((t) => !handledByTally.has(t))
       : [];
   if (filterTarget != null && filterGrids.length > 0) {
     const scopeTables = tableScopeForTally(question, filterGrids);

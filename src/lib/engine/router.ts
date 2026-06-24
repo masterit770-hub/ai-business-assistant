@@ -15,6 +15,7 @@ import { listUploadedDocs as listUploadedDocsDurable } from "./pgvector-store.ts
 import { introspectSchema, hydrateUploadedTables, type CatalogScope } from "./structured-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
 import { buildConversationContext, type Turn } from "./conversation.ts";
+import { classifyOccurrenceIntent, isGridShaped } from "./cell-tally.ts";
 
 export type RoutePlan = {
   sources: ("structured" | "documents")[];
@@ -137,13 +138,20 @@ export async function routeQuestion(
   // ONLY for a demo caller). A structured source is only accessible if a table is listed.
   const hasAccessibleDocs = (includeBundled ? DOCUMENTS.length : 0) + uploaded.length > 0;
   const hasAccessibleTables = tables.length > 0;
-  const raw = await chat(
-    [
-      { role: "system", content: buildSystem(uploaded, tables, includeBundled) },
-      { role: "user", content: userContent },
-    ],
-    { json: true, temperature: 0 }
-  );
+  // TEST-ONLY: force the router LLM to "return empty" so a test can prove the deterministic guards
+  // rescue a stranded grid-cell/summary question (the LLM is non-deterministic at temp 0 and
+  // intermittently returns sources:[] for her cryptic Hebrew sheets — we must not depend on its mood
+  // to verify the guard). Never set in production; gated behind an explicit test env flag.
+  const raw =
+    process.env.__ROUTER_FORCE_EMPTY === "1"
+      ? '{"sources": [], "docFilter": null, "rationale": "forced-empty (test)"}'
+      : await chat(
+          [
+            { role: "system", content: buildSystem(uploaded, tables, includeBundled) },
+            { role: "user", content: userContent },
+          ],
+          { json: true, temperature: 0 }
+        );
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -171,7 +179,15 @@ export async function routeQuestion(
   // is keyed only off the question SHAPE (a summary cue) + "the caller has tables", never a table
   // name or subject — a non-summary question is untouched.
   const planned = guardEmptyCatalogs(normalizePlan(parsed), hasAccessibleDocs, hasAccessibleTables);
-  return guardSummaryOverOwnData(planned, question, hasAccessibleTables);
+  const withSummary = guardSummaryOverOwnData(planned, question, hasAccessibleTables);
+  // GRID-CELL ROUTING GUARD: a grid occurrence-ranking/count/filter question over the caller's OWN
+  // grid sheets must route to "structured" even when the router LLM punted it to empty/documents — the
+  // cell-tally lane (which the planner can't express in plain SQL) is the only thing that answers it.
+  // This used to gate on a regex cue-list; it now gates on the SAME phrasing-independent intent flag
+  // the structured lane uses (the model decides intent, no maintained phrase list). The extra intent
+  // call only runs in the RESCUE path: the router didn't already route structured AND the caller has a
+  // grid-shaped table. When the router already chose structured (the common case) it's a no-op.
+  return guardGridCellOverOwnData(withSummary, question, tables);
 }
 
 // A SUMMARY / OVERVIEW / "what is / what does X include / tell me about / describe X" cue (EN + HE).
@@ -201,6 +217,32 @@ export function guardSummaryOverOwnData(
     sources: [...plan.sources, "structured"],
     docFilter: plan.docFilter,
     rationale: `${plan.rationale || "summary"}; also routing to the caller's structured sheets (a summary of their own subject may live in their tables, not only documents)`,
+  };
+}
+
+// For a GRID OCCURRENCE question (ranking / specific-value count / filter-by-count over a header-less
+// grid sheet) the caller owns, ensure "structured" is in the route so the cell-tally lane gets to run
+// — without removing "documents". The router LLM intermittently strands these questions (sources:[] or
+// documents-only) over her cryptic Hebrew sheet names. The trigger is the SAME phrasing-independent
+// intent flag the structured lane uses (the model decides intent; no regex cue-list), so this guard
+// and the lane agree. The extra intent LLM call runs ONLY in the rescue path: the router did NOT
+// already route structured AND the caller has a grid-shaped table. When structured is already routed,
+// or the caller has no grid sheet, it is a no-op with no extra call. `tables` is the SAME owner-scoped
+// catalog the prompt was built from, so this only ever adds the caller's OWN structured source.
+export async function guardGridCellOverOwnData(
+  plan: RoutePlan,
+  question: string,
+  tables: TableSchema[]
+): Promise<RoutePlan> {
+  if (plan.sources.includes("structured")) return plan;
+  const gridTables = tables.filter((t) => isGridShaped(t));
+  if (gridTables.length === 0) return plan;
+  const intent = await classifyOccurrenceIntent(question, gridTables);
+  if (intent.kind === "none") return plan;
+  return {
+    sources: [...plan.sources, "structured"],
+    docFilter: plan.docFilter,
+    rationale: `${plan.rationale || "grid occurrence question"}; also routing to the caller's structured sheets (an occurrence-${intent.kind} over their schedule grid is answered by the cell-tally lane, not plain SQL)`,
   };
 }
 
