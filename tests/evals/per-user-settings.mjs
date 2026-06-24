@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { skip as skipShared } from "./_skip.mjs";
+import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
 
 const ROOT = "/home/codex/Projects/nucleus";
 const WANT = new Set(["SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]);
@@ -142,9 +143,14 @@ async function cleanup() {
     deleted === 3 && residue === 0, `deleted=${deleted} residue=${residue}`);
 }
 
+// RESIDUE GUARD (#79): refuse to run over a DB a prior leaked run left dirty (a polluted
+// catalog produces a FALSE GREEN); abort loudly. Asserts 0 throwaway orphan rows BEFORE the run.
+await assertCleanBefore("per-user-settings");
 let runErr = null;
 try { await main(); } catch (e) { runErr = e; console.error("\nEVAL ERROR:", e instanceof Error ? e.stack : e); }
 finally { await cleanup(); }
+// RESIDUE GUARD (#79): this run must leave 0 throwaway residue — fail loudly if its cleanup leaked.
+await assertCleanAfter("per-user-settings");
 
 const fails = results.filter((r) => !r.ok);
 console.log(`\n${"═".repeat(72)}`);

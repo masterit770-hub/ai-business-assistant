@@ -38,6 +38,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { skip as skipShared } from "./_skip.mjs";
+import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -274,6 +275,9 @@ async function cleanup() {
     after === 0 && docsAfter === 0 && usersDeleted === 2, `tablesRemaining=${after} docsRemaining=${docsAfter} usersDeleted=${usersDeleted}`);
 }
 
+// RESIDUE GUARD (#79): refuse to run over a DB a prior leaked run left dirty (a polluted
+// catalog produces a FALSE GREEN); abort loudly. Asserts 0 throwaway orphan rows BEFORE the run.
+await assertCleanBefore("cold-start-durability");
 let runError = null;
 try {
   await main();
@@ -283,6 +287,8 @@ try {
 } finally {
   await cleanup();
 }
+// RESIDUE GUARD (#79): this run must leave 0 throwaway residue — fail loudly if its cleanup leaked.
+await assertCleanAfter("cold-start-durability");
 
 const fails = results.filter((r) => !r.ok);
 console.log(`\n${"═".repeat(72)}`);

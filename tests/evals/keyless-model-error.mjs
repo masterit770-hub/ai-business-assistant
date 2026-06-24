@@ -35,6 +35,7 @@
 // echoes, logs, or commits any secret value. It only ever SETS a bogus throwaway key.
 
 import fs from "node:fs";
+import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
@@ -212,6 +213,9 @@ async function cleanup() {
   }
 }
 
+// RESIDUE GUARD (#79): refuse to run over a DB a prior leaked run left dirty (a polluted
+// catalog produces a FALSE GREEN); abort loudly. Asserts 0 throwaway orphan rows BEFORE the run.
+await assertCleanBefore("keyless-model-error");
 let runError = null;
 try {
   await main();
@@ -221,6 +225,8 @@ try {
 } finally {
   await cleanup();
 }
+// RESIDUE GUARD (#79): this run must leave 0 throwaway residue — fail loudly if its cleanup leaked.
+await assertCleanAfter("keyless-model-error");
 
 const fails = results.filter((r) => !r.ok);
 console.log(`\n${"═".repeat(72)}`);

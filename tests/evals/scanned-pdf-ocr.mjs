@@ -43,6 +43,7 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { skip as skipShared } from "./_skip.mjs";
+import { assertCleanBefore, assertCleanAfter } from "./_residue-guard.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -510,6 +511,9 @@ async function cleanup() {
     docsAfter === 0 && userDeleted, `docsRemaining=${docsAfter} userDeleted=${userDeleted}`);
 }
 
+// RESIDUE GUARD (#79): refuse to run over a DB a prior leaked run left dirty (a polluted
+// catalog produces a FALSE GREEN); abort loudly. Asserts 0 throwaway orphan rows BEFORE the run.
+await assertCleanBefore("scanned-pdf-ocr");
 let runError = null;
 try {
   await main();
@@ -520,6 +524,8 @@ try {
   await cleanupBluefalcon();
   await cleanup();
 }
+// RESIDUE GUARD (#79): this run must leave 0 throwaway residue — fail loudly if its cleanup leaked.
+await assertCleanAfter("scanned-pdf-ocr");
 
 const fails = results.filter((r) => !r.ok);
 console.log(`\n${"═".repeat(72)}`);
