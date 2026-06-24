@@ -7,7 +7,9 @@
     "build": "node scripts/prune-onnx.mjs && next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test tests/unit/*.test.mts",
+    "test": "node --experimental-strip-types --test tests/unit/*.test.mts && npm run test:components",
+    "test:unit": "node --experimental-strip-types --test tests/unit/*.test.mts",
+    "test:components": "vitest run",
     "typecheck": "tsc --noEmit",
     "test:journeys": "node scripts/run-journeys.mjs",
     "eval:cold-start": "node tests/evals/cold-start-durability.mjs",
@@ -43,14 +45,20 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4.7.0",
     "eslint": "^9",
     "eslint-config-next": "16.2.9",
+    "jsdom": "^25.0.1",
     "playwright-core": "1.52.0",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^3.2.6"
   }
 }

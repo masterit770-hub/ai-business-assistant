@@ -3,6 +3,7 @@ allowBuilds:
   '@google/genai': true
   better-sqlite3: true
   canvas: true
+  esbuild: true
   protobufjs: true
   sharp: true
   tesseract.js: true
@@ -11,3 +12,4 @@ onlyBuiltDependencies:
   - sharp
   - unrs-resolver
   - tesseract.js
+  - esbuild
