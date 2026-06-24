@@ -25,7 +25,10 @@ import {
 import type { TableSchema } from "./sql-guard.ts";
 import {
   isCellTallyQuestion,
+  isCellCountQuestion,
+  isGridShaped,
   tallyCellOccurrencesAcross,
+  countNamedEntityAcross,
   tableScopeForTally,
 } from "./cell-tally.ts";
 
@@ -221,6 +224,10 @@ export async function answerStructured(
   let primarySql: string | null = null;
   let verifiedTally: string | undefined;
   let verifiedTopGroup: { maxCount: number; leaders: string[] } | undefined;
+  // Set ONLY when the cell-count lane resolved a named value that occurs ZERO times — an HONEST
+  // zero (the value genuinely never appears), carried so the answer states "X does not appear"
+  // even though there are no rows to cite. Distinct from a query-failure note.
+  let countZeroNote: string | undefined;
   const failures: string[] = [];
 
   // ── CELL-TALLY LANE (UNIFIED, runs ONCE across all the grid tables it spans) ──────────────
@@ -232,10 +239,27 @@ export async function answerStructured(
   // ONCE over ALL the grid tables the question spans and aggregate, so the tally and the cited
   // rows are consistent and a no-month / system-wide question surfaces the TRUE cross-sheet max.
   // GENERAL — keyed off the question shape + table shape, never a specific dataset.
-  const gridTables = plan.tables.filter((t) => {
+  //
+  // CANDIDATE GRID SET — expanded beyond the planner's picks to the planner-picked grid's FAMILY.
+  // The planner is an LLM that, for a vague "how many times is <X> scheduled" / "who is scheduled
+  // most", often picks just ONE sheet (the live RED: it picked a December sheet where the name
+  // never appears and answered "0"). A tally/count over a scheduling grid is inherently a
+  // CROSS-SHEET operation, so we expand to the OTHER grids in the SAME FAMILY as a planner-picked
+  // grid — "same family" = they share a meaningful name segment (the monthly שיבוצים sheets share
+  // their stem; an unrelated intake/assessment grid does NOT). This both fixes the wrong-single-
+  // sheet bug AND avoids dragging in a different grid family (e.g. assessment forms whose names
+  // merely also contain a month word). Then tableScopeForTally narrows by the question's month
+  // words. Gated on "the planner routed to ≥1 grid" so a non-grid question is never hijacked.
+  // GENERAL — keyed off table SHAPE + shared name segments, never a dataset.
+  const plannerGrids = plan.tables.filter((t) => {
     const s = catalog.find((c) => c.table === t);
-    return s && isCellTallyQuestion(question, s);
+    return s && isGridShaped(s);
   });
+  const familyGrids = (predicate: (s: TableSchema) => boolean): string[] =>
+    catalog
+      .filter((c) => predicate(c) && plannerGrids.some((pt) => shareNameFamily(pt, c.table, question)))
+      .map((c) => c.table);
+  const gridTables = plannerGrids.length > 0 ? familyGrids((c) => isCellTallyQuestion(question, c)) : [];
   const handledByTally = new Set<string>();
   if (gridTables.length > 0) {
     const scopeTables = tableScopeForTally(question, gridTables);
@@ -273,8 +297,45 @@ export async function answerStructured(
     // through to the normal SQL path below (handledByTally stays empty for them).
   }
 
+  // ── CELL-COUNT LANE (a SPECIFIC value's occurrence count over the grid) ────────────────────
+  // "How many times is <X> scheduled?" is NOT a ranking — it asks for ONE named value's frequency
+  // ACROSS the grid's many columns, which a single guarded GROUP BY on one column cannot express.
+  // The live RED: the SQL lane wrote a one-column COUNT and answered "0" for a name that appears
+  // 15× across the sheets — a fabricated wrong count. We count it in code (exact), spanning the
+  // same scope the tally would. Runs only when the tally did NOT already handle these tables.
+  // Candidate grids from the planner-picked grid's FAMILY (same reason as the tally: a specific-
+  // value count is a cross-sheet op and the planner may pick the wrong single sheet), excluding any
+  // the tally already handled.
+  const countGrids =
+    plannerGrids.length > 0
+      ? familyGrids((c) => isCellCountQuestion(question, c)).filter((t) => !handledByTally.has(t))
+      : [];
+  if (countGrids.length > 0) {
+    const scopeTables = tableScopeForTally(question, countGrids);
+    const c = await countNamedEntityAcross(question, scopeTables, catalog, scope);
+    for (const u of c.usages) usages.push(u);
+    if (c.ok && c.entity) {
+      for (const tbl of scopeTables) handledByTally.add(tbl);
+      if (!primaryTable) {
+        primaryTable = c.tables[0] ?? scopeTables[0];
+        primarySql = `cell-count of "${c.entity}" across ${scopeTables.length} grid sheet(s) — exact occurrence count across cells = ${c.count}`;
+      }
+      if (c.count > 0) {
+        allRows.push(...c.rows);
+      }
+      // The verified count is AUTHORITATIVE (code-computed). Pass it as the tally so the grounded
+      // generator states the exact number — including an HONEST 0 ("X does not appear") with no
+      // fabrication. (A count is not a ranking, so no verifiedTopGroup/tie gate applies.)
+      verifiedTally = `[count] ${c.entity} = ${c.count} occurrence(s) across ${scopeTables.length} sheet(s)`;
+      if (c.count === 0) {
+        countZeroNote = `the value "${c.entity}" does not appear in the spanned scheduling sheet(s) — its occurrence count is 0`;
+      }
+    }
+    // If the count lane couldn't pin the named value, the grid tables fall through to SQL below.
+  }
+
   for (const table of plan.tables) {
-    if (handledByTally.has(table)) continue; // already answered by the unified cell-tally
+    if (handledByTally.has(table)) continue; // already answered by the unified cell-tally / count
     const outcome = await runForTable(question, table, catalog, samples, usages, scope);
     if (outcome.ok && outcome.rows.length > 0) {
       if (!primaryTable) { primaryTable = table; primarySql = outcome.sql; }
@@ -293,6 +354,13 @@ export async function answerStructured(
     // to the grounded generator so it restates every co-leader's exact count, not just one row.
     // verifiedTopGroup is its structured form, used by the content-fidelity gate downstream.
     return { table: primaryTable, sql: primarySql, rows: allRows, ok: true, verifiedTally, verifiedTopGroup, usages };
+  }
+  // HONEST-ZERO cell-count: the named value genuinely occurs 0 times. There are no rows to cite,
+  // but this is an authoritative, code-verified answer (not a query failure) — return ok:true with
+  // the count note + verifiedTally so the generator states "X does not appear" rather than
+  // fabricating a number or punting to a generic "no matching rows".
+  if (countZeroNote) {
+    return { table: primaryTable, sql: primarySql, rows: [], ok: true, note: countZeroNote, verifiedTally, usages };
   }
   // No rows cited. If a table was chosen + a valid query ran but matched nothing, that
   // is an honest empty result (ok:true, zero rows) — the generation layer states "no
@@ -342,4 +410,25 @@ function cleanSql(sql: string): string {
     .replace(/\s*```$/i, "")
     .replace(/;\s*$/, "")
     .trim();
+}
+
+// Do two table names belong to the SAME FAMILY of grids — i.e. do they share a meaningful name
+// segment that is NOT just a scope word from the question? The monthly שיבוצים scheduling sheets
+// share their stem "שיבוצים"; an unrelated intake/assessment grid does NOT — even though BOTH may
+// also contain a month word like "אוגוסט". So the month word is NOT a family signal: we EXCLUDE any
+// shared segment the question itself mentions (a month/scope word the user typed) and require a
+// shared segment that survives that exclusion (the real family stem). We split each sanitized
+// identifier on `_`/digits and keep segments of length ≥ 3 (a real word, not a number/short token).
+// GENERAL — no dataset/month/stem is named; it compares the tables' OWN names against the question.
+function shareNameFamily(a: string, b: string, question: string): boolean {
+  const q = question.normalize("NFC").toLowerCase();
+  const segs = (t: string) =>
+    t.normalize("NFC").toLowerCase().split(/[_\d]+/).filter((s) => s.length >= 3);
+  const sb = new Set(segs(b));
+  for (const s of segs(a)) {
+    // A segment the QUESTION mentions is a scope word (a month), not a family identifier — skip it.
+    if (q.includes(s)) continue;
+    if (sb.has(s)) return true;
+  }
+  return false;
 }

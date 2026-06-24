@@ -67,35 +67,70 @@ export function tallyDirection(question: string): "most" | "least" {
 // Columns that are bookkeeping, never tallied.
 const ANCHOR_COLS = new Set(["rowid_anchor", "id"]);
 
+// An occurrence/appearance/scheduling/activity cue (EN + HE) — a value RECURS across the grid's
+// cells. Shared by the ranking-tally and the specific-value-count detectors below.
+const OCCURS_RE =
+  /\b(appear|appears|scheduled|schedule|recur|recurs|frequent|frequency|occurr?ence|times|listed|assigned|active|busy)\b/;
+const OCCURS_HE = /(משובץ|משובצת|משובצים|שיבוצ|מופיע|מופיעה|פעמים|הופעות|שובץ|שובצה|תדירות|פעיל|עסוק)/;
+function hasOccurrenceCue(question: string): boolean {
+  return OCCURS_RE.test(question.normalize("NFC").toLowerCase()) || OCCURS_HE.test(question);
+}
+
 /**
- * Decide whether THIS question over THIS table is a cell-tally case: a "which/who recurs the
- * MOST / appears most often / is scheduled most / is the most frequent" ranking-by-occurrence
- * question over a WIDE table whose values are spread across many text columns. Conservative by
- * design — it only fires for an occurrence-frequency question on a genuinely grid-shaped table,
- * so an ordinary aggregate ("total cost", "count of contracts") still goes through SQL. Pure +
- * exported for unit testing (no LLM): keyed off the question's wording + the table's shape.
+ * GRID SHAPE: many columns, most free-text (not numeric) — the layout where a value recurs ACROSS
+ * columns (a calendar/scheduling grid). A narrow or mostly-numeric table is a normal SQL aggregate,
+ * not this. Shared by both grid detectors. Pure.
  */
-export function isCellTallyQuestion(question: string, table: TableSchema): boolean {
-  const q = question.normalize("NFC").toLowerCase();
-  // A frequency/ranking-by-occurrence intent in EN or HE. We require BOTH a superlative/ranking
-  // cue AND an occurrence/appearance/scheduling/activity cue, so a plain "how many rows" doesn't
-  // match. The cue lists are broadened to the NATURAL phrasings the client actually types (not
-  // just the one eval string): "who is scheduled the MOST", a no-month "מי משובץ הכי הרבה", a
-  // system-wide "מי משובץ הכי הרבה במערכת", "who is the MOST ACTIVE / BUSIEST person", "who is
-  // scheduled the LEAST". GENERAL — keyed off the question's words + the table SHAPE below.
-  const ranks =
-    /\b(most|fewest|least|top|highest|lowest|busiest|rank|ranked|first)\b/.test(q) ||
-    /(הכי|הרבה ביותר|הכי הרבה|הכי מעט|המשובצת|משובצת הכי|הכי משובץ|הנפוץ|השכיח|התדירות|ביותר)/.test(question);
-  const occurs =
-    /\b(appear|appears|scheduled|schedule|recur|recurs|frequent|frequency|occurr?ence|times|listed|assigned|active|busy)\b/.test(q) ||
-    /(משובץ|משובצת|משובצים|שיבוצ|מופיע|מופיעה|פעמים|הופעות|שובץ|שובצה|תדירות|פעיל|עסוק)/.test(question);
-  if (!(ranks && occurs)) return false;
-  // GRID SHAPE: many columns, and most are free-text (not numeric) — the layout where a value
-  // recurs ACROSS columns. A narrow or mostly-numeric table is a normal SQL aggregate, not this.
+export function isGridShaped(table: TableSchema): boolean {
   const dataCols = table.columns.filter((c) => !ANCHOR_COLS.has(c.name.toLowerCase()));
   if (dataCols.length < 4) return false;
   const textCols = dataCols.filter((c) => (c.type || "TEXT").toUpperCase() !== "REAL");
   return textCols.length >= Math.max(3, Math.ceil(dataCols.length / 2));
+}
+
+/**
+ * Decide whether THIS question over THIS table is a cell-tally RANKING case: a "which/who recurs
+ * the MOST / appears most often / is scheduled most / is the most frequent" ranking-by-occurrence
+ * question over a WIDE table whose values are spread across many text columns. Conservative by
+ * design — it only fires for an occurrence-frequency RANKING on a genuinely grid-shaped table, so
+ * an ordinary aggregate ("total cost", "count of contracts") still goes through SQL. Pure +
+ * exported for unit testing (no LLM): keyed off the question's wording + the table's shape.
+ */
+export function isCellTallyQuestion(question: string, table: TableSchema): boolean {
+  const q = question.normalize("NFC").toLowerCase();
+  // A superlative/ranking cue (EN or HE). We require BOTH a ranking cue AND an occurrence cue, so a
+  // plain "how many rows" doesn't match. Broadened to the NATURAL phrasings the client types.
+  const ranks =
+    /\b(most|fewest|least|top|highest|lowest|busiest|rank|ranked|first)\b/.test(q) ||
+    /(הכי|הרבה ביותר|הכי הרבה|הכי מעט|המשובצת|משובצת הכי|הכי משובץ|הנפוץ|השכיח|התדירות|ביותר)/.test(question);
+  if (!(ranks && hasOccurrenceCue(question))) return false;
+  return isGridShaped(table);
+}
+
+/**
+ * Decide whether THIS question is a SPECIFIC-VALUE OCCURRENCE COUNT over a grid: "HOW MANY TIMES is
+ * <X> scheduled / listed / does <X> appear". This is NOT a ranking (no superlative) and NOT a row
+ * count — it asks for ONE named value's frequency ACROSS the grid's many columns, which a single
+ * guarded GROUP BY on one column cannot express (the live RED: the SQL lane wrote a one-column
+ * COUNT and answered "0" for a name that appears 15× across the sheets). We count it in code, like
+ * the tally. Conservative: requires a "how many / count" cue AND an occurrence cue AND a grid
+ * shape. Pure + exported (no LLM). The NAMED value itself is extracted later by the model.
+ */
+export function isCellCountQuestion(question: string, table: TableSchema): boolean {
+  const q = question.normalize("NFC").toLowerCase();
+  // A "how many / how many times / count of" cue (EN + HE), WITHOUT a superlative (that's the
+  // ranking case above). "כמה פעמים" = how many times; "כמה פעמים משובצת" = how many times scheduled.
+  const counts =
+    /\b(how many times|how often|number of times|count of)\b/.test(q) ||
+    /(כמה פעמים|כמה פעם|מספר הפעמים|כמה משמרות|בכמה)/.test(question);
+  if (!counts) return false;
+  // Must NOT also be a superlative ranking (those go to the tally lane).
+  const isRanking =
+    /\b(most|fewest|least|top|highest|lowest|busiest)\b/.test(q) ||
+    /(הכי הרבה|הכי מעט|הרבה ביותר|הכי|ביותר)/.test(question);
+  if (isRanking) return false;
+  if (!hasOccurrenceCue(question)) return false;
+  return isGridShaped(table);
 }
 
 /**
@@ -220,6 +255,112 @@ export async function tallyCellOccurrencesAcross(
   return { rows: citeRows, tally: tallied, table: present[0], tables: present, direction, ok: true, usages };
 }
 
+export type CellCountResult = {
+  // The named value the count is FOR (verbatim as it appears in the grid), or null if the model
+  // couldn't pin one from the question.
+  entity: string | null;
+  // The EXACT occurrence count across every cell of the spanned tables (0 if it never appears).
+  count: number;
+  // One citable row per table where it occurs (so [S:table#rowid] resolves).
+  rows: SqlRow[];
+  tables: string[];
+  ok: boolean;
+  note?: string;
+  usages: ChatUsage[];
+};
+
+/**
+ * SPECIFIC-VALUE OCCURRENCE COUNT over the grid ("how many times is <X> scheduled"). The model
+ * extracts the NAMED value from the question and matches it to the closest real distinct cell value
+ * (so a slight spelling/spacing difference still resolves); CODE then counts that value's exact
+ * occurrences across every cell of the spanned tables. This fixes the live RED where the SQL lane
+ * wrote a one-column COUNT and answered "0" for a name that appears 15× across the sheets. Honest:
+ * if the value genuinely never appears, it returns count 0 with ok:true and no rows — the generator
+ * then says "X does not appear" rather than fabricating. Fail-soft: any error → {ok:false}.
+ */
+export async function countNamedEntityAcross(
+  question: string,
+  tables: string[],
+  catalog: TableSchema[],
+  scope?: CatalogScope
+): Promise<CellCountResult> {
+  const usages: ChatUsage[] = [];
+  const present = tables.filter((t) => catalog.some((c) => c.table === t));
+  if (present.length === 0) {
+    return { entity: null, count: 0, rows: [], tables: [], ok: false, note: "no table in catalog", usages };
+  }
+  // 1. Accumulate occurrences across every spanned table (same machinery as the tally).
+  const occ: OccMap = new Map();
+  let totalRows = 0;
+  for (const table of present) {
+    let rows: SqlRow[];
+    try {
+      rows = selectWithIds(`SELECT * FROM "${table}" LIMIT ${HARD_ROW_CAP}`, table, catalog, scope);
+    } catch {
+      usages.push({ live: false, provider: "—", model: "—" } as ChatUsage);
+      continue;
+    }
+    totalRows += rows.length;
+    accumulateOccurrences(occ, table, rows);
+  }
+  if (totalRows === 0) return { entity: null, count: 0, rows: [], tables: present, ok: false, note: "no rows", usages };
+
+  // 2. MODEL: which DISTINCT cell value does the question name (the closest exact match to the
+  //    person/value the user asked to count)? One JSON call. Returns a verbatim distinct value.
+  const distinct = [...occ.keys()];
+  const { value, usage } = await extractNamedValue(question, distinct);
+  usages.push(usage);
+  if (!value) {
+    return { entity: null, count: 0, rows: [], tables: present, ok: false, note: "could not pin the named value", usages };
+  }
+
+  // 3. CODE: the EXACT count for that value (0 if absent — an HONEST zero, not a fabrication).
+  const e = occ.get(value);
+  const count = e?.count ?? 0;
+  const anchors = e ? [...e.anchors.values()].sort((a, b) => a.table.localeCompare(b.table) || a.id - b.id) : [];
+  // Cite up to a few real rows where it occurs (one per table is enough for traceability).
+  const seenTables = new Set<string>();
+  const rows: SqlRow[] = [];
+  for (const a of anchors) {
+    if (seenTables.has(a.table)) continue;
+    seenTables.add(a.table);
+    rows.push({ table: a.table, id: a.id, data: { entity: value, occurrences: count } });
+  }
+  return { entity: value, count, rows, tables: present, ok: true, usages };
+}
+
+// Extract the single DISTINCT cell value the question names (the value to count). Returns a verbatim
+// member of `distinct` or null. JSON, temperature 0. Kept null-safe: the model must pick from the
+// real list (it cannot invent a value), so the count is always over a value that truly exists.
+async function extractNamedValue(
+  question: string,
+  distinct: string[]
+): Promise<{ value: string | null; usage: ChatUsage }> {
+  const system = `The user's QUESTION asks HOW MANY TIMES a specific named thing (usually a person's name) appears in a spreadsheet. You are given the QUESTION and the list of DISTINCT cell values. Pick the ONE distinct value that is the thing the question names (the closest exact match — allow for minor spelling/spacing differences, but it must clearly be the same name/thing). Return ONLY JSON: {"value": "<the exact distinct value, copied verbatim>"} — or {"value": null} if NONE of the distinct values is the named thing. Copy the value EXACTLY as written. Do not invent a value that is not in the list.`;
+  const user = `QUESTION: ${question}
+
+DISTINCT VALUES:
+${distinct.map((v) => `- ${v}`).join("\n")}
+
+Return the JSON now.`;
+  const { content, usage } = await chatWithUsage(
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    { json: true, temperature: 0 }
+  );
+  try {
+    const parsed = JSON.parse(content);
+    if (typeof parsed.value === "string" && distinct.includes(parsed.value)) {
+      return { value: parsed.value, usage };
+    }
+  } catch {
+    /* fall through to null */
+  }
+  return { value: null, usage };
+}
+
 // The per-entity occurrence accumulator: distinct cell value → its total count + the
 // table-qualified row anchors it occurs in. Exported shape so the pure tally can be tested.
 export type OccMap = Map<string, { count: number; anchors: Map<string, { table: string; id: number }> }>;
@@ -272,20 +413,28 @@ export function computeExtremeTally(
 }
 
 /**
- * Classify which of the distinct cell values are the ENTITY the question ranks (e.g. a person's
- * name), excluding day-headers, dates, and activity/event/place labels. Returns the verbatim
- * subset. JSON, temperature 0 — deterministic; copies values exactly so the code tally matches.
+ * Classify which of the distinct cell values are the ENTITY KIND the QUESTION ranks. The kind is
+ * QUESTION-DRIVEN, not hardcoded: a "who / which person is scheduled most" question ranks PEOPLE
+ * (so activities/places/dates are excluded); a "which ACTIVITY / event / place appears most"
+ * question ranks ACTIVITIES/PLACES (so PEOPLE are excluded). A pure day/date header is ALWAYS
+ * excluded (it is bookkeeping, never the answer to either). Returns the verbatim subset. JSON,
+ * temperature 0 — deterministic; copies values exactly so the code tally matches.
  */
 async function classifyEntities(
   question: string,
   distinct: string[]
 ): Promise<{ entities: string[]; usage: ChatUsage }> {
-  const system = `You are given the QUESTION a user asked about a spreadsheet, and a list of DISTINCT cell values from that spreadsheet. The question ranks some kind of ENTITY by how often it appears (e.g. which PERSON is scheduled most). Decide which of the listed values ARE that entity (e.g. a person's full name) and which are NOT.
+  const system = `You are given the QUESTION a user asked about a spreadsheet, and a list of DISTINCT cell values from that spreadsheet. The question ranks SOME KIND OF THING by how often it appears. Your job: FIRST read the question to determine WHICH KIND of thing it is ranking, THEN return only the listed values that ARE that kind.
 
-NOT the entity (exclude these): a day-of-week or date header (e.g. a weekday name followed by a date), a month or holiday name, and any activity / event / task / workshop / outing / place / room / location label. These describe WHAT happens or WHERE, not WHO — even though they sit in the same cells. Judge by meaning, in whatever language the values are written.
+STEP 1 — what KIND does the question rank? Read the question:
+- If it asks WHO / which PERSON / which girl / which volunteer / who is scheduled / who is most active → the kind is a PERSON (a human name). Include the person names; EXCLUDE activity/event/task/workshop/outing labels and place/room/location labels and dates.
+- If it asks which ACTIVITY / event / task / workshop / outing / session, or which PLACE / room / location → the kind is an ACTIVITY-or-PLACE label. Include those labels; EXCLUDE person names and dates.
+- If the question's kind is genuinely ambiguous, default to PERSON names.
 
-Return ONLY JSON: {"entities": ["...the values that ARE the entity being ranked..."]}.
-- Include a value ONLY if it is the entity the question is about (when in doubt about a plausible person name, include it; when a value is clearly an activity/place/date/header, exclude it).
+STEP 2 — ALWAYS EXCLUDE, regardless of the kind: a day-of-week or date header (e.g. a weekday name followed by a date), a bare month or holiday name, a pure number, and a column-header/label string. These are bookkeeping — never the answer to "most X".
+
+Return ONLY JSON: {"entities": ["...the values that ARE the kind the question ranks..."]}.
+- Include a value ONLY if it matches the KIND the question is about (per step 1). Do NOT include a person when the question ranks activities/places, and do NOT include an activity/place when the question ranks people.
 - COPY each value EXACTLY as written (same characters, same spacing) — do not translate, reformat, or merge.
 - Do not invent values that are not in the list.`;
   const user = `QUESTION: ${question}

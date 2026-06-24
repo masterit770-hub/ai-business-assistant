@@ -305,11 +305,33 @@ function crossCheckClaims(answer: string, evidence: Evidence): string[] {
     }
   }
 
-  // FABRICATION-ONLY FAILURE: the answer states cited figures yet NOT ONE of them appears
-  // anywhere in the retrieved evidence → genuinely ungrounded/fabricated. A single real
-  // figure (even one cited to the wrong page, or sitting beside a derived number) makes it
-  // grounded — placement & derivation never fail it.
-  if (citedFactualFigures > 0 && supportedFigures === 0) {
+  // GROUNDING RESCUE (placement-robust): if NO cited-adjacent figure resolved, the answer may
+  // still be genuinely grounded — the verified figure it restates can sit AWAY from the citation
+  // tokens (e.g. a code-verified COUNT answer: "X is scheduled 15 times … [S:..][S:..][S:..]" puts
+  // 15 in prose and the tokens at the end, so the only window-adjacent number is a benign derived
+  // one like "across 6 sheets"). Before failing, check whether ANY verified evidence figure (a
+  // result-row value or a server aggregate, like the code-computed count) appears as a standalone
+  // number ANYWHERE in the answer. If it does, the answer restates a real figure → it is grounded,
+  // and a benign derived number near a token must not sink it. GENERAL — keyed only off the
+  // verified-figure set, no question/domain/fact.
+  const statesAVerifiedFigure = (): boolean => {
+    const verified = new Set<number>([...numericValues, ...aggregates]);
+    // Scan the PROSE only — strip citation tokens first so a token's own row-id/page number
+    // (e.g. the "269" inside [S:contracts#269]) is NEVER mistaken for a stated figure. Otherwise a
+    // fabricated "$999,999 [S:contracts#269]" would be wrongly rescued because 269 is a real row id.
+    const prose = answer.replace(/\[(?:S|P):[^\]#]+#\d+\]/g, " ");
+    for (const m of prose.matchAll(NUMBER_RE)) {
+      const n = parseNumber(m[0]);
+      if (n != null && verified.has(round2(n)) && !isBareYear(m[0])) return true;
+    }
+    return false;
+  };
+
+  // FABRICATION-ONLY FAILURE: the answer states cited figures yet NOT ONE of them appears anywhere
+  // in the retrieved evidence → genuinely ungrounded/fabricated. A single real figure (even one
+  // cited to the wrong page, sitting beside a derived number, or stated away from the token but
+  // present in the verified set) makes it grounded — placement & derivation never fail it.
+  if (citedFactualFigures > 0 && supportedFigures === 0 && !statesAVerifiedFigure()) {
     return [
       `answer states cited figure(s) that appear nowhere in the retrieved evidence — ungrounded/fabricated`,
     ];
