@@ -26,28 +26,34 @@ Model: [`count-coverage.md`](./count-coverage.md). **Every capability gets one.*
 ## 2. Coverage matrix — capability × layer (the gap-finder)
 🟢 real guard · 🟡 partial / one-phrasing-only · 🔴 gap · — n/a
 
-| # | Capability | Unit | Integration | Component | E2E | Scenario gate |
-|---|---|:--:|:--:|:--:|:--:|---|
-| 1 | Upload→ingest (pdf/excel/word/csv/scanned) | 🟢 ocr-decision, pdf-pagination | 🟢 upload-formats, scanned-pdf-ocr | 🔴 chat-upload, upload-button | 🟡 documents | — |
-| 2 | Document Q&A — grounded + cited | 🟢 answer-helpers, validate-answer | 🟢 case-file-grounding, answer-reliability | — | 🟡 chat, golden-evals | — |
-| 3 | Structured / text-to-SQL (lookup, SUM/COUNT) | 🟢 sql-guard, structured-store, table-view | 🟢 router-decisions, edge AGG | — | 🔴 | — |
-| 4 | **Grid count / ranking (cell-tally)** | 🟡 trigger only — 🔴 tally-correctness fixture | 🟡 **one phrasing only** | — | 🔴 **failed live on variations** | 🟡 count-coverage.md (in progress) |
-| 5 | Hebrew / cross-lingual Q&A | 🟢 | 🟢 cold-start HE, edge cross-lingual | — | 🔴 | — |
-| 6 | Grounding fidelity / no-fabricate / validateAnswer | 🟢 validate-answer, validate-claim-support, salvage | 🟢 answer-reliability, edge UNANSWERABLE | — | 🟡 | 🟡 needs the adversarial set |
-| 7 | Recommendation — never dead-end | 🟢 grounded-general-fallback | 🟢 recommendation-substance | — | 🔴 | — |
-| 8 | Keyless / model-mode → clear error | 🟢 cloud-provider, hipaa-mode, keyless, model-switch | 🟢 keyless-model-error | 🔴 models-panel, model-switch | 🟡 model-modes | — |
-| 9 | Per-user settings / **prompt-save** | 🟢 settings-save-feedback | 🟢 per-user-settings, prompt-save-roundtrip | 🔴 answer-setup, prompts-panel | 🔴 | — |
-| 10 | Cold-start durability (docs + settings) | — | 🟢 cold-start-durability, settings-durability | — | — | — |
-| 11 | Delete source (purged from retrieval) | 🟢 deleted-sources | 🟢 edge DELETE | 🔴 materials-rail | 🔴 | — |
-| 12 | Multi-chat / conversations | 🟢 conversation, session-titles, ask-sessions | 🟢 ask-history | 🔴 conversations-column | 🔴 | — |
-| 13 | Auth / kick-out / per-user isolation | 🟢 account-validate, invite | 🟢 edge ISOLATION | 🔴 auth-form, users-panel, user-menu | 🟢 auth, admin | — |
-| 14 | Urgency flagging | 🟡 | 🟡 | 🔴 | 🔴 | 🔴 **uncovered** |
-| 15 | UI render (chat / sources / inspector / citations / account) | 🟢 answer-helpers | — | 🔴 most panels | 🟢 chat, rail-render, citations, account | — |
+The **API** column = the route-handler HTTP-contract layer (§6, `tests/api/*`). 🟢 = its handlers' contract
+is guarded (auth/role, validation, owner-scoping, error mapping).
 
-**What the matrix says right now (honest):** unit + integration are strong; the **entire Component column
-is 🔴** (0 of 26 stateful components — this is where the prompt-save lie lived); **E2E is patchy**; the
-**count capability** is mid-fix (one-phrasing integration + a live E2E failure); **urgency** is barely
-covered. These 🔴s are the work — not "nice to have."
+| # | Capability | Unit | Integration | API | Component | E2E | Scenario gate |
+|---|---|:--:|:--:|:--:|:--:|:--:|---|
+| 1 | Upload→ingest (pdf/excel/word/csv/scanned) | 🟢 ocr-decision, pdf-pagination | 🟢 upload-formats, scanned-pdf-ocr | 🟢 ingest-route | 🟢 chat-upload, upload-button | 🟡 documents | — |
+| 2 | Document Q&A — grounded + cited | 🟢 answer-helpers, validate-answer | 🟢 case-file-grounding, answer-reliability | 🟢 ask-route | 🟢 assistant-console | 🟡 chat, golden-evals | — |
+| 3 | Structured / text-to-SQL (lookup, SUM/COUNT) | 🟢 sql-guard, structured-store, table-view | 🟢 router-decisions, edge AGG | 🟢 table-route | 🟢 table-viewer | 🔴 | — |
+| 4 | **Grid count / ranking (cell-tally)** | 🟡 trigger only — 🔴 tally-correctness fixture | 🟡 **one phrasing only** | — | — | 🔴 **failed live on variations** | 🟡 count-coverage.md (in progress) |
+| 5 | Hebrew / cross-lingual Q&A | 🟢 | 🟢 cold-start HE, edge cross-lingual | — | — | 🔴 | — |
+| 6 | Grounding fidelity / no-fabricate / validateAnswer | 🟢 validate-answer, validate-claim-support, salvage | 🟢 answer-reliability, edge UNANSWERABLE | 🟢 ask-route (friendly error) | — | 🟡 | 🟡 needs the adversarial set |
+| 7 | Recommendation — never dead-end | 🟢 grounded-general-fallback | 🟢 recommendation-substance | — | — | 🔴 | — |
+| 8 | Keyless / model-mode → clear error | 🟢 cloud-provider, hipaa-mode, keyless, model-switch | 🟢 keyless-model-error | 🟢 settings, test-connection, local-models | 🟢 models-panel, model-switch | 🟡 model-modes | — |
+| 9 | Per-user settings / **prompt-save** | 🟢 settings-save-feedback | 🟢 per-user-settings, prompt-save-roundtrip | 🟢 settings-route (write-only-key) | 🟢 answer-setup, prompts-panel, account-panel | 🔴 | — |
+| 10 | Cold-start durability (docs + settings) | — | 🟢 cold-start-durability, settings-durability | — | — | — | — |
+| 11 | Delete source (purged from retrieval) | 🟢 deleted-sources | 🟢 edge DELETE | 🟢 documents-route (403 boundary) | 🟢 materials-rail, uploaded-docs, bundled-docs | 🔴 | — |
+| 12 | Multi-chat / conversations | 🟢 conversation, session-titles, ask-sessions | 🟢 ask-history | 🟢 history-route (owner-scope) | 🟢 conversations-column, history-panel | 🔴 | — |
+| 13 | Auth / kick-out / per-user isolation | 🟢 account-validate, invite | 🟢 edge ISOLATION | 🟢 admin-users, documents-file (isolation) | 🟢 auth-form, users-panel | 🟢 auth, admin | — |
+| 14 | Urgency flagging | 🟡 | 🟡 | — | 🟡 (rail badge) | 🔴 | 🔴 **uncovered** |
+| 15 | UI render (chat / sources / inspector / citations / account) | 🟢 answer-helpers | — | — | 🟢 console, rail, account, table-viewer | 🟢 chat, rail-render, citations, account | — |
+
+**What the matrix says now (honest):** unit + integration are strong; the **API contract layer** (§6) closed
+the route-handler gap — 119 tests across all 11 handlers, every guarded branch RED-first; the **Component**
+column went from 0 → **16 stateful components / 149 tests** (the prompt-save-lie class — Save-only-on-real-
+success, confirm-gated destructive actions, owner/role UI boundaries — is now guarded). Genuinely
+presentational components (answer-view, inspector-panels render-only; theme-toggle/simple-tabs/app-sidebar)
+remain uncovered **by judgment**, not gap — they carry no fetch/destructive state machine. Still open:
+**count** (mid-fix), **urgency** (barely covered), and **E2E** (patchy, non-deterministic).
 
 ---
 

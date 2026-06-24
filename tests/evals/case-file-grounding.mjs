@@ -46,6 +46,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import { skip as skipShared } from "./_skip.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -83,13 +84,9 @@ if (!process.env.SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_URL) {
 const haveSupabase = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
 const haveLlm = !!(process.env.LLM_API_KEY && process.env.LLM_API_KEY.length > 8);
 
-function skip(msg) {
-  console.log("\n" + "═".repeat(72));
-  console.log("⏭  SKIPPED — case-file-grounding eval did NOT run (this is NOT a pass).");
-  console.log("   " + msg);
-  console.log("═".repeat(72));
-  process.exit(0);
-}
+// Exit code is honest under CI_STRICT/REQUIRE_CREDS: a creds-skip in CI is a FAILURE
+// (exit 1), never a silent pass. The loud "NOT a pass" banner prints in either mode. See _skip.mjs.
+const skip = (msg) => skipShared("case-file-grounding", msg);
 if (!haveSupabase) skip("Supabase URL + SERVICE_ROLE_KEY not found — the throwaway-user/auth path can't run.");
 if (!haveLlm) skip("No LLM_API_KEY found — the router + answer pipeline make real LLM calls and can't run.");
 

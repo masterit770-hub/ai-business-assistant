@@ -12,6 +12,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { skip as skipShared } from "./_skip.mjs";
 
 const ROOT = "/home/codex/Projects/nucleus";
 const WANT = new Set(["SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]);
@@ -34,9 +35,10 @@ loadEnv(".env.local");
 loadEnv(".secrets/supabase.env");
 if (!process.env.SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_URL) process.env.SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 
+// Exit code is honest under CI_STRICT/REQUIRE_CREDS: a creds-skip in CI is a FAILURE
+// (exit 1), never a silent pass. The loud "NOT a pass" banner prints in either mode. See _skip.mjs.
 if (!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)) {
-  console.log("\n⏭  SKIPPED — Supabase not configured; per-user settings durability can't be exercised (NOT a pass).");
-  process.exit(0);
+  skipShared("per-user-settings", "Supabase not configured; per-user settings durability can't be exercised.");
 }
 
 const results = [];
