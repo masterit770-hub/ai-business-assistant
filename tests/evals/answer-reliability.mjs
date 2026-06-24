@@ -275,6 +275,40 @@ function gradeNoUngroundedOverOwnData(res) {
   };
 }
 
+// ── THE CORRECT-COUNT GRADER (cell-tally lane): over her real August grid, the engine must now
+// produce the CORRECT grounded ranking, not just an honest limit. GROUND TRUTH (hand-computed by
+// exact frequency tally over every cell of `שיבוצים-אוגוסט-2024…`, owner 3d1ca025): the top group
+// is SEVEN people tied at 5 occurrences. These are TEST ASSERTIONS against the data's ground truth
+// (verifying the engine's output) — NOT engine tuning; the engine names no hardcoded value.
+const AUG_TOP_LEADERS = ["אדירה סגל", "הדס נביאי", "הלל לוי", "מירה ארונוב", "נגה מאירסון", "נועה סביר", "רינה אנטוב"];
+// Known NON-people in that grid that must NEVER be reported as "the most scheduled" person — the
+// activity/place labels that out-rank the people in a NAIVE (unclassified) cell count. If any of
+// these is named as a person/answer, the name-vs-activity classification failed (RED #3).
+const AUG_ACTIVITIES = ["חדר מתנות", "הרכב + ימי הולדת", "חוויה עם נייר", "שזירת פרחים", "עציצי בטון", "טיול שיבא"];
+
+function gradeCorrectScheduleCount(res) {
+  // First the HARD floor: never an ungrounded fabrication / deflection / upload-denial.
+  const base = gradeNoUngroundedOverOwnData(res);
+  if (!base.ok) return base;
+  const a = res.answer ?? "";
+  // If it produced the grounded ranking (the desired outcome), it MUST be CORRECT:
+  if (isGroundedClean(res)) {
+    // (a) no activity label presented as the answer/person.
+    const activityShown = AUG_ACTIVITIES.find((act) => a.includes(act));
+    if (activityShown) return { ok: false, why: `RED#3: named an ACTIVITY ("${activityShown}") as a scheduled person` };
+    // (b) at least one real top-group leader is named (the answer actually ranks correctly).
+    const named = AUG_TOP_LEADERS.filter((n) => a.includes(n));
+    if (named.length === 0) return { ok: false, why: "grounded ranking but named NONE of the true 5-count leaders" };
+    // (c) the correct count (5) is stated for the top group.
+    if (!/\b5\b|חמ(ש|ישה)/.test(a)) return { ok: false, why: "named leaders but did not state the correct top count (5)" };
+    return { ok: true };
+  }
+  // An honest grounded-limit is still an acceptable FLOOR (base already verified it acknowledges
+  // her file + says-not-in-docs) — never a fabrication. (The tally lane makes the grounded case
+  // the norm; the floor catches a rare run where classification yielded nothing.)
+  return { ok: true };
+}
+
 const QUESTIONS = [
   // ─────────────── GMAIL USER — her Hebrew national-service handover file ───────────────
   {
@@ -377,11 +411,15 @@ const QUESTIONS = [
   {
     id: "HE/sched-august-most", ctx: SCHED, mustGround: false,
     q: "מי הכי משובץ באוגוסט?",
-    grade: (res) => gradeNoUngroundedOverOwnData(res),
+    // The cell-tally lane must now produce the CORRECT grounded ranking (7 leaders tied at 5),
+    // not just an honest limit — and never an activity-as-person. Floor: no ungrounded fabrication.
+    grade: (res) => gradeCorrectScheduleCount(res),
   },
   {
     id: "HE/sched-most-bare", ctx: SCHED, mustGround: false,
     q: "מי הבת שמשובצת הכי הרבה?",
+    // Same data, no month qualifier — still must never fabricate/deflect over her own data
+    // (it may rank one month's grid or honestly state the limit; both are correct, no RED).
     grade: (res) => gradeNoUngroundedOverOwnData(res),
   },
 

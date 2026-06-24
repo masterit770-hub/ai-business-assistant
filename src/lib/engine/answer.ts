@@ -293,6 +293,9 @@ async function runAnswerPipeline(
   const rows: SqlRow[] = [];
   let structuredSql: string | null = null;
   let structuredNote: string | undefined;
+  // The cell-tally lane's VERIFIED top-group summary (exact counts), passed to grounded
+  // generation as authoritative evidence so the answer names every co-leader with its real count.
+  let verifiedTally: string | undefined;
   if (route.sources.includes("structured")) {
     try {
       const structured = await answerStructured(question, includeBundled, structuredScope);
@@ -300,6 +303,7 @@ async function runAnswerPipeline(
       tel.generationMs += 0; // structured-lane LLM time folds into total; phase timer below
       rows.push(...structured.rows);
       structuredSql = structured.sql;
+      verifiedTally = structured.verifiedTally;
       if (!structured.ok || structured.rows.length === 0) structuredNote = structured.note;
     } catch (e) {
       // A MODEL-RUN FAILURE (keyless/bad-key/unreachable backend) must NOT be swallowed
@@ -555,7 +559,8 @@ async function runAnswerPipeline(
     structuredNote,
     TODAY,
     stylePreamble,
-    convo
+    convo,
+    verifiedTally
   );
   tel.generationMs += now() - genStart;
   tel.usages.push(grounded.usage);
@@ -1565,7 +1570,12 @@ async function generateGrounded(
   // Prior-conversation block (or ""). Threaded BEFORE the question so a follow-up
   // ("and Q2?", "who is the defendant there?") resolves against the thread while the
   // answer stays grounded strictly in the evidence below.
-  convo = ""
+  convo = "",
+  // The cell-tally lane's VERIFIED ranking (entity → exact count), when a wide/grid table was
+  // tallied for a "who recurs the most" question. This is AUTHORITATIVE ranking data the answer
+  // restates — it satisfies the "superlative needs ranking data" rule (the counts ARE the data),
+  // so the answer names the real top group instead of refusing. Undefined for every other turn.
+  verifiedTally?: string
 ): Promise<{ text: string; usage: ChatUsage }> {
   const structuredEvidence =
     rows.length === 0
@@ -1615,7 +1625,7 @@ GROUNDING RULES (these apply whenever the SOURCE flag is "documents", and cannot
 - For an ADVICE / STRATEGY question, ground the strategy in the cited literal figures and terms from the evidence (do not answer with generic, uncited boilerplate).
 - STATE THE MATERIAL FIGURE THE QUESTION IS ABOUT (mandatory whenever it is in the evidence): identify the central amount/figure/term the question turns on — the payment/charge/award it asks you to reduce, increase, change, compare, or dispute (e.g. "pay less X" is fundamentally about the current X). If that exact figure is written in the evidence, you MUST state it with its citation EARLY in the answer; an answer that advises on changing a figure without ever stating that figure has dropped the single most material fact and is incomplete. Surface every grounded figure the answer materially depends on — do not omit a key figure that is present in the evidence.
 - PREMISE CHECK (mandatory, BEFORE you write the advice): identify the KEY thing the question asks you to reduce, change, find, or argue (the specific award / charge / fee / term / party / figure it names). Check whether THAT EXACT thing actually appears in the evidence. If it does NOT — the question assumes something the records never state (e.g. it asks about a charge/award/term of one kind, but the records only impose a DIFFERENT kind) — you MUST OPEN your answer with ONE explicit sentence saying so ("the evidence does not contain/award X — what it actually orders is Y"), then give the COMPLETE grounded answer on that CORRECTED basis: state the real term/figure the records DO contain, each with its [P:...]/[S:...] citation, and build the advice on it. Do NOT silently adopt the question's (false) framing, do NOT echo the wrong term as if it were real, and do NOT refuse. (General — this polices ANY false premise, never a specific word.)
-- SUPERLATIVE / RANKING QUESTIONS NEED RANKING DATA — NEVER MANUFACTURE A "MOST/LEAST/TOP" ANSWER (mandatory, applies to ANY "who/what/which is the MOST X", "the LEAST X", "the HIGHEST/LOWEST", "appears the most", "ranked first/top", "happens most often" question): to name one item as "the most/least X", the evidence must actually contain the COUNTS, FREQUENCIES, TOTALS, RANKS, or SCORES that let you RANK the candidates by X. A bare list of names/rows with NO such quantity for X cannot answer a "most X" question — you CANNOT rank without numbers to rank by. So FIRST check: does the evidence carry a count/frequency/total/rank/score for the thing being maximized? • If YES, compute the max from those cited figures and answer with the winner, cited. • If NO (the evidence has names/entries but no quantity measuring X — e.g. names appear in a roster but the file has no schedule counts, no per-item totals, no tally) you MUST NOT pick one and call it "the most X". Do NOT promote an item just because it has a note, appears first, is the only one described, or is mentioned more times in the text — text mentions, narrative notes, and list position are NOT a ranking of X and treating them as one is FABRICATION. Instead say plainly that the file does not contain the counts/figures needed to determine the most X (name what it DOES contain, cited). This is a SPECIFIC FACT about their content: inventing the "most X" when the data can't rank is exactly the forbidden fabrication. Do NOT open by naming a candidate and then hedge — the honest "the data doesn't contain the figures to rank by X" answer is the complete, correct answer.
+- SUPERLATIVE / RANKING QUESTIONS NEED RANKING DATA — NEVER MANUFACTURE A "MOST/LEAST/TOP" ANSWER (mandatory, applies to ANY "who/what/which is the MOST X", "the LEAST X", "the HIGHEST/LOWEST", "appears the most", "ranked first/top", "happens most often" question): to name one item as "the most/least X", the evidence must actually contain the COUNTS, FREQUENCIES, TOTALS, RANKS, or SCORES that let you RANK the candidates by X. A bare list of names/rows with NO such quantity for X cannot answer a "most X" question — you CANNOT rank without numbers to rank by. So FIRST check: does the evidence carry a count/frequency/total/rank/score for the thing being maximized? • If a VERIFIED TALLY block is provided below, THOSE ARE the ranking counts — they were computed by exact code over every cell of the table and the entities were already filtered to the kind the question asks about. Answer with the top group from the tally, stating each leader and its exact count, cited to the table rows. (If several tie at the top, name them ALL as tied — do not arbitrarily pick one.) • Else if the evidence carries a count/frequency/total/rank/score, compute the max from those cited figures and answer with the winner, cited. • If NO ranking quantity exists at all (the evidence has names/entries but no count/tally for X) you MUST NOT pick one and call it "the most X". Do NOT promote an item just because it has a note, appears first, is the only one described, or is mentioned more times in the text — text mentions, narrative notes, and list position are NOT a ranking of X and treating them as one is FABRICATION. Instead say plainly that the file does not contain the counts/figures needed to determine the most X (name what it DOES contain, cited). This is a SPECIFIC FACT about their content: inventing the "most X" when the data can't rank is exactly the forbidden fabrication. Do NOT open by naming a candidate and then hedge — the honest "the data doesn't contain the figures to rank by X" answer is the complete, correct answer.
 - A citation token is ALWAYS a single id: [S:contracts#12]. NEVER write a range like [S:contracts#12–#47] and NEVER merge ids — cite each row with its own token.
 - When you list sample rows, put each row's OWN token at the end of that row's line.
 - Use ONLY tokens that appear in the evidence below. Never invent a citation.
@@ -1630,7 +1640,7 @@ GROUNDING RULES (these apply whenever the SOURCE flag is "documents", and cannot
   const user = `Today's date is ${today}. Any filtering in the structured evidence (e.g. "next 90 days") was already computed relative to today, so the rows below are the answer set — do not say the date is unknown.
 ${convo ? `\n${convo}\n` : ""}
 Question: ${question}
-${structuredNote ? `\nSTRUCTURED LANE NOTE: ${structuredNote}. (If this means the data has no column for what's asked, say so honestly and report what the data DOES contain.)\n` : ""}
+${structuredNote ? `\nSTRUCTURED LANE NOTE: ${structuredNote}. (If this means the data has no column for what's asked, say so honestly and report what the data DOES contain.)\n` : ""}${verifiedTally ? `\nVERIFIED TALLY (exact occurrence counts computed by code over EVERY cell of the table; the listed entities were already filtered to the kind the question asks about — these ARE the ranking figures, state the top group with these exact counts, cited to the structured rows): ${verifiedTally}\n` : ""}
 STRUCTURED EVIDENCE (SQLite query result rows):
 ${structuredEvidence}
 

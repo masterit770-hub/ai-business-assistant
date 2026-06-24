@@ -23,6 +23,7 @@ import {
   type SqlRow,
 } from "./structured-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
+import { isCellTallyQuestion, tallyCellOccurrences } from "./cell-tally.ts";
 
 // `||` (not `??`) so an empty env value ("") falls through to the real date instead
 // of producing a broken date filter like date('', '+90 days') → NULL.
@@ -44,6 +45,11 @@ export type StructuredResult = {
   // A human note when we couldn't answer structurally (no table matched, or the
   // query failed twice) — surfaced honestly, never as a fabricated answer.
   note?: string;
+  // The cell-tally lane's VERIFIED top-group summary (exact code counts + model-classified
+  // entities), e.g. "X = 5, Y = 5; next: Z = 4". Distinct from `note` (a couldn't-answer
+  // signal): this is AUTHORITATIVE evidence the grounded generator restates so it names every
+  // co-leader, not just the one cited row. Undefined when the tally lane didn't run.
+  verifiedTally?: string;
   usages: ChatUsage[];
 };
 
@@ -202,9 +208,34 @@ export async function answerStructured(
   const allRows: SqlRow[] = [];
   let primaryTable: string | null = null;
   let primarySql: string | null = null;
+  let verifiedTally: string | undefined;
   const failures: string[] = [];
 
   for (const table of plan.tables) {
+    const schema = catalog.find((c) => c.table === table);
+    // CELL-TALLY LANE: a "which <entity> recurs the MOST" question over a WIDE/GRID table that
+    // a single SELECT can't express (e.g. a scheduling grid: a person spread across many day
+    // columns). Run it FIRST for such a table — exact code-tally + model classification — so we
+    // return the real top group rather than a wrong one-column GROUP BY row. If it can't apply,
+    // fall through to the normal SQL path. GENERAL: keyed off the question shape + table shape.
+    if (schema && isCellTallyQuestion(question, schema)) {
+      const t = await tallyCellOccurrences(question, table, catalog, scope);
+      for (const u of t.usages) usages.push(u);
+      if (t.ok && t.rows.length > 0) {
+        if (!primaryTable) { primaryTable = table; primarySql = `cell-tally over "${table}" (occurrence frequency across cells)`; }
+        allRows.push(...t.rows);
+        // Summarize the FULL verified top group so the grounded generator names every co-leader,
+        // not just the one cited row. Counts are EXACT (code-computed), entities model-classified.
+        const top = t.tally.filter((x) => x.count === t.tally[0].count);
+        verifiedTally = `${top.map((x) => `${x.entity} = ${x.count}`).join(", ")}${
+          t.tally.length > top.length
+            ? `; next: ${t.tally.slice(top.length, top.length + 3).map((x) => `${x.entity} = ${x.count}`).join(", ")}`
+            : ""
+        }`;
+        continue;
+      }
+      // tally couldn't apply (no entities classified, empty table) — fall through to SQL.
+    }
     const outcome = await runForTable(question, table, catalog, samples, usages, scope);
     if (outcome.ok && outcome.rows.length > 0) {
       if (!primaryTable) { primaryTable = table; primarySql = outcome.sql; }
@@ -219,7 +250,9 @@ export async function answerStructured(
   }
 
   if (allRows.length > 0) {
-    return { table: primaryTable, sql: primarySql, rows: allRows, ok: true, usages };
+    // verifiedTally (when set) is the cell-tally lane's authoritative top-group summary, passed
+    // to the grounded generator so it restates every co-leader's exact count, not just one row.
+    return { table: primaryTable, sql: primarySql, rows: allRows, ok: true, verifiedTally, usages };
   }
   // No rows cited. If a table was chosen + a valid query ran but matched nothing, that
   // is an honest empty result (ok:true, zero rows) — the generation layer states "no
