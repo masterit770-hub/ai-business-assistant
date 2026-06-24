@@ -213,7 +213,22 @@ export async function answerStructured(
 
   const { plan, usage: planUsage } = await planTables(question, catalogText);
   usages.push(planUsage);
-  if (plan.tables.length === 0) {
+  // EARLY-RETURN GUARD — but NOT when the question is a grid tally/count over grids that EXIST.
+  // The planner is a flaky LLM: for an UNSCOPED specific-person count ("how many times is <X>
+  // scheduled", no month) the cryptic Hebrew sheet names give it no anchor, so it returns
+  // tables:[] and we used to bail here with "no relevant table" — even though the cell-count
+  // lane below counts that name across ALL her grids perfectly (the live RED: רינה אנטוב = 15
+  // deflected to a general "couldn't find scheduling info, try COUNTIF"). The grid lanes already
+  // own a "planner picked no grid → fall back to every matching grid" path (familyGrids), so when
+  // THIS question is a grid tally/count and at least one grid table exists, we must NOT bail —
+  // we let the lanes fire on the full-grid fallback. A non-grid question (the planner's empty
+  // pick is genuinely correct) still returns the honest "no relevant table". GENERAL — keyed off
+  // table SHAPE + the question's tally/count shape, never a dataset.
+  const anyGrid = catalog.some((c) => isGridShaped(c));
+  const isGridTallyOrCount =
+    anyGrid &&
+    catalog.some((c) => isCellTallyQuestion(question, c) || isCellCountQuestion(question, c));
+  if (plan.tables.length === 0 && !isGridTallyOrCount) {
     return { table: null, sql: null, rows: [], ok: false, note: "no relevant table for this question", usages };
   }
 
@@ -255,11 +270,25 @@ export async function answerStructured(
     const s = catalog.find((c) => c.table === t);
     return s && isGridShaped(s);
   });
-  const familyGrids = (predicate: (s: TableSchema) => boolean): string[] =>
-    catalog
-      .filter((c) => predicate(c) && plannerGrids.some((pt) => shareNameFamily(pt, c.table, question)))
-      .map((c) => c.table);
-  const gridTables = plannerGrids.length > 0 ? familyGrids((c) => isCellTallyQuestion(question, c)) : [];
+  // The candidate grids for a predicate: ALL catalog grids matching it, narrowed to the planner-
+  // picked grid's name-FAMILY *when the planner picked one* (so a month query stays in the right
+  // family). When the planner picked NO grid (it is a FLAKY LLM that intermittently routes a
+  // ranking-over-grids question to a non-grid table — the live RED where a system-wide count fell
+  // to a SQL monthly-total GROUP BY), we do NOT gate the lane off: we fall back to every catalog
+  // grid that matches the question, then tableScopeForTally narrows by the question's month words.
+  // This makes the cell-tally/count lane fire DETERMINISTICALLY for a grid-ranking question instead
+  // of depending on the planner's coin-flip. GENERAL — keyed off table SHAPE + the question.
+  const familyGrids = (predicate: (s: TableSchema) => boolean): string[] => {
+    const matching = catalog.filter((c) => predicate(c));
+    const inFamily =
+      plannerGrids.length > 0
+        ? matching.filter((c) => plannerGrids.some((pt) => shareNameFamily(pt, c.table, question)))
+        : [];
+    // Prefer the planner's family; fall back to ALL matching grids when the planner picked no grid
+    // (or its picks share no family with the matching grids).
+    return (inFamily.length > 0 ? inFamily : matching).map((c) => c.table);
+  };
+  const gridTables = familyGrids((c) => isCellTallyQuestion(question, c));
   const handledByTally = new Set<string>();
   if (gridTables.length > 0) {
     const scopeTables = tableScopeForTally(question, gridTables);
@@ -292,9 +321,20 @@ export async function answerStructured(
       // tie). `maxCount` here means "the count at the asked-for extreme" (max for most, min for
       // least) — the value the answer MUST state as the winner's count.
       verifiedTopGroup = { maxCount: extreme[0].count, leaders: extreme.map((x) => x.entity) };
+    } else {
+      // The tally is THE correct lane for this grid-ranking question but it couldn't apply this turn
+      // (the classifier returned no entities even after a retry, or the tables were empty). We must
+      // NOT let these grid sheets fall through to the generic SQL lane — a single-column GROUP BY
+      // over a calendar grid produces a MISLEADING "monthly total" answer (the observed
+      // intermittency: "each row shows a total of N schedules, no names"). Mark them handled so SQL
+      // is skipped; with no rows cited, the generation layer gives an HONEST grounded-limit answer
+      // ("I couldn't rank your sheets reliably this turn") rather than a fabricated aggregate.
+      for (const tbl of scopeTables) handledByTally.add(tbl);
+      if (!primaryTable) {
+        primaryTable = scopeTables[0];
+        primarySql = `cell-tally over ${scopeTables.length} grid sheet(s) — could not classify the ranked entity this turn (no fabricated aggregate)`;
+      }
     }
-    // If the tally couldn't apply (no entities classified, empty tables) the grid tables fall
-    // through to the normal SQL path below (handledByTally stays empty for them).
   }
 
   // ── CELL-COUNT LANE (a SPECIFIC value's occurrence count over the grid) ────────────────────
@@ -303,13 +343,11 @@ export async function answerStructured(
   // The live RED: the SQL lane wrote a one-column COUNT and answered "0" for a name that appears
   // 15× across the sheets — a fabricated wrong count. We count it in code (exact), spanning the
   // same scope the tally would. Runs only when the tally did NOT already handle these tables.
-  // Candidate grids from the planner-picked grid's FAMILY (same reason as the tally: a specific-
-  // value count is a cross-sheet op and the planner may pick the wrong single sheet), excluding any
-  // the tally already handled.
-  const countGrids =
-    plannerGrids.length > 0
-      ? familyGrids((c) => isCellCountQuestion(question, c)).filter((t) => !handledByTally.has(t))
-      : [];
+  // Candidate grids (via the same family-or-all fallback as the tally, so a flaky planner pick
+  // doesn't gate the lane off), excluding any the tally already handled.
+  const countGrids = familyGrids((c) => isCellCountQuestion(question, c)).filter(
+    (t) => !handledByTally.has(t)
+  );
   if (countGrids.length > 0) {
     const scopeTables = tableScopeForTally(question, countGrids);
     const c = await countNamedEntityAcross(question, scopeTables, catalog, scope);

@@ -229,9 +229,18 @@ export async function tallyCellOccurrencesAcross(
   }
 
   // 2. MODEL: which distinct values are the entity the question ranks vs noise (day-headers,
-  //    dates, activity/event/place labels)? ONE JSON call over the union of distinct values.
-  const { entities, usage } = await classifyEntities(question, distinct);
+  //    dates, activity/event/place labels)? ONE JSON call over the union of distinct values. The
+  //    classifier is an LLM call that very occasionally returns an empty/unparseable result; a
+  //    bare-empty result would make the lane bail and fall through to a generic SQL GROUP BY that
+  //    fabricates monthly totals (the observed intermittency). So we RETRY ONCE on empty before
+  //    giving up — cheap, and it removes the flaky fall-through.
+  let { entities, usage } = await classifyEntities(question, distinct);
   usages.push(usage);
+  if (entities.length === 0) {
+    const retry = await classifyEntities(question, distinct);
+    usages.push(retry.usage);
+    entities = retry.entities;
+  }
   if (entities.length === 0) {
     return { rows: [], tally: [], table: present[0], tables: present, direction, ok: false, note: "no entities classified to rank", usages };
   }

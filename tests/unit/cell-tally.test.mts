@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   isCellTallyQuestion,
+  isCellCountQuestion,
+  isGridShaped,
   tallyDirection,
   tableScopeForTally,
   accumulateOccurrences,
@@ -91,6 +93,33 @@ test("FIRES on the live-regression natural variations over a grid table", () => 
   assert.equal(isCellTallyQuestion("who is the most active person in the schedules?", grid), true);
   assert.equal(isCellTallyQuestion("מי משובץ הכי מעט בשיבוצים?", grid), true); // least
   assert.equal(isCellTallyQuestion("who is scheduled the least?", grid), true);
+});
+
+// ── SPECIFIC-VALUE COUNT (DV4) — "how many times is <X> scheduled" over a grid ──────────────────
+// A specific-value occurrence COUNT (not a ranking, not a row count) needs the cell-count lane: a
+// single guarded GROUP BY on one column can't count a value across the grid's many columns (the
+// live RED: the SQL lane answered "0" for a name that appears 15×). isCellCountQuestion is the pure
+// trigger — it must fire for "how many times" / "כמה פעמים", and NOT for a ranking or a row count.
+test("isCellCountQuestion FIRES on a specific-value occurrence count over a grid", () => {
+  assert.equal(isCellCountQuestion("כמה פעמים רינה אנטוב משובצת?", grid), true);
+  assert.equal(isCellCountQuestion("כמה פעמים רינה אנטוב משובצת באוגוסט?", grid), true);
+  assert.equal(isCellCountQuestion("how many times is Rina scheduled?", grid), true);
+});
+test("isCellCountQuestion does NOT fire on a RANKING (that's the tally lane) or a row count", () => {
+  // A superlative ranking → the tally lane owns it, not the count lane.
+  assert.equal(isCellCountQuestion("מי משובץ הכי הרבה פעמים?", grid), false);
+  assert.equal(isCellCountQuestion("who is scheduled the most times?", grid), false);
+  // A plain row count is an ordinary SQL aggregate, not a cell occurrence count.
+  assert.equal(isCellCountQuestion("how many rows are there?", grid), false);
+  // No grid shape → not this lane.
+  const narrow: TableSchema = { table: "t", columns: [{ name: "id", type: "INTEGER" }, { name: "name", type: "TEXT" }] };
+  assert.equal(isCellCountQuestion("how many times is X listed?", narrow), false);
+});
+
+// ── GRID SHAPE predicate (shared by both lanes) ────────────────────────────────────────────────
+test("isGridShaped: a wide free-text table is a grid; a narrow/numeric one is not", () => {
+  assert.equal(isGridShaped(grid), true);
+  assert.equal(isGridShaped({ table: "c", columns: [{ name: "id", type: "INTEGER" }, { name: "vendor", type: "TEXT" }, { name: "cost", type: "REAL" }] }), false);
 });
 
 // ── DIRECTION: most vs least ──────────────────────────────────────────────────────────────────

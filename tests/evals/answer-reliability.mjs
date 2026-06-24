@@ -58,6 +58,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import { skip as skipShared } from "./_skip.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -93,13 +94,9 @@ if (!process.env.SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_URL) {
 const haveSupabase = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
 const haveLlm = !!(process.env.LLM_API_KEY && process.env.LLM_API_KEY.length > 8);
 
-function skip(msg) {
-  console.log("\n" + "═".repeat(72));
-  console.log("⏭  SKIPPED — answer-reliability eval did NOT run (this is NOT a pass).");
-  console.log("   " + msg);
-  console.log("═".repeat(72));
-  process.exit(0);
-}
+// Exit code is honest under CI_STRICT/REQUIRE_CREDS: a creds-skip in CI is a FAILURE
+// (exit 1), never a silent pass. The loud "NOT a pass" banner prints in either mode. See _skip.mjs.
+const skip = (msg) => skipShared("answer-reliability", msg);
 if (!haveSupabase) skip("Supabase URL + SERVICE_ROLE_KEY not found — the corpus + auth path can't run.");
 if (!haveLlm) skip("No LLM_API_KEY found — the router + answer pipeline make real LLM calls and can't run.");
 
@@ -215,8 +212,13 @@ function gFact(...rx) {
 // מכילות" (f. pl., when it refers to הראיות/the evidence). All three are the SAME honest
 // not-in-docs reply; the recognizer must accept every inflection or it false-fails a correct
 // answer purely on grammatical gender (a grader gap, not an engine miss).
+// "contain" inflects by the (gendered) subject: m.sg "אינו מכיל", m.pl "אינם מכילים", f.pl
+// "אינן מכילות", AND f.sg "אינה מכילה" (when the subject is העדות/הראיה — the evidence). The honest
+// path also commonly says "אינה מזכיר/ה" (does not mention), "לא הצלחתי למצוא" (I couldn't find),
+// and "לא נמצא/ה ... ב..." — all the SAME honest not-in-docs reply. Accepting every inflection/
+// phrasing is correctness, not weakening: the no-fabrication guarantee is checked SEPARATELY.
 const SAYS_NOT_IN_DOCS_HE =
-  /(אינו זמין|לא זמין|לא מצוין|אין במסמך|אין מידע|לא ניתן לקבוע|אינו מכיל|אינם מכילים|אינן מכילות|לא מכיל|אין בהם|לא נמצא|אין שיבוצ|לא כולל|אין נתונ|אין רשימת שיבוצ)/;
+  /(אינו זמין|לא זמין|לא מצוין|אין במסמך|אין מידע|לא ניתן לקבוע|אינו מכיל|אינה מכילה|אינם מכילים|אינן מכילות|לא מכיל|אינה מזכיר|אינו מזכיר|לא מזכיר|לא הצלחתי למצוא|אין בהם|לא נמצא|אין שיבוצ|לא כולל|אין נתונ|אין רשימת שיבוצ)/;
 const SAYS_NOT_IN_DOCS_EN =
   /(not (in|contain|include|available|present|stated|found)|does not (contain|include|have|cover)|do not contain|no (information|data|record|mention)|isn'?t (in|available)|cannot (find|determine)|I don'?t have (access|real-?time|live))/i;
 // Normalize markdown emphasis before matching so a correct honest answer that bolds a
@@ -314,6 +316,32 @@ function gradeCorrectScheduleCount(res) {
   return { ok: true };
 }
 
+// ── SELF-CONSISTENCY (SV1): the prose must AGREE with its own cited [S:] rows ─────────────────
+// The dangerous live bug was a SELF-CONTRADICTION: the cited evidence rows showed occurrences=10
+// while the prose declared "Rina=5" as the leader. A cell-tally answer's cited rows carry the
+// code-computed {entity, occurrences}; the prose MUST state the MAX of those cited occurrences and
+// name an entity that holds it. This grader fails the moment the prose disagrees with the evidence
+// it cites — independent of any external ground truth. (For a "least" question the leader is the
+// MIN of the cited rows; the direction is passed in.) GENERAL — reads only res.evidence.rows.
+function selfConsistencyCheck(res, direction = "most") {
+  const rows = (res.evidence?.rows ?? []).filter((r) => r?.data && typeof r.data.occurrences === "number");
+  if (rows.length === 0) return { ok: true }; // not a cell-tally/count answer → nothing to cross-check
+  const a = res.answer ?? "";
+  const counts = rows.map((r) => r.data.occurrences);
+  const extreme = direction === "least" ? Math.min(...counts) : Math.max(...counts);
+  // The prose MUST state the extreme count from its OWN cited rows (not some other number).
+  const statesExtreme = new RegExp(`(?<![\\d.,])${extreme}(?!\\d)(?![.,]\\d)`).test(a);
+  if (!statesExtreme) {
+    return { ok: false, why: `SELF-CONTRADICTION: cited rows show ${direction} occurrences=${extreme}, but the prose does not state ${extreme} (it reported a different number than its own evidence)` };
+  }
+  // At least one entity at that extreme (per the cited rows) must be NAMED in the prose.
+  const extremeEntities = rows.filter((r) => r.data.occurrences === extreme).map((r) => String(r.data.entity));
+  if (extremeEntities.length > 0 && !extremeEntities.some((e) => a.includes(e))) {
+    return { ok: false, why: `SELF-CONTRADICTION: cited rows put ${extremeEntities.join("/")} at the ${direction} count ${extreme}, but the prose names none of them` };
+  }
+  return { ok: true };
+}
+
 // ── THE VARIATION GRADER (the live count-regression fix) ─────────────────────────────────────
 // The live regression: the cell-tally lane passed the eval's exact "August" string but FAILED on
 // the NATURAL variations the client actually asks (no-month, system-wide, "most active", a
@@ -333,7 +361,7 @@ function gradeCorrectScheduleCount(res) {
 // group at the extreme; `runnerUpBelow` (optional) is a count that is the NEXT rank and must NOT
 // be presented as THE answer count (a guard the non-max-as-max RED would trip).
 function gradeCellTallyFaithful(opts) {
-  const { maxCount, leaders, forbidActivities = true } = opts;
+  const { maxCount, leaders, forbidActivities = true, direction = "most" } = opts;
   // Match the exact integer as a standalone token (not a substring of a larger number).
   const statesCount = (a) => new RegExp(`(?<![\\d.,])${maxCount}(?!\\d)(?![.,]\\d)`).test(a);
   return (res) => {
@@ -346,6 +374,11 @@ function gradeCellTallyFaithful(opts) {
     if (!isGroundedClean(res)) {
       return { ok: false, why: `expected a grounded tally answer, got mode=${res.mode} (tally lane did not fire / produce a ranking)` };
     }
+    // (SV1) SELF-CONSISTENCY: the prose must agree with its OWN cited [S:] rows before we even
+    // check it against external ground truth — this catches the "evidence shows 29, prose says 5"
+    // contradiction class directly.
+    const sc = selfConsistencyCheck(res, direction);
+    if (!sc.ok) return sc;
     // (a) the TRUE extreme count is stated.
     if (!statesCount(a)) return { ok: false, why: `did not state the true extreme count (${maxCount}) — a non-extreme may have been reported as the answer` };
     // (b) the FULL tied group is named — no collapse. Every co-leader at the extreme must appear.
@@ -512,9 +545,21 @@ const QUESTIONS = [
     grade: gradeCellTallyFaithful({ maxCount: 18, leaders: DEC_TOP_LEADERS }),
   },
   {
-    // VARIATION: "most active" in English — a different wording entirely; must still trigger the
-    // tally and report the system-wide sole max (נגה מאירסון = 29), full faithfulness.
+    // VARIATION: "most active" in English — this is the EXACT live-failing phrasing (NO trailing
+    // "in the schedules" scheduling-context cue). The prior eval string DID include "in the
+    // schedules?", which gave the flaky planner an anchor so it routed; the bare natural phrasing
+    // the client typed did NOT — the planner returned tables:[] and answerStructured bailed before
+    // the tally lane, deflecting to mode=general ("your file has no activity counts, try Asana/Jira",
+    // 0 cites). Fixed by letting the tally lane fire on a planner-punt. Must trigger the tally and
+    // report the system-wide sole max (נגה מאירסון = 29), full faithfulness.
     id: "EN/sched-most-active", ctx: SCHED, mustGround: false,
+    q: "who is the most active person",
+    grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // KEEP the qualified phrasing too (it already worked live) — a regression guard that the
+    // scheduling-context cue still grounds, so the fix didn't trade one routing for another.
+    id: "EN/sched-most-active-qualified", ctx: SCHED, mustGround: false,
     q: "who is the most active person in the schedules?",
     grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
   },
@@ -537,6 +582,129 @@ const QUESTIONS = [
       // Never an activity/place label as the person.
       const act = AUG_ACTIVITIES.find((x) => a.includes(x));
       if (act) return { ok: false, why: `named an ACTIVITY/PLACE ("${act}") as the least-scheduled person` };
+      return { ok: true };
+    },
+  },
+
+  // ── FULL COUNT SPACE: per-month (June/July), specific-person count, exactly-N, activity-as-top ──
+  {
+    // PER-MONTH June — a SOLE leader (רינה אנטוב @5; חדר מתנות=6 is a place, excluded). Proves the
+    // engine names ONE when there's one winner (no fabricated tie) and scopes to the June sheet.
+    id: "HE/sched-june-most", ctx: SCHED, mustGround: false,
+    q: "בשיבוצי יוני מי משובץ הכי הרבה?",
+    grade: gradeCellTallyFaithful({ maxCount: 5, leaders: ["רינה אנטוב"] }),
+  },
+  {
+    // PER-MONTH July — a 7-way tie @5 (same shape as August). Proves per-month scoping + full tie.
+    id: "HE/sched-july-most", ctx: SCHED, mustGround: false,
+    q: "בשיבוצי יולי מי משובץ הכי הרבה?",
+    grade: gradeCellTallyFaithful({ maxCount: 5, leaders: AUG_TOP_LEADERS }),
+  },
+  {
+    // DV4 specific-person count, SYSTEM-WIDE (no month) — she appears 15× across the sheets. This is
+    // the EXACT live-failing phrasing (verb-before-name word order: "משובצת רינה אנטוב"), which is
+    // DISTINCT from the prior eval string "רינה אנטוב משובצת" (name-before-verb). The live RED: the
+    // planner returned tables:[] for this unscoped, no-month, cryptic-Hebrew-sheet question, so
+    // answerStructured bailed with "no relevant table" BEFORE the cell-count lane ran → a mode=general
+    // deflection ("couldn't find scheduling info for Rina, try COUNTIF", 0 cites) for a name that
+    // appears 15×. The prior eval string happened to route (planner picked a sheet); the natural
+    // verb-first phrasing the client typed did not. Fixed by letting the grid count/tally lanes fire
+    // even on a planner-punt (text-to-sql early-return guard). Must now say 15, cited.
+    id: "HE/sched-count-rina-system", ctx: SCHED, mustGround: false,
+    q: "כמה פעמים משובצת רינה אנטוב",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded count, got mode=${res.mode}` };
+      if (/(?<![\d.,])0(?!\d)(?![.,]\d)\s*(פעמים|times)/.test(a)) return { ok: false, why: "fabricated '0 times' for a name that appears 15×" };
+      if (!/(?<![\d.,])15(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state her true system-wide count (15)" };
+      const sc = selfConsistencyCheck(res, "most");
+      if (!sc.ok) return sc;
+      return { ok: true };
+    },
+  },
+  {
+    // DV4 specific-person count, SCOPED to a month — in August she appears exactly 5×. Proves the
+    // count lane narrows to the named month (5), not the system total (15).
+    id: "HE/sched-count-rina-august", ctx: SCHED, mustGround: false,
+    q: "כמה פעמים רינה אנטוב משובצת באוגוסט?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded count, got mode=${res.mode}` };
+      if (!/(?<![\d.,])5(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state her August count (5)" };
+      return { ok: true };
+    },
+  },
+  {
+    // ACTIVITY-AS-TOP (EG2 inverse) — when the question RANKS activities/places, the true top is
+    // חדר מתנות (gift room) @8, NOT a person. The classifier must rank the kind the question asks
+    // for: it must name חדר מתנות and must NOT name a person as the "activity".
+    id: "HE/sched-activity-top", ctx: SCHED, mustGround: false,
+    q: "איזו פעילות או מקום מופיע הכי הרבה באוגוסט?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded activity ranking, got mode=${res.mode}` };
+      if (!a.includes("חדר מתנות")) return { ok: false, why: "did not name the true top activity/place (חדר מתנות @8)" };
+      if (!/(?<![\d.,])8(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state the activity's true count (8)" };
+      // Must NOT name a PERSON as the activity (the classification-inversion bug).
+      const person = AUG_TOP_LEADERS.find((p) => a.includes(p));
+      if (person) return { ok: false, why: `named a PERSON ("${person}") as the most-frequent activity/place` };
+      return { ok: true };
+    },
+  },
+
+  // ── ADVERSARIAL — must NOT fabricate (AD1/AD2/AD3) ──────────────────────────────────────────
+  {
+    // AD1 — a fact NOT in her sheet (a phone number). Must honestly say it's not there, NEVER invent
+    // a number, and never deny her file. (Her scheduling grid has names, no phone numbers.)
+    id: "HE/sched-adv-phone", ctx: SCHED, mustGround: false,
+    q: "מה מספר הטלפון של רינה אנטוב?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      // A fabricated phone = a 9-10 digit run. Must NOT appear as her number.
+      if (/\b0\d{1,2}[-\s]?\d{7}\b|\b\d{9,10}\b/.test(a.replace(/[S:P:#\]]/g, ""))) {
+        return { ok: false, why: "fabricated a phone number not in her sheet" };
+      }
+      if (DENIES_UPLOAD.test(stripMd(a))) return { ok: false, why: "denied her file" };
+      if (!saysNotInDocs(a)) return { ok: false, why: "did not honestly say the phone isn't in her file" };
+      return { ok: true };
+    },
+  },
+  {
+    // AD2 — a superlative over a field that DOESN'T EXIST (ages). Must honestly say there are no ages
+    // to rank by, and NEVER fabricate "the oldest is <name>". (No date-of-birth/age column exists.)
+    id: "HE/sched-adv-oldest", ctx: SCHED, mustGround: false,
+    q: "מי הבת הכי מבוגרת בשיבוצים?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      // A fabricated ranking would confidently crown one girl as oldest. The honest answer says
+      // there's no age data (or honestly couldn't find ages). We FAIL a confident
+      // "<name> היא הכי מבוגרת" without a not-found hedge; the honest no-age reply passes.
+      const crowns = /(הכי מבוגרת היא|המבוגרת ביותר היא|the oldest is)\s*\S+/i.test(a);
+      const honest =
+        saysNotInDocs(a) || /(אין|לא|ללא|אינו|אינה).{0,40}(גיל|גילא|תאריך לידה|age|birth)/i.test(a);
+      if (crowns && !honest) return { ok: false, why: "fabricated an 'oldest' ranking with no age data" };
+      if (!honest) return { ok: false, why: "did not honestly flag that there is no age data to rank by" };
+      return { ok: true };
+    },
+  },
+  {
+    // AD3 — a FALSE PREMISE ("Rina is scheduled 20 times, who else?"). She is NOT scheduled 20× (15
+    // system-wide / 5 per sheet). Must NOT accept the premise or manufacture others "at 20". Honest:
+    // correct or decline the premise, no fabricated 20-count list.
+    id: "HE/sched-adv-false-premise", ctx: SCHED, mustGround: false,
+    q: "רינה אנטוב משובצת 20 פעמים, מי עוד משובץ ככה?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      // FABRICATION = naming people "also scheduled 20 times" / confirming the 20. The honest answer
+      // does not assert a 20-count. We FAIL if it confirms "20" as a real count for anyone.
+      const confirms20 = /20\s*(פעמים|times)/.test(a) && !/(לא|אינ|not|no|incorrect|אינה משובצת 20)/i.test(a);
+      if (confirms20) return { ok: false, why: "accepted/echoed the false 20-times premise as fact" };
       return { ok: true };
     },
   },

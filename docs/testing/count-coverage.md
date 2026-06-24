@@ -24,33 +24,33 @@ grids (June/July/Aug/Dec; Aug top = 7 people @5, Dec top = 7 @10, "gift room"/ח
 ## B — Derived: phrasing / scope / direction variations
 | id | input | expected | status |
 |---|---|---|---|
-| DV1 | per-month: `...באוגוסט` / `ביוני` / `ביולי` / `בדצמבר` | correct **per-month** tied group (counts differ by month) | 🟢 evals `HE/sched-august-most` (Aug 7-way @5) + `HE/sched-december-most` (Dec 3-way @18) 5/5 |
+| DV1 | per-month: `...באוגוסט` / `ביוני` / `ביולי` / `בדצמבר` | correct **per-month** tied group (counts differ by month) | 🟢 evals — Aug `HE/sched-august-most` (7-way @5), Dec `HE/sched-december-most` (3-way @18), **June `HE/sched-june-most` (sole רינה @5)**, **July `HE/sched-july-most` (7-way @5)** — all 5/5 |
 | DV2 | synonyms / language: `מי הכי פעילה?`, `who is scheduled the most?`, `who's most active?` | same correct answer as CA1 | 🟢 eval `EN/sched-most-active` 5/5 (the EN false-deflect RED is fixed) |
 | DV3 | inverse: `מי משובצת הכי מעט?` (least) | correct **minimum**, tie group if tied | 🟢 eval `HE/sched-least` 5/5 (direction-aware lane) + unit `LEAST picks the MIN group` |
-| DV4 | specific person: `כמה פעמים משובצת <real name>?` | that person's **exact count**, cited | ⬜ (normal SQL lane, not cell-tally — not guarded this round) |
-| DV5 | filter-by-count: `מי משובצת בדיוק 5 פעמים?` | the exact set at that count | ⬜ (not guarded this round) |
+| DV4 | specific person: `כמה פעמים משובצת <real name>?` | that person's **exact count**, cited | 🟢 **FIXED** — new cell-count lane (`countNamedEntityAcross`). Evals `HE/sched-count-rina-system` (15 across sheets) + `HE/sched-count-rina-august` (5 in-month) 5/5; unit `isCellCountQuestion`. (The RED: SQL lane answered "0" via a one-column COUNT.) |
+| DV5 | filter-by-count: `מי משובצת בדיוק 5 פעמים?` | the exact set at that count | ⬜ (still routes to the SQL lane → honest mode=general floor, no fabrication; a dedicated filter-by-count lane is the NEXT slice) |
 | DV6 | cross-month: `בכל החודשים מי משובצת הכי הרבה?` | correct **aggregate across sheets** | 🟢 same unified cross-sheet path as CA2 (=29) |
 
 ## C — Edge cases (derived)
 | id | input | expected | status |
 |---|---|---|---|
-| EG1 | the top is a **tie** (the real case) | name the FULL group; **never collapse to one**; never demote a tied member to a lower count | 🟢 unit `a genuine TIE … returned IN FULL` + gate test + Aug/Dec evals |
-| EG2 | highest raw value is an **activity/room** (gift-room=8) | excluded; never named as the "who" | 🟢 unit `excludes the activity label` + grader forbids `AUG_ACTIVITIES` |
-| EG3 | a genuine **single** leader exists | name just that one — don't fabricate a tie | 🟢 unit `MOST picks the true max group` + prompt no-fabricated-tie rule (verified in repro) |
+| EG1 | the top is a **tie** (the real case) | name the FULL group; **never collapse to one**; never demote a tied member to a lower count | 🟢 unit `a genuine TIE … returned IN FULL` + gate test + Aug/Jul/Dec evals |
+| EG2 | highest raw value is an **activity/room** (gift-room=8) | excluded when ranking PEOPLE; and when the question RANKS activities, it IS the answer | 🟢 unit `excludes the activity label`; people-grader forbids `AUG_ACTIVITIES`; **activity-ranking eval `HE/sched-activity-top` 5/5 (חדר מתנות=8, never a person)** — the classifier is now QUESTION-DRIVEN (ranks the kind the question asks for) |
+| EG3 | a genuine **single** leader exists | name just that one — don't fabricate a tie | 🟢 unit `MOST picks the true max group` + **June eval (sole leader) 5/5** + the prompt's no-fabricated-tie rule |
 | EG4 | sparse / no determinable ranking | honest about it — don't guess | ⬜ (lane fail-soft → honest-limit floor exists; no dedicated guard this round) |
 
 ## D — Adversarial: must NOT fabricate
 | id | input | expected | status |
 |---|---|---|---|
-| AD1 | a fact NOT in the sheet: `מה הטלפון/הכתובת של <real name>?` | honest "not in your file" — **never invent** | ⬜ (smoke-test held; no dedicated eval row added this round) |
-| AD2 | superlative over a **non-existent field**: `מי הכי מבוגרת?` (no ages) | honest; no fabricated ranking | ⬜ (not guarded this round) |
-| AD3 | **false premise**: `<name> משובצת 20 פעמים, מי עוד?` | reject the false count; correct from the data | ⬜ (not guarded this round) |
-| AD4 | **non-existent name**: `כמה פעמים משובצת <made-up name>?` | honest "not in your file" / 0 — never invent a count | ⬜ (not guarded this round) |
+| AD1 | a fact NOT in the sheet: `מה הטלפון/הכתובת של <real name>?` | honest "not in your file" — **never invent** | 🟢 eval `HE/sched-adv-phone` 5/5 — honest (no phone in her sheet), never a fabricated number |
+| AD2 | superlative over a **non-existent field**: `מי הכי מבוגרת?` (no ages) | honest; no fabricated ranking | 🟢 eval `HE/sched-adv-oldest` 5/5 — honestly flags no age data, never crowns an "oldest" |
+| AD3 | **false premise**: `<name> משובצת 20 פעמים, מי עוד?` | reject the false count; correct from the data | 🟢 eval `HE/sched-adv-false-premise` 5/5 — never confirms/echoes the false "20 times" |
+| AD4 | **non-existent name**: `כמה פעמים משובצת <made-up name>?` | honest "not in your file" / 0 — never invent a count | ⬜ (the cell-count lane returns an HONEST 0 for an absent value by design, but no dedicated eval row added this round) |
 
 ## E — Self-consistency & validation (the dangerous green-check class)
 | id | input | expected | status |
 |---|---|---|---|
-| SV1 | any count answer | the named leader/count **matches the answer's own cited `[S:]` rows** (no "evidence shows 10, prose says 5") | 🟢 the unified tally makes rows+`verifiedTally` agree by construction; the SV2 gate enforces stated==verified |
+| SV1 | any count answer | the named leader/count **matches the answer's own cited `[S:]` rows** (no "evidence shows 10, prose says 5") | 🟢 **`selfConsistencyCheck(res, dir)` grader** reads `res.evidence.rows`, asserts the prose states the MAX/MIN of its OWN cited `occurrences` + names an entity at it — wired into every variation grader; plus the unified tally makes rows+`verifiedTally` agree by construction |
 | SV2 | a tie-collapse OR a non-max-as-max answer | **`validateAnswer` FAILS it** (validation.ok=false); a confidently-wrong count NEVER gets a green check | 🟢 unit `cell-tally-gate.test.mts` (collapse FAILS + non-max FAILS) + pipeline gate in `answer.ts` |
 | SV3 | a count question over her own data | **never answered `mode=general`** (no ungrounded answer over her data) | 🟢 `gradeNoUngroundedOverOwnData` floor in every SCHED grader, 5/5 |
 | SV4 | a **CORRECT** count/tie answer | **`validateAnswer` PASSES it** (validation.ok=true) — must NOT false-reject a correct tie | 🟢 unit `cell-tally-gate.test.mts` (faithful tie PASSES, sole leader PASSES) — gate keyed to `verifiedTopGroup` |
@@ -63,12 +63,22 @@ grids (June/July/Aug/Dec; Aug top = 7 people @5, Dec top = 7 @10, "gift room"/ח
 > ROOT CAUSE found deeper than reported: the per-table cell-tally loop overwrote one `verifiedTally` while
 > accumulating each sheet's local top group into the rows → tally and citations disagreed. Fixed by ONE
 > unified cross-sheet tally (`tallyCellOccurrencesAcross`).
+>
+> **Second round (the FULL space, RED-first):** beyond the 2 reported REDs, the broader sweep found two more
+> real fabrication-class bugs and fixed them generally:
+> **DV4** "how many times is <name> scheduled" → the SQL lane wrote a one-column COUNT and answered **"0"**
+> for a name that appears 15× → **FIXED** by a new cell-COUNT lane (`countNamedEntityAcross`): the model
+> pins the named value, code counts its exact occurrences across the grid; an absent value returns an HONEST 0.
+> **EG2-inverse** "which ACTIVITY/place appears most" → the classifier (hardcoded to rank PEOPLE) labelled
+> PEOPLE as the top "activities" → **FIXED** by a QUESTION-DRIVEN classifier (it reads the question to decide
+> the entity KIND it ranks — people vs activities/places — and excludes the other). Also fixed the planner
+> picking a single wrong sheet (a count/tally is cross-sheet): the candidate grids now expand to the planner-
+> picked grid's name-FAMILY (`shareNameFamily`, month-word excluded) then narrow by the question's scope.
 > Safety bar HELD across all adversarial probes: no fabricated missing facts, no activity-as-person.
 >
-> **Still ⬜ (NOT guarded this round — open gaps, honestly flagged):** DV4, DV5 (specific-person count /
-> filter-by-count — these route through the normal SQL lane, not cell-tally), EG4 (sparse), AD1–AD4
-> (adversarial — the prior smoke-test showed these HELD, but no dedicated regression row was added). These
-> are the next slice, not closed.
+> **Still ⬜ (NOT guarded — open gaps, honestly flagged):** DV5 (filter-by-count "who has exactly 5" — still
+> the SQL lane → honest mode=general floor, no fabrication), EG4 (sparse), AD4 (non-existent-name count —
+> the count lane returns an honest 0 by design, but no dedicated eval row). These are the next slice, not closed.
 >
 > **Status legend note:** 🟢 = guard green (unit/eval on this box). NONE are ✅ yet — ✅ requires the
 > **verifier's** independent LIVE re-test on nucleus-woad (the engineer does not self-certify or deploy).
