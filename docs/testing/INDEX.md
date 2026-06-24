@@ -34,14 +34,14 @@ is guarded (auth/role, validation, owner-scoping, error mapping).
 | 1 | Upload→ingest (pdf/excel/word/csv/scanned) | 🟢 ocr-decision, pdf-pagination | 🟢 upload-formats, scanned-pdf-ocr | 🟢 ingest-route | 🟢 chat-upload, upload-button | 🟡 documents | — |
 | 2 | Document Q&A — grounded + cited | 🟢 answer-helpers, validate-answer | 🟢 case-file-grounding, answer-reliability | 🟢 ask-route | 🟢 assistant-console | 🟡 chat, golden-evals | — |
 | 3 | Structured / text-to-SQL (lookup, SUM/COUNT) | 🟢 sql-guard, structured-store, table-view | 🟢 router-decisions, edge AGG | 🟢 table-route | 🟢 table-viewer | 🔴 | — |
-| 4 | **Grid count / ranking (cell-tally)** | 🟡 trigger only — 🔴 tally-correctness fixture | 🟡 **one phrasing only** | — | — | 🔴 **failed live on variations** | 🟡 count-coverage.md (in progress) |
+| 4 | **Grid count / ranking (cell-tally)** | 🟢 cell-tally + cell-tally-coverage + gate units | 🟢 answer-reliability SCHED — all variations 5/5 serial | — | — | 🟡 core live-verified on nucleus-woad (#44); DV5/EG4/AD4 deploy-pending | 🟢 count-coverage.md — all 24 rows guard-green |
 | 5 | Hebrew / cross-lingual Q&A | 🟢 | 🟢 cold-start HE, edge cross-lingual | — | — | 🔴 | — |
 | 6 | Grounding fidelity / no-fabricate / validateAnswer | 🟢 validate-answer, validate-claim-support, salvage | 🟢 answer-reliability, edge UNANSWERABLE | 🟢 ask-route (friendly error) | — | 🟡 | 🟡 needs the adversarial set |
 | 7 | Recommendation — never dead-end | 🟢 grounded-general-fallback | 🟢 recommendation-substance | — | — | 🔴 | — |
 | 8 | Keyless / model-mode → clear error | 🟢 cloud-provider, hipaa-mode, keyless, model-switch | 🟢 keyless-model-error | 🟢 settings, test-connection, local-models | 🟢 models-panel, model-switch | 🟡 model-modes | — |
 | 9 | Per-user settings / **prompt-save** | 🟢 settings-save-feedback | 🟢 per-user-settings, prompt-save-roundtrip | 🟢 settings-route (write-only-key) | 🟢 answer-setup, prompts-panel, account-panel | 🔴 | — |
 | 10 | Cold-start durability (docs + settings) | — | 🟢 cold-start-durability, settings-durability | — | — | — | — |
-| 11 | Delete source (purged from retrieval) | 🟢 deleted-sources | 🟢 edge DELETE | 🟢 documents-route (403 boundary) | 🟢 materials-rail, uploaded-docs, bundled-docs | 🔴 | — |
+| 11 | Delete source (purged from retrieval) | 🟢 deleted-sources | 🟢 edge DELETE | 🟢 documents-route (403 boundary) | 🟢 materials-rail, uploaded-docs, bundled-docs | 🟢 documents — two-step inline confirm → excluded, live-verified | — |
 | 12 | Multi-chat / conversations | 🟢 conversation, session-titles, ask-sessions | 🟢 ask-history | 🟢 history-route (owner-scope) | 🟢 conversations-column, history-panel | 🔴 | — |
 | 13 | Auth / kick-out / per-user isolation | 🟢 account-validate, invite | 🟢 edge ISOLATION | 🟢 admin-users, documents-file (isolation) | 🟢 auth-form, users-panel | 🟢 auth, admin | — |
 | 14 | Urgency flagging | 🟡 | 🟡 | — | 🟡 (rail badge) | 🔴 | 🔴 **uncovered** |
@@ -52,8 +52,12 @@ the route-handler gap — 119 tests across all 11 handlers, every guarded branch
 column went from 0 → **16 stateful components / 149 tests** (the prompt-save-lie class — Save-only-on-real-
 success, confirm-gated destructive actions, owner/role UI boundaries — is now guarded). Genuinely
 presentational components (answer-view, inspector-panels render-only; theme-toggle/simple-tabs/app-sidebar)
-remain uncovered **by judgment**, not gap — they carry no fetch/destructive state machine. Still open:
-**count** (mid-fix), **urgency** (barely covered), and **E2E** (patchy, non-deterministic).
+remain uncovered **by judgment**, not gap — they carry no fetch/destructive state machine. The **count**
+capability is now guard-complete (all 24 count-coverage rows green; the core surface live-verified on
+nucleus-woad — DV5/EG4/AD4 are committed + eval-green, deploy-pending). The **live E2E journey suite is
+green 9/9** — two journeys were stale FALSE-REDs (the old `window.confirm` delete + the pre-sub-tab admin
+nav) and were fixed to drive the shipped UI; the delete is now live-verified end-to-end (two-step inline
+confirm → row removed → excluded from the answer corpus → restored). Still open: **urgency** (barely covered).
 
 ---
 
