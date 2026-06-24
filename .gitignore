@@ -55,3 +55,10 @@ heb.traineddata
 
 # Raw test-evidence logs may contain real client data (names from her sheets) — keep local, never commit.
 docs/testing/evidence/
+
+# Client PII — her ENTIRE uploaded corpus (youth-name scheduling sheets, the family-court case-file
+# PDF, the Carter story, the school-data CSVs) is the client's private data and MUST NEVER be committed
+# or deployed. Ignore ALL of data/ (the files stay on disk for local evals; they're just never tracked).
+# Root-level raw grid dumps (grid-*.txt) are the same PII in another form — ignore those too.
+data/
+grid-*.txt
