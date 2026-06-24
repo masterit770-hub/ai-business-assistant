@@ -49,7 +49,11 @@ const FORBIDDEN_RE = new RegExp(`\\b(${FORBIDDEN.join("|")})\\b`, "i");
 
 // A SQL identifier (optionally schema/table-qualified): foo, foo.bar, "Quoted Name".
 // We capture qualified column refs (a.b) and bare idents separately during scanning.
-const IDENT = `(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)`;
+// The UNQUOTED branch is Unicode-aware (\p{L}) so an unquoted non-Latin identifier — a
+// Hebrew/Arabic/CJK table or column name the model didn't quote — is still recognized as
+// one token (rather than being split on its internal `_` separators). The QUOTED branch
+// already accepts any character. `u` flag is set on every RegExp built from IDENT.
+const IDENT = `(?:"[^"]+"|[\\p{L}_][\\p{L}\\p{N}_]*)`;
 
 /**
  * Validate (and lightly normalize) a model-generated SQL string against the live
@@ -129,7 +133,7 @@ export function validateGeneratedSql(
 // following the keyword (handles `FROM contracts`, `JOIN sales s`, `from "My Table"`).
 function referencedTables(sql: string): string[] {
   const out = new Set<string>();
-  const re = new RegExp(`\\b(?:from|join)\\s+(${IDENT})`, "gi");
+  const re = new RegExp(`\\b(?:from|join)\\s+(${IDENT})`, "giu");
   for (const m of sql.matchAll(re)) out.add(unquote(m[1]));
   return [...out];
 }
@@ -142,7 +146,7 @@ function collectAliases(
   known: Map<string, Set<string>>
 ): Map<string, string> {
   const aliases = new Map<string, string>();
-  const re = new RegExp(`\\b(?:from|join)\\s+(${IDENT})(?:\\s+(?:as\\s+)?(${IDENT}))?`, "gi");
+  const re = new RegExp(`\\b(?:from|join)\\s+(${IDENT})(?:\\s+(?:as\\s+)?(${IDENT}))?`, "giu");
   const reserved = new Set([
     "on", "where", "group", "order", "limit", "join", "inner", "left", "right",
     "outer", "cross", "using", "having", "and", "or", "natural",
@@ -182,12 +186,12 @@ function checkColumns(
   // column — it is legitimate and must not be flagged as "unknown column". Collect
   // every alias name so the bare-identifier scan treats them as known.
   const aliasNames = new Set<string>();
-  for (const m of sql.matchAll(new RegExp(`\\bas\\s+(${IDENT})`, "gi"))) {
+  for (const m of sql.matchAll(new RegExp(`\\bas\\s+(${IDENT})`, "giu"))) {
     aliasNames.add(unquote(m[1]).toLowerCase());
   }
 
   // 1. Qualified references: alias.col  — the strongest signal of a real column ref.
-  const qualRe = new RegExp(`(${IDENT})\\.(${IDENT})`, "g");
+  const qualRe = new RegExp(`(${IDENT})\\.(${IDENT})`, "gu");
   for (const m of sql.matchAll(qualRe)) {
     const q = unquote(m[1]).toLowerCase();
     const col = unquote(m[2]).toLowerCase();
@@ -209,16 +213,24 @@ function checkColumns(
   //    known column. Keywords, functions (ident directly followed by `(`), aliases,
   //    table names, and literals are excluded.
   const stripped = stripStringsAndQualified(sql);
-  for (const word of stripped.matchAll(/\b[A-Za-z_][A-Za-z0-9_]*\b/g)) {
-    const w = word[0];
+  // Identifier candidates — BOTH quoted ("Quoted Name" / "שיבוצים") and unquoted. Unicode-
+  // aware (\p{L}/\p{N}, not A-Za-z/\d) so a non-Latin identifier is one token rather than
+  // being split on its internal `_` separators. We unquote each candidate before checking,
+  // so a hallucinated column is caught WHETHER OR NOT the model quoted it (a quoted unknown
+  // column must NOT slip through). The table names referenced after FROM/JOIN were stripped
+  // by stripStringsAndQualified, so they don't reach here as false "unknown column" hits.
+  const candidateRe = new RegExp(IDENT, "gu");
+  for (const word of stripped.matchAll(candidateRe)) {
+    const raw = word[0];
+    const w = unquote(raw);
     const lw = w.toLowerCase();
     if (SQL_KEYWORDS.has(lw) || SQL_FUNCS.has(lw)) continue;
     if (aliasToTable.has(lw) || known.has(lw)) continue; // a table/alias name
     if (aliasNames.has(lw)) continue; // a result-column alias (… AS name)
     // Skip if it's actually a function call `name(` (the `(` survives stripping).
     const idx = word.index ?? 0;
-    if (stripped[idx + w.length] === "(") continue;
-    // A bare candidate column that no in-scope table has → a hallucinated column.
+    if (stripped[idx + raw.length] === "(") continue;
+    // A candidate column that no in-scope table has → a hallucinated column.
     if (!allCols.has(lw)) {
       return { ok: false, reason: `unknown column '${w}'` };
     }
@@ -233,7 +245,16 @@ function checkColumns(
 // function-call lookahead still lines up.
 function stripStringsAndQualified(sql: string): string {
   let s = sql.replace(/'(?:[^']|'')*'/g, (m) => " ".repeat(m.length)); // 'literals'
-  s = s.replace(new RegExp(`(${IDENT})\\.(${IDENT})`, "g"), (m) => " ".repeat(m.length));
+  // Strip the TABLE NAME token after FROM/JOIN (quoted or unquoted) so it doesn't reach the
+  // bare/quoted-identifier column scan as a false "unknown column". Tables are validated by
+  // referencedTables; columns are validated by the scan. We blank ONLY the name, preserving
+  // the FROM/JOIN keyword and offsets. (A standalone quoted COLUMN is deliberately left in so
+  // the scan still validates it — a quoted hallucinated column must not slip through.)
+  s = s.replace(new RegExp(`(\\b(?:from|join)\\s+)(${IDENT})`, "giu"), (_m, kw, name) =>
+    kw + " ".repeat(name.length)
+  );
+  // Strip qualified refs (alias.col / "t"."c") — validated in checkColumns step 1.
+  s = s.replace(new RegExp(`(${IDENT})\\.(${IDENT})`, "gu"), (m) => " ".repeat(m.length));
   return s;
 }
 

@@ -132,9 +132,13 @@ function uploadSignature(uploads: Map<string, SqlRow[]>): string {
 // are sanitized to safe SQLite identifiers, and the original header is preserved in a
 // per-table column map the planner can show the model.
 function materializeUploads(db: Database.Database, uploads: Map<string, SqlRow[]>): void {
+  // ONE de-collided name per uploaded table, so two sheets whose names sanitize equal each
+  // get their OWN materialized table (the data-loss fix). introspectSchema computes the same
+  // map on the same uploads, so the names agree.
+  const safeNames = buildSafeTableNames(uploads);
   for (const [table, rows] of uploads) {
     if (rows.length === 0) continue;
-    const safeTable = sanitizeIdent(table);
+    const safeTable = safeNames.get(table)!;
     // Union of all keys across rows (skip the synthetic `id`), in first-seen order.
     const headers: string[] = [];
     const seen = new Set<string>();
@@ -220,8 +224,10 @@ export function introspectSchema(
   // set (nothing hidden / Supabase off) → identical to the prior catalog.
   const hidden = deletedSourceIds();
   // A handle table is BUNDLED iff it is not one of THIS scope's runtime-uploaded tables
-  // (whose names are sanitized into SQLite identifiers when materialized).
-  const uploadedNames = new Set([...runtimeRows(scope).keys()].map(sanitizeIdent));
+  // (whose names are de-collided into unique SQLite identifiers when materialized). MUST use
+  // the SAME mapping materializeUploads used, or a de-collided name (foo_2) would be wrongly
+  // treated as bundled and hidden from a non-demo caller.
+  const uploadedNames = new Set(buildSafeTableNames(runtimeRows(scope)).values());
   const tables = (
     db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
@@ -329,14 +335,51 @@ export function selectWithIds(
 
 // ── small utilities ────────────────────────────────────────────────────────────
 
+// Sanitize an arbitrary header / table name into a SAFE SQLite identifier, PRESERVING
+// non-Latin letters (Hebrew, Arabic, CJK, …). We always quote identifiers when we emit
+// SQL, so a quoted identifier may contain any character except a double-quote. The old
+// version stripped EVERYTHING outside [A-Za-z0-9_], which annihilated a Hebrew table name
+// like "שיבוצים-אוגוסט-2024-…" down to "_2024" — so every month's sheet collapsed to the
+// same meaningless name (the planner couldn't tell August from June, and distinct sheets
+// even COLLIDED and overwrote each other on materialize: the recorded "only 1 row for June"
+// bug). Keeping Unicode word characters makes the name meaningful AND distinct again.
+//
+// What we still normalize: any RUN of characters that is whitespace/punctuation (i.e. not a
+// Unicode letter, a digit, or `_`) becomes a single `_`; a double-quote is dropped (it would
+// break our quoting); a leading digit is prefixed with `_` (so the identifier is valid even
+// unquoted); leading/trailing `_` are trimmed. ASCII is lower-cased (case-insensitive match
+// in the guard); non-cased scripts like Hebrew are unaffected by lower-casing. Empty → "col".
 function sanitizeIdent(s: string): string {
   const cleaned = s
+    .normalize("NFC")
     .trim()
-    .replace(/[^A-Za-z0-9_]+/g, "_")
+    .replace(/"/g, "") // a double-quote would break our quoted-identifier emission
+    .replace(/[^\p{L}\p{N}_]+/gu, "_") // collapse non-(letter|number|_) runs to one _
     .replace(/^_+|_+$/g, "")
-    .replace(/^(\d)/, "_$1") // can't start with a digit
+    .replace(/^(\p{N})/u, "_$1") // can't start with a digit (valid even unquoted)
     .toLowerCase();
   return cleaned || "col";
+}
+
+// Deterministically map EACH uploaded table's original name → a UNIQUE safe SQLite
+// identifier. De-collision is essential: two distinct uploaded sheets whose names sanitize
+// to the SAME identifier (e.g. two Hebrew month sheets) must NOT share a materialized table,
+// or one DROP/CREATE clobbers the other (the data-loss bug). We append _2, _3, … on a clash.
+// Iteration order is the uploads map's insertion order, which is stable for a given scope, so
+// materializeUploads and introspectSchema (which both call this on the SAME map) agree on the
+// name of every table.
+function buildSafeTableNames(uploads: Map<string, SqlRow[]>): Map<string, string> {
+  const map = new Map<string, string>();
+  const used = new Set<string>();
+  for (const original of uploads.keys()) {
+    const base = sanitizeIdent(original);
+    let name = base;
+    let n = 2;
+    while (used.has(name)) name = `${base}_${n++}`;
+    used.add(name);
+    map.set(original, name);
+  }
+  return map;
 }
 
 function isNumeric(v: unknown): boolean {

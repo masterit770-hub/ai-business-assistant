@@ -138,8 +138,19 @@ const { supabaseEnabled, admin } = await import("../../src/lib/engine/supabase.t
 // ── REAL CORPUS HANDLES ────────────────────────────────────────────────────────
 // The gmail client's real owner id (read-only; her one Hebrew handover file).
 const GMAIL_OWNER = "b01c311e-bd28-4e43-ab1e-d6825bfeb929";
+// The SCHEDULING client's real owner id (read-only): her uploaded Hebrew Excel SHEETS —
+// monthly scheduling grids (שיבוצים) + intake sheets, in uploaded_rows. This is the
+// STRUCTURED/Excel lane and is DISTINCT from GMAIL_OWNER's handover DOCUMENT. Her logged
+// "who is scheduled most in August" question over THIS data was answered three different
+// wrong ways — the worst being an UNGROUNDED `general`-mode fabrication that denied her
+// file existed ("I don't have access to live data about August"). The hard guarantee under
+// test: a question routed to HER OWN uploaded data is NEVER answered in ungrounded general
+// mode — it grounds in her sheet, or makes an honest grounded-limit statement about it, and
+// NEVER fabricates a name/count or claims she uploaded nothing.
+const SCHED_OWNER = "3d1ca025-d718-4d55-bab5-821a239cadbf";
 const DEMO_ADMIN = { isDemo: true, role: "admin" };           // bundled + ALL uploaded docs/tables
 const GMAIL = { ownerId: GMAIL_OWNER, isDemo: false, role: "member" }; // ONLY her file
+const SCHED = { ownerId: SCHED_OWNER, isDemo: false, role: "member" }; // ONLY her Excel sheets
 
 // ── GRADING PRIMITIVES (fact + citation presence, never exact string) ──────────
 const cites = (a) => [...(a || "").matchAll(/\[[SP]:[^\]]+\]/g)].map((m) => m[0]);
@@ -212,6 +223,57 @@ const saysNotInDocs = (a) => {
   const s = stripMd(a);
   return SAYS_NOT_IN_DOCS_HE.test(s) || SAYS_NOT_IN_DOCS_EN.test(s);
 };
+
+// ── THE HARD-GUARANTEE GRADER: no ungrounded fabrication over the caller's OWN data ──
+// The recorded RED, verbatim from her logs, is an ungrounded `general`-mode answer that
+// DEFLECTS to "I have no access to live/real-time data" and DENIES her uploaded file — over a
+// file that literally holds her August schedule. This grader fails THAT and any fabricated
+// "the most scheduled is <name>" guess; it passes a grounded answer OR an honest grounded-
+// limit reply that acknowledges her file. It is GENERAL (no specific name/number expected).
+//
+// The fabrication/deflection phrasings the RED produced (must NEVER appear as the answer):
+//   • "no access to live/real-time/updated data" (HE: נתונים חיים / בזמן אמת / מעודכנים)
+//   • denying the upload exists (HE: לא העלית / לא סופק קובץ ; EN: you didn't upload / no file)
+const LIVE_DATA_DEFLECTION =
+  /(נתונים חיים|בזמן אמת|מידע עדכני|נתונים מעודכנים|אין לי גישה לנתונים|no access to (live|real-?time)|don'?t have (access to )?(live|real-?time)|real-?time data)/i;
+const DENIES_UPLOAD =
+  /(לא העלית|לא סופק קובץ|אין קובץ שהעלית|לא הועלה קובץ|you (did not|didn'?t) upload|no file (was )?(uploaded|provided)|haven'?t (uploaded|provided) (a|any) file)/i;
+// An answer that ACKNOWLEDGES her uploaded data is present (the honest grounded-limit floor).
+// This includes referring to "the provided/presented data" (הנתונים המובאים/המוצגים) — the
+// honest path legitimately discusses the retrieved data without the literal words "your file",
+// and that is still an acknowledgment that her data IS here (the opposite of the RED, which
+// denied any file/deflected to "no live data"). The forbidden RED patterns are checked first
+// and independently, so widening the acknowledgment recognizer never lets a fabrication pass.
+const ACKNOWLEDGES_FILE_HE =
+  /(הקובץ שלך|הקובץ שהעלית|יש לך קובץ|בקובץ שלך|הנתונים שלך|בנתונים שהעלית|הטבלה|הגיליון|הקובץ מכיל|הנתונים שהועלו|הנתונים המובאים|הנתונים המוצגים|הנתונים שהתקבלו|הנתונים הקיימים|המידע הקיים|הנתונים שנמצאו)/;
+const ACKNOWLEDGES_FILE_EN =
+  /(your (uploaded )?(file|data|sheet|table|spreadsheet)|the (file|data|sheet|table) you uploaded|in your data|the uploaded (file|data)|the (provided|retrieved|presented|available) (data|file|sheet|table)|the data (provided|retrieved|presented|available))/i;
+
+function gradeNoUngroundedOverOwnData(res) {
+  const a = res.answer ?? "";
+  const s = stripMd(a);
+  // (1) The router MUST route this to her own content (the question is about her uploaded
+  //     scheduling data). If it routed to NO source, the upstream catalog/hydrate broke —
+  //     surface it rather than silently passing on a general answer.
+  if (!(res.route?.sources?.length > 0)) {
+    return { ok: false, why: `routed to NO source (sources=${JSON.stringify(res.route?.sources)}) — her uploaded data wasn't seen` };
+  }
+  // (2) THE RED, forbidden outright: the live-data deflection or denying her upload.
+  if (LIVE_DATA_DEFLECTION.test(s)) return { ok: false, why: "RED: ungrounded 'no live/real-time data' deflection over her own uploaded file" };
+  if (DENIES_UPLOAD.test(s)) return { ok: false, why: "RED: denied she uploaded a file" };
+  // (3) Either it GROUNDED in her sheet (mode grounded + a resolving [S:]/[P:] cite, gate
+  //     clean), OR it is an HONEST grounded-limit reply that ACKNOWLEDGES her file. A bare
+  //     only-docs refusal is not acceptable.
+  if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "bare only-docs refusal" };
+  if (isGroundedClean(res)) return { ok: true };
+  const acknowledges = ACKNOWLEDGES_FILE_HE.test(s) || ACKNOWLEDGES_FILE_EN.test(s);
+  const honestLimit = saysNotInDocs(a);
+  if (acknowledges && honestLimit) return { ok: true };
+  return {
+    ok: false,
+    why: `not grounded AND not an honest grounded-limit over her file (mode=${res.mode}, acknowledges=${acknowledges}, honestLimit=${honestLimit})`,
+  };
+}
 
 const QUESTIONS = [
   // ─────────────── GMAIL USER — her Hebrew national-service handover file ───────────────
@@ -299,6 +361,28 @@ const QUESTIONS = [
       if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "refused a general-knowledge question" };
       return { ok: /פריז/.test(a), why: "did not answer Paris in Hebrew" };
     },
+  },
+
+  // ─────────────── SCHEDULING USER — her real uploaded Excel SHEETS (structured lane) ───────────────
+  // THE HARD GUARANTEE (A): a question routed to HER OWN uploaded data must NEVER be answered
+  // in ungrounded `general` mode. The recorded RED was exactly that — over her real August
+  // scheduling sheet the engine answered mode=general with NO citations and a world-knowledge
+  // DEFLECTION ("I don't have access to live/real-time data about who's scheduled in August
+  // 2026"), denying her uploaded file exists. These graders FAIL that RED and PASS only an
+  // answer that is GROUNDED in her sheet OR an HONEST grounded-limit statement that
+  // acknowledges her file — never a fabricated name/count, never "no live data", never
+  // "you didn't upload anything". (B — a fully-correct person-frequency count over the messy
+  // calendar grid — is a separate, harder goal NOT asserted here; the bar here is "no
+  // ungrounded fabrication over her own data".)
+  {
+    id: "HE/sched-august-most", ctx: SCHED, mustGround: false,
+    q: "מי הכי משובץ באוגוסט?",
+    grade: (res) => gradeNoUngroundedOverOwnData(res),
+  },
+  {
+    id: "HE/sched-most-bare", ctx: SCHED, mustGround: false,
+    q: "מי הבת שמשובצת הכי הרבה?",
+    grade: (res) => gradeNoUngroundedOverOwnData(res),
   },
 
   // ─────────────── MERIDIAN DEMO — Carter case file (bundled) ───────────────

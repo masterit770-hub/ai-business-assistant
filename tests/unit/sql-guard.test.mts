@@ -166,3 +166,52 @@ test("does not false-reject a string literal that looks like a column", () => {
   const r = validateGeneratedSql("SELECT vendor FROM contracts WHERE vendor = 'overdue'", catalog);
   assert.equal(r.ok, true, r.ok ? "" : r.reason);
 });
+
+// ── UNICODE (Hebrew) identifiers — the client's uploaded-sheet regression ──────────────
+// Uploaded Hebrew-named tables/columns ("שיבוצים_אוגוסט_2024", "שם") are valid SQLite
+// identifiers when quoted. The OLD guard's bare-word scan split a quoted Hebrew name on its
+// internal `_` separators and wrongly flagged `_` as an unknown column, REJECTING even a
+// correct query over her own data — which then collapsed to the ungrounded-general
+// fabrication. The guard must accept correct quoted Unicode SQL while STILL rejecting a
+// hallucinated column (quoted or bare). These prove both.
+const hebCatalog: TableSchema[] = [
+  {
+    table: "שיבוצים_אוגוסט_2024",
+    columns: [
+      { name: "rowid_anchor", type: "INTEGER" },
+      { name: "empty", type: "TEXT" },
+      { name: "empty_1", type: "TEXT" },
+      { name: "שם", type: "TEXT" },
+    ],
+  },
+];
+
+test("accepts a correct quoted SELECT over a Hebrew-named table + columns", () => {
+  const r = validateGeneratedSql(`SELECT "empty", "empty_1" FROM "שיבוצים_אוגוסט_2024" LIMIT 50`, hebCatalog);
+  assert.equal(r.ok, true, r.ok ? "" : r.reason);
+});
+
+test("accepts a COUNT aggregate over a Hebrew-named table (the scheduling-count shape)", () => {
+  const r = validateGeneratedSql(`SELECT COUNT(*) AS n FROM "שיבוצים_אוגוסט_2024"`, hebCatalog);
+  assert.equal(r.ok, true, r.ok ? "" : r.reason);
+});
+
+test("accepts a real Hebrew COLUMN identifier (quoted)", () => {
+  const r = validateGeneratedSql(`SELECT "שם" FROM "שיבוצים_אוגוסט_2024"`, hebCatalog);
+  assert.equal(r.ok, true, r.ok ? "" : r.reason);
+});
+
+test("still REJECTS a hallucinated QUOTED column on a Hebrew-named table (no fidelity hole)", () => {
+  const r = validateGeneratedSql(`SELECT "nonexistent" FROM "שיבוצים_אוגוסט_2024"`, hebCatalog);
+  assert.equal(r.ok, false, "a quoted unknown column must NOT slip through");
+});
+
+test("still REJECTS a hallucinated BARE column alongside a Hebrew-named table", () => {
+  const r = validateGeneratedSql(`SELECT bogus FROM "שיבוצים_אוגוסט_2024"`, hebCatalog);
+  assert.equal(r.ok, false);
+});
+
+test("still REJECTS DDL against a Hebrew-named table", () => {
+  const r = validateGeneratedSql(`DROP TABLE "שיבוצים_אוגוסט_2024"`, hebCatalog);
+  assert.equal(r.ok, false);
+});

@@ -4,7 +4,7 @@ Nucleus is an **AI Business Assistant** delivered as a real Upwork contract to a
 
 ## Build to the functional outcome, not the client's tech words
 The client's spec was partly **generated with ChatGPT and she doesn't understand the technical clauses**. Deliver what she *functionally* wants; **drop the boilerplate plumbing she named but doesn't need**:
-- **DROP:** Docker, API/CRM connectors, local-LLM/Ollama, grading/observability dashboards, no-vendor-lock-in ceremony.
+- **DROP:** Docker, API/CRM connectors, grading/observability dashboards, no-vendor-lock-in ceremony. *(CORRECTION 2026-06-23: Ollama/local-LLM was previously listed here IN ERROR — the **Local model mode IS in scope and must be tested**; see Keys & models below.)*
 - **DELIVER (functional scope):** upload (PDF / Excel / CSV / scanned) → ask → **cited answers**; hybrid **SQL + document** retrieval with dual citations; **Hebrew** Q&A; real **users / auth / kick-out**; **per-user document isolation**; **urgency** flagging; **editable prompts**.
 - Litmus before building any "requirement": *does the existing engine (the self-hosted hybrid RAG + text-to-SQL) already do this?* If yes, it's a verification step, not a build.
 
@@ -16,7 +16,8 @@ The client's spec was partly **generated with ChatGPT and she doesn't understand
 - **Demo data is gated:** the bundled sample corpus is shown/retrieved only for `profiles.is_demo` accounts (migration 009). A real client user starts with a clean bucket. The demo accounts are the admin + the regular-user login in `.secrets/demo-accounts.txt`.
 
 ## Keys & models
-- The LLM is **provider-neutral via env**: `LLM_PROVIDER` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`. Three model modes: **Cloud** (default DeepSeek), **HIPAA** (Azure OpenAI, fails closed), **Local** (Ollama via the cloudflared tunnel). See `src/lib/engine/llm.ts` + `docs/HANDOFF.md`.
+- The LLM is **provider-neutral via env**: `LLM_PROVIDER` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`. Three model modes: **Cloud** (default DeepSeek), **HIPAA** (Azure OpenAI, fails closed), **Local** (Ollama). See `src/lib/engine/llm.ts` + `docs/HANDOFF.md`.
+- **Local (Ollama) mode IS in scope and MUST be tested** — in BOTH configurations: **box-local** (Ollama on this machine, `localhost:11434`) AND **remote** (Ollama reached over the cloudflared tunnel). Client-confirmed 2026-06-23 (an earlier directive wrongly dropped it). This is a **required, documented test journey** — *not the current top priority* (the grounding/structured-data fixes are), but it must not be forgotten.
 - **There is NO Gemini/GCP key anymore.** `.secrets/gemini.env` is dead for this build. Supabase creds live in `.secrets/supabase.env` (gitignored — **never print/commit**).
 - **Anything that is the client's-side config — her own cloud key, a stronger model, her Azure deployment — goes in `docs/HANDOFF.md` / `docs/SETUP.md`. It is a handoff note, NOT a build blocker.**
 

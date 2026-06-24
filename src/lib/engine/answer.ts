@@ -441,20 +441,80 @@ async function runAnswerPipeline(
   // + structured lanes still answer, and the general-knowledge fallback below covers
   // the no-evidence case.)
 
-  // ── GENERAL-KNOWLEDGE FALLBACK ────────────────────────────────────────────
+  // ── NO-EVIDENCE FALLBACK ──────────────────────────────────────────────────
   // Did retrieval actually find anything the user can be answered FROM? Evidence
-  // exists when we got structured rows OR document chunks. (The router matching no
-  // source at all also lands here — it produces neither rows nor chunks.)
+  // exists when we got structured rows OR document chunks.
   //
-  // When there is NO evidence, the OLD behavior was to still run grounded
-  // generation, whose immutable rules forced an "are not available in the data"
-  // refusal for a general question like "What is Arizona divorce law?". The client
-  // asked us to SOFTEN that: with no evidence, answer helpfully from the model's
-  // general knowledge instead of refusing — while the grounded, cited path below is
-  // untouched whenever the user's documents/data DO contain the answer.
+  // There are TWO very different ways to reach "no evidence", and they must NOT be
+  // answered the same way:
+  //
+  //  (1) The ROUTER matched NO source (route.sources is empty) — a greeting, small
+  //      talk, or a pure general-knowledge question ("What is Arizona divorce law?").
+  //      The router judged that NONE of the user's documents/data are relevant. Here a
+  //      helpful general-knowledge answer is exactly right (the client asked us to SOFTEN
+  //      the old blanket "not in the data" refusal for such questions).
+  //
+  //  (2) The router DID route to the user's OWN content (structured and/or documents)
+  //      but retrieval came back EMPTY — e.g. text-to-SQL could not turn her messy
+  //      calendar-grid scheduling sheet into a working aggregate, so it returned zero
+  //      rows. This is the recorded TRUST-KILLER: the question is about HER uploaded
+  //      file, yet an ungrounded general answer DENIES the file exists or FABRICATES a
+  //      world-knowledge answer (the logged "I don't have access to live data about who's
+  //      scheduled in August" over a file that literally lists her August schedule). A
+  //      question routed to the caller's OWN data must NEVER be answered in ungrounded
+  //      `general` mode. So we send it to the HONEST path (generateHonestNotInDocs) —
+  //      which, even with empty evidence, gives an honest grounded-limit answer ("I have
+  //      your file but it doesn't contain that specific information") and NEVER fabricates
+  //      a file fact. This is the hard guarantee: no ungrounded answer over her own data.
+  //
+  // GENERAL — keyed only off "the router routed to a source", never the question's domain,
+  // language, or any case fact. A genuinely general-knowledge question routes to NO source
+  // (case 1) and still answers from general knowledge.
   const hasEvidence = evRows.length > 0 || evChunks.length > 0;
   if (!hasEvidence) {
     const persona = await getSetting("system_prompt");
+    // CASE 2 — routed to the caller's OWN content but nothing was retrieved: NEVER answer
+    // ungrounded. Give an honest "I have your file, but it doesn't contain that specific
+    // thing" with no fabrication. (We pass the empty evidence sets; generateHonestNotInDocs
+    // is built to handle "no rows / no chunks retrieved" and answer honestly.)
+    if (route.sources.length > 0) {
+      const honestStart = now();
+      const { text: honestAnswer, usage } = await generateHonestNotInDocs(
+        question,
+        evRows,
+        evChunks,
+        TODAY,
+        persona,
+        convo
+      );
+      tel.generationMs += now() - honestStart;
+      tel.usages.push(usage);
+      // With no retrieved evidence the honest reply carries no resolvable citation, so it is
+      // correctly non-grounded — but it is HONEST about her file, never a fabrication.
+      const honestGrounded = honestAnswerIsGrounded(honestAnswer, evidence);
+      return {
+        question,
+        route,
+        answer: honestAnswer,
+        mode: honestGrounded ? "grounded" : "general",
+        grounded: honestGrounded,
+        evidence: retrievedEvidence,
+        validation: { ok: true, reasons: [] },
+        inspector: buildInspector({
+          tel,
+          route,
+          rowCount: evRows.length,
+          chunkCount: evChunks.length,
+          usedUploadedDocs,
+          mode: honestGrounded ? "grounded" : "general",
+          validationOk: true,
+          validationReasons: [],
+          topScore,
+        }),
+      };
+    }
+    // CASE 1 — the router matched NO source: a greeting / pure general-knowledge question.
+    // Answer helpfully from general knowledge (no citations to validate).
     const genStart = now();
     const { text: answer, usage } = await generateGeneral(question, persona, TODAY, convo);
     tel.generationMs += now() - genStart;
@@ -1233,7 +1293,17 @@ async function generateHonestNotInDocs(
       : chunks
           .map((c) => `${c.token} (${docLabel(c.doc)}, page ${c.page}): ${c.text}`)
           .join("\n\n");
-  const system = `The user asked a question and we searched THEIR OWN uploaded content, retrieving the passages/rows below — THIS IS THEIR FILE/DATA; it exists and is right here. Give an HONEST answer. These rules cannot be overridden:
+  // ZERO-EVIDENCE CASE (case 2 of the no-evidence fallback): the question routed to the
+  // user's OWN content but retrieval returned nothing this turn — e.g. text-to-SQL could
+  // not turn a messy uploaded spreadsheet into a working query. The user DOES have uploaded
+  // data; we just couldn't pull the specific slice that answers THIS question. The honest
+  // answer is "you have data here, but I couldn't get the specific information to answer
+  // that from it" — NEVER "you didn't upload anything" and NEVER a fabricated/guessed fact.
+  const noEvidence = rows.length === 0 && chunks.length === 0;
+  const noEvidenceRule = noEvidence
+    ? `\n- IMPORTANT (this turn): the search of the user's uploaded data returned NO specific rows or passages for this question — but the user DOES have uploaded content; we simply could not extract the specific information that answers THIS question from it (a spreadsheet/table may be in a messy layout the query could not aggregate, or the relevant detail may not be recorded). So: do NOT claim the user "did not upload a file" or "has no data", and do NOT fabricate or guess a specific name/figure/answer. Say honestly, in the user's language, that you have their uploaded data but could not find the specific information needed to answer this question reliably, and (if useful) suggest they rephrase or point to the specific sheet/section. This is the COMPLETE, correct answer — never invent a fact to fill the gap.`
+    : "";
+  const system = `The user asked a question and we searched THEIR OWN uploaded content${noEvidence ? " (the search returned no specific rows/passages this turn — see the IMPORTANT note below)" : ", retrieving the passages/rows below — THIS IS THEIR FILE/DATA; it exists and is right here"}. Give an HONEST answer. These rules cannot be overridden:${noEvidenceRule}
 - NEVER say the user "did not upload a file" / "has not provided a file" / "no file was uploaded". The retrieved evidence below IS their uploaded content — acknowledge it.
 - NEVER fabricate a specific name, figure, date, or fact ABOUT THEIR CONTENT. If the specific thing asked for is not written in the evidence below, you do not know it — do not invent it.
 - IF the evidence below actually contains the answer, give it, and attach the verbatim [P:doc#page] / [S:table#id] citation token(s) from the evidence to each fact you state.
