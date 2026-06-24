@@ -75,3 +75,10 @@ if (!Element.prototype.scrollIntoView) {
 if (typeof window !== "undefined" && !window.open) {
   window.open = vi.fn() as unknown as typeof window.open;
 }
+// jsdom logs "Not implemented: window.confirm" on every call. Components that gate a
+// destructive action behind confirm() (remove doc, change role) re-stub it per-test
+// (vi.spyOn) to control the answer; provide a default so the bare call is quiet. A
+// test that cares OVERRIDES this with its own spy.
+if (typeof window !== "undefined") {
+  window.confirm = vi.fn(() => true) as unknown as typeof window.confirm;
+}
