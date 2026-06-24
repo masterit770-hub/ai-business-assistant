@@ -34,7 +34,7 @@ is guarded (auth/role, validation, owner-scoping, error mapping).
 | 1 | Upload→ingest (pdf/excel/word/csv/scanned) | 🟢 ocr-decision, pdf-pagination | 🟢 upload-formats, scanned-pdf-ocr | 🟢 ingest-route | 🟢 chat-upload, upload-button | 🟡 documents | — |
 | 2 | Document Q&A — grounded + cited | 🟢 answer-helpers, validate-answer | 🟢 case-file-grounding, answer-reliability | 🟢 ask-route | 🟢 assistant-console | 🟡 chat, golden-evals | — |
 | 3 | Structured / text-to-SQL (lookup, SUM/COUNT) | 🟢 sql-guard, structured-store, table-view | 🟢 router-decisions, edge AGG | 🟢 table-route | 🟢 table-viewer | 🔴 | — |
-| 4 | **Grid count / ranking (cell-tally)** | 🟢 cell-tally + cell-tally-coverage + gate units | 🟢 answer-reliability SCHED — all variations 5/5 serial | — | — | 🟡 core live-verified on nucleus-woad (#44); DV5/EG4/AD4 deploy-pending | 🟢 count-coverage.md — all 24 rows guard-green |
+| 4 | **Grid count / ranking (cell-tally)** | 🟢 cell-tally + cell-tally-coverage + gate units | 🟢 answer-reliability SCHED — all variations 5/5 serial | — | — | 🟢 WHOLE surface live-verified on nucleus-woad (incl. DV5/EG4/AD4 after b7d9e29 deploy) | 🟢 count-coverage.md — all 24 rows guard-green |
 | 5 | Hebrew / cross-lingual Q&A | 🟢 | 🟢 cold-start HE, edge cross-lingual | — | — | 🔴 | — |
 | 6 | Grounding fidelity / no-fabricate / validateAnswer | 🟢 validate-answer, validate-claim-support, salvage | 🟢 answer-reliability, edge UNANSWERABLE | 🟢 ask-route (friendly error) | — | 🟡 | 🟡 needs the adversarial set |
 | 7 | Recommendation — never dead-end | 🟢 grounded-general-fallback | 🟢 recommendation-substance | — | — | 🔴 | — |

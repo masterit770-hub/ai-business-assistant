@@ -91,12 +91,13 @@ grids (June/July/Aug/Dec; Aug top = 7 people @5, Dec top = 7 @10, "gift room"/ח
 > name/activity-as-person/wrong-corpus all held). Cross-corpus EN routing (the bundled `contracts` leak) was a
 > separate live RED fixed by `selectTallyGridsByKind` (entity-kind grid selection) — guarded by `EN/sched-most-active`.
 >
-> **Status legend note:** 🟢 = guard green (unit/eval on this box). **LIVE STATUS (2026-06-24):** the
-> **core surface** (CA1/CA2, DV1–DV4, EG1–EG3, AD1–AD3) is now **live-verified on nucleus-woad** — the
-> deployed engine (830f0f2) returns נגה מאירסון=29 system-wide (3/3 stable, no contracts/company leak),
-> DV4 רינה=15, the correct tie / least / activity-top, and honest adversarial refusals. **DV5 / EG4 / AD4**
-> are guard-green (eval 5/5 serial) but landed in 719f037 and are **NOT yet deployed**, so they stay
-> guard-green pending a deploy + a live ✅ re-test. The engineer does not self-certify or deploy.
+> **Status legend note:** 🟢 = guard green (unit/eval on this box). **LIVE STATUS (2026-06-24, after the
+> b7d9e29 production deploy):** the **WHOLE count surface is now live-verified on nucleus-woad** — core
+> (most-active = 29 system-wide, no contracts/company leak; DV4 = 15; correct tie / least / activity-top;
+> honest adversarial refusals) AND the previously-undeployed edge cases: **DV5** "exactly 5 in August" →
+> the 7-person set, each cited; **EG4** sparse intake grid → honest "no metric to rank by", no fabricated
+> winner; **AD4** non-existent name → honest "not in your file", no fabricated count. So every row is now
+> guard-green AND confirmed on the deployed build, not just eval-green.
 
 ---
 

@@ -5,8 +5,8 @@
 (git-ignored — the eval logs contain real client names from her sheets; kept local, not committed).
 
 - **Repo HEAD at capture:** `699ac41` (branch `ui-redesign`) — deterministic gate re-confirmed green at this commit
-- **Deployed (live) app:** `nucleus-woad.vercel.app` @ `830f0f2` — the count fix + all client-reported-bug fixes
-- **Not yet deployed:** DV5/EG4/AD4 count edge-cases (`719f037`) — committed + eval-green, deploy-pending
+- **Deployed (live) app:** `nucleus-woad.vercel.app` @ `b7d9e29` (deployed 2026-06-24) — the count fix + all
+  client-reported-bug fixes **plus the DV5/EG4/AD4 edge cases**, the whole count surface live-verified post-deploy
 
 ---
 
@@ -95,12 +95,13 @@ companion to `npm test` — `npm test` proves zero answer-quality (no live LLM),
 miss OR a creds-skip under `CI_STRICT`.
 
 ## 5. Honest open items
-- **DV5 / EG4 / AD4** (filter-by-count, sparse, non-existent-name) — committed (`719f037`) + eval-green 5/5
-  serial, **not yet deployed**. The deployed app already fixes every bug she reported; these are derived edge
-  cases. Held for a watched deploy.
 - **Urgency flagging** — only partially covered (no scenario gate yet).
 - **Local/Ollama mode** (`#6`) — in scope, must be tested (box-local + remote); not yet exercised. Not top priority.
 
 _Closed this session:_ journey value-blindness (**#42** — chat/citations now assert the golden **$1,285** +
 the real parties, with a negative-lookahead matcher so `12850` ≠ `1285`); the creds-gated answer-quality gate
-(**#41** — `npm run test:gate`); and the two stale journeys (documents two-step-confirm, admin sub-tab nav).
+(**#41** — `npm run test:gate`); the two stale journeys (documents two-step-confirm, admin sub-tab nav); and
+the **DV5/EG4/AD4 deploy** (`b7d9e29` → nucleus-woad) — the whole count surface now live-verified, incl. the
+edge cases (exactly-N set cited; sparse → honest no-rank; non-existent name → honest "not in your file").
+Also confirmed the count engine is **general, not hardcoded** — ran the real tally/filter functions on a
+freshly-invented grid (names in no test) and they computed every case correctly; cheat-grep clean.
