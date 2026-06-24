@@ -143,6 +143,56 @@ test("isGridShaped: a wide free-text table is a grid; a narrow/numeric one is no
   assert.equal(isGridShaped({ table: "c", columns: [{ name: "id", type: "INTEGER" }, { name: "vendor", type: "TEXT" }, { name: "cost", type: "REAL" }] }), false);
 });
 
+// THE CLEAN-TABLE DISCRIMINATOR (the over-count fix): a header-LESS calendar grid (placeholder
+// columns) IS a grid and falls to the occurrence-tally fallback; a CLEAN tabular sheet with distinct
+// named columns is NOT a grid — it must route to text-to-SQL (GROUP BY the real column) so a name
+// that also appears in another column is not over-counted. Keyed only off column NAMES, no dataset.
+test("isGridShaped: a CLEAN named-column table is NOT a grid (routes to text-to-SQL, not the tally)", () => {
+  // A simple participation log: 4 distinct, meaningful headers, all text. Old logic wrongly called
+  // this a grid (wide + text-heavy); now it is NOT — text-to-SQL handles it exactly.
+  const cleanTable = {
+    table: "participation_log",
+    columns: [
+      { name: "rowid_anchor", type: "INTEGER" },
+      { name: "participant", type: "TEXT" },
+      { name: "coach", type: "TEXT" },
+      { name: "session", type: "TEXT" },
+      { name: "date", type: "TEXT" },
+    ],
+  };
+  assert.equal(isGridShaped(cleanTable), false);
+});
+test("isGridShaped: a HEADER-LESS grid (placeholder columns) IS still a grid (her scheduling sheets)", () => {
+  // The auto-named, header-less calendar layout — the only case the occurrence-tally should own.
+  const headerlessGrid = {
+    table: "schedule",
+    columns: [
+      { name: "rowid_anchor", type: "INTEGER" },
+      { name: "__EMPTY", type: "TEXT" },
+      { name: "__EMPTY_1", type: "TEXT" },
+      { name: "__EMPTY_2", type: "TEXT" },
+      { name: "__EMPTY_3", type: "TEXT" },
+      { name: "1", type: "TEXT" },
+    ],
+  };
+  assert.equal(isGridShaped(headerlessGrid), true);
+});
+test("isGridShaped: a MOSTLY-named table with one stray placeholder is NOT a grid (majority rule)", () => {
+  // 4 named columns + 1 placeholder → still a clean table; the model/SQL reads it.
+  const mostlyNamed = {
+    table: "log",
+    columns: [
+      { name: "rowid_anchor", type: "INTEGER" },
+      { name: "participant", type: "TEXT" },
+      { name: "role", type: "TEXT" },
+      { name: "team", type: "TEXT" },
+      { name: "notes", type: "TEXT" },
+      { name: "__EMPTY", type: "TEXT" },
+    ],
+  };
+  assert.equal(isGridShaped(mostlyNamed), false);
+});
+
 // ── DIRECTION: most vs least ──────────────────────────────────────────────────────────────────
 test("tallyDirection detects LEAST/FEWEST (EN+HE), defaults to MOST", () => {
   assert.equal(tallyDirection("who is scheduled the most?"), "most");

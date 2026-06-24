@@ -242,6 +242,68 @@ silently assert one. (XF-NEW3.)
 **Status:** the two live REDs (SUM-bug leaked-source re-pin; now FC content is CONFIRMED so the only
 live RED left is SUM-bug) need a model run the verifier couldn't do (no LLM key) → **engineer**, RED-first.
 
+---
+
+## ROUND 3 — engineer fixes, re-scoped by the RETRIEVAL-vs-REASONING lens (2026-06-24, `herdata-engineer`)
+
+The four reported bugs were reproduced RED-first in-process over owner `3d1ca025` (when her corpus was
+intact at session start) and ground-truthed by SQL. The lead then applied the priority lens: **every
+bug is either RETRIEVAL (the system didn't get the right content in front of the model — fix SOLID +
+GENERAL, the priority) or REASONING (the model HAD the content but interpreted it loosely — best-effort,
+a stronger model fixes it, NO format-specific code).** An earlier draft added format-specific lanes
+(a template-detector + a multi-sheet period guard) — those were **REVERTED** as the per-format
+anti-pattern; the GENERAL retrieval fixes were kept, and the two reasoning bugs got ONE general prompt
+nudge (no detector, no branch).
+
+| bug | class | fix | proof |
+|---|---|---|---|
+| **2 MENDA incomplete** (preferred not named) | **RETRIEVAL (fixed solid)** | enumeration/summary WHOLE-DOC recall boost in `answer.ts` (`isEnumerationOrSummaryQuestion` + `fetchDocChunksByDoc`/`fetchBundledDocChunks`) — pulls enough of the subject doc so options 2–4 + the preferred reach the model. Also fixed a DEEPER general bug: a multi-chunk single-PAGE doc (docx/one-page memo, MENDA's 7-chunks-all-page-1 shape) collapsed to 1 chunk in `unionByRrf` (keyed by `doc#page`); the boost content-dedups instead. Helps EVERY document, no MENDA-specific code | retrieval gate `RETRIEVAL/MENDA-depth/enough-chunks` (≥4 chunks, was 1) + `…/grounded-cited` |
+| **4 summary routing** (leaks to docs / denies own data) | **RETRIEVAL (fixed solid)** | summary-over-own-data router guard (`isSummaryQuestion` + `guardSummaryOverOwnData` in `router.ts`) — a summary of the user's own subject routes to + retrieves their structured sheets, phrasing-robust, never an ungrounded-general denial | retrieval gate `RETRIEVAL/source-routing/structured` + `…/no-denial`, all 3 phrasings; units in `her-data-detectors.test.mts` |
+| **1 intake fabrication** (`58 candidates`) | **REASONING (best-effort)** | NO format-specific code (the template-detector was reverted). ONE general grounding-prompt nudge: "if a sheet's rows are form field labels, it's a blank template — say so, don't count rows as records". Retrieval is correct; interpretation is a model-quality gap | reported (not gated) in the retrieval eval as a best-effort signal |
+| **3 plan-periods conflation** (`166 periods`) | **REASONING (best-effort)** | same single general nudge: "the number of separate sheets is the number of periods/sections; never sum per-sheet row counts as periods". No detector | reported (not gated) in the retrieval eval |
+
+**Tests:** `tests/evals/her-data-generality.mjs` (the permanent RETRIEVAL gate — synthetic file of each
+input type under a throwaway owner, **HARD-gates the retrieval fixes** [right source/chunks retrieved],
+**REPORTS the reasoning signals** without gating, deletes the throwaway; 9/9 green) +
+`tests/unit/her-data-detectors.test.mts` (7 deterministic detector boundaries for the kept general
+fixes). **Gates:** `npx tsc --noEmit` clean; `npm test` 457/457 green; December cell-tally count eval
+5/5 (NO count-surface regression after the format-code revert); anti-cheat grep clean (zero
+owner-id/her-table/her-number in engine logic). **Caveat (reported, not hidden):** her live
+`uploaded_rows`/`doc_chunks` were externally WIPED + partially re-ingested mid-session (now only the 2
+December scheduling sheets + family-court remain), so the final RED→GREEN on HER exact data + the rest
+of the count surface (June/July/Aug/system-wide) must be re-pinned once her corpus is restored. The
+broader model-writes-SQL-against-real-structure rebuild (retiring special-case lanes generally) is the
+lead's deliberate next direction, not done tonight.
+
+---
+
+## ROUND 4 — the cell-tally CLEAN-TABLE over-count fix (2026-06-24, `herdata-engineer`)
+
+A new client report: a simple Excel + "who participates most" → RIGHT name, WRONG number (said 18,
+truth 10). Root cause: the cell-tally lane counts NAME OCCURRENCES across ALL columns instead of
+reading the real table — on a CLEAN tabular sheet that over-counts (a name in a Participant column AND
+a Coach column is tallied twice). The lead's call: **a REMOVAL, not new logic** — stop the
+occurrence-counter from HIJACKING clean tables; route them to the existing text-to-SQL `GROUP BY` for
+the exact count. Keep cell-tally as the fallback ONLY for genuinely messy header-less grids (her
+scheduling sheets) text-to-SQL can't parse.
+
+**The minimal diff:** `isGridShaped` (the single gate all three cell-tally detectors share) now also
+requires the table's columns to be mostly PLACEHOLDER/positional names (`__EMPTY`, `__EMPTY_3`, `col5`,
+`Column1`, a bare number) — the fingerprint of a header-less sheet ingestion auto-named. A CLEAN table
+with distinct headers (`participant`, `coach`, `venue`, `notes`) is no longer a "grid" → it falls to
+text-to-SQL. No new detector/lane/guard; one structural predicate added to the existing gate. Keyed
+only off column NAMES — no dataset/owner/number hardcoding (anti-cheat clean).
+
+**Proof (RED→GREEN, synthetic, throwaway owner):** `tests/evals/clean-table-not-occurrence-count.mjs`
+builds the over-count trap — Maya PARTICIPATES 8× but her name OCCURS 16× (also Coach 4× + Notes 4×)
+in a 4-named-column table. RED-first (old `isGridShaped`): the clean table got hijacked → wrong count.
+GREEN (fix): routes to text-to-SQL → **8, not 16/12**. The same eval's NO-REGRESSION case proves a
+HEADER-LESS placeholder-column grid STILL uses the occurrence-tally (Dana = 5 across unnamed columns).
+Unit: `tests/unit/cell-tally.test.mts` pins `isGridShaped` (clean named table → false; header-less /
+mostly-placeholder grid → true). `tsc` clean; `npm test` 460/460; cell-tally count units 37/37 (messy-
+grid path preserved). Did NOT touch her wiped live data (the December SCHED end-to-end re-pin waits on
+her corpus restore).
+
 ### Meta (feeds the ratchet)
 The independent audit found a false-block + 22 gaps the pm's own green-by-row view could not. So the
 **completeness audit of a coverage bar should be a standing VERIFIER responsibility** — re-derive the

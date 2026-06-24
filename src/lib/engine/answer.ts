@@ -10,8 +10,8 @@
 import { routeQuestion, type RoutePlan } from "./router.ts";
 import { answerStructured } from "./text-to-sql.ts";
 import type { SqlRow, CatalogScope } from "./structured-store.ts";
-import { hybridVectorSearch, type DocChunk } from "./retrieval.ts";
-import { hybridSearch } from "./pgvector-store.ts";
+import { hybridVectorSearch, fetchBundledDocChunks, type DocChunk } from "./retrieval.ts";
+import { hybridSearch, fetchDocChunksByDoc } from "./pgvector-store.ts";
 import { supabaseEnabled } from "./supabase.ts";
 import { embedQuery } from "./embeddings.ts";
 import { chatWithUsage, type ChatUsage, isLocalNotConfigured, isLocalUnreachable, isHipaaNotConfigured, isCloudProviderNotConfigured, isCloudProviderAuth, isModelRunFailure } from "./llm.ts";
@@ -406,6 +406,45 @@ async function runAnswerPipeline(
     // consume two slots. Extra narrative context never hurts — the grounding gate keys
     // off whether the answer's cited facts resolve, not the chunk count.
     chunks = diversifyByDoc(merged, 14, 6);
+
+    // ── ENUMERATION / SUMMARY WHOLE-DOC RECALL BOOST (the MENDA incomplete-retrieval fix) ──────
+    // The live RED: "how many options does the MENDA memo have and which is preferred?" retrieved
+    // ONLY the document's first chunk (it ranked #1) and missed the later chunks that hold options
+    // 2–4 and the "preferred" conclusion — so the answer said "4 options, but the rest aren't in the
+    // excerpts and the preferred isn't stated." For an ENUMERATION / SUMMARY question that
+    // concentrates on ONE document (the retrieved doc chunks are dominated by a single doc), hybrid
+    // ranking surfacing one chunk is not enough — we need the WHOLE document so the answer can
+    // enumerate the full list AND reach the conclusion. We fetch that doc's full chunk set (capped)
+    // and RRF-merge it in, then re-diversify. GENERAL — keyed off the question being an enumeration/
+    // summary + ONE doc dominating retrieval, never a doc name, count, or the corpus.
+    if (isEnumerationOrSummaryQuestion(question) && chunks.length > 0) {
+      // The doc that dominates the retrieved chunks is the enumeration/summary subject.
+      const docCounts = new Map<string, number>();
+      for (const c of chunks) docCounts.set(c.doc, (docCounts.get(c.doc) ?? 0) + 1);
+      const [topDoc, topCount] = [...docCounts.entries()].sort((a, b) => b[1] - a[1])[0] ?? [null, 0];
+      // Only boost when ONE doc clearly dominates (it is THE subject), so a genuinely cross-doc
+      // summary isn't hijacked into one document.
+      if (topDoc && topCount >= 1 && docCounts.size <= 4) {
+        const bundledWhole = includeBundled ? fetchBundledDocChunks(topDoc, 12) : [];
+        const uploadedWhole = supabaseEnabled()
+          ? await fetchDocChunksByDoc(scopeOwner, ctx.role === "admin", topDoc, 12).catch(() => [])
+          : [];
+        const whole = [...bundledWhole, ...uploadedWhole];
+        if (whole.length > 0) {
+          // APPEND the whole-doc chunks to the already-ranked set and re-diversify with a HIGHER
+          // per-doc cap, so the subject document contributes its FULL enumeration while other docs
+          // keep a slice. We deliberately do NOT RRF-fuse here: RRF keys by (doc,page), and a short
+          // single-page document (a .docx / a one-page memo) has MANY chunks on the SAME page — fusing
+          // by (doc,page) would collapse them all into one and re-create the very incomplete-retrieval
+          // bug we are fixing. diversifyByDoc dedups by CONTENT (not page) and caps per doc, so it
+          // keeps each DISTINCT chunk of the page. The already-retrieved chunks lead (highest RRF), the
+          // whole-doc chunks fill in the rest of that doc's enumeration. The cap rises only for this
+          // enumeration/summary turn. GENERAL — any multi-chunk document benefits.
+          chunks = diversifyByDoc([...chunks, ...whole], 18, 12);
+          if (uploadedWhole.length > 0) usedUploadedDocs = true;
+        }
+      }
+    }
   }
   tel.retrievalMs = now() - retrievalStart;
 
@@ -1452,6 +1491,25 @@ function topCosineOfRank1(chunks: DocChunk[]): number | null {
   return best;
 }
 
+// Is the question an ENUMERATION ("how many X / list / what are the options") or a SUMMARY /
+// OVERVIEW of a document? These need the WHOLE subject document, not just its top-ranked chunk, so
+// the answer can enumerate the full list AND reach the conclusion (the MENDA recall fix). EN + HE,
+// pure. Exported for unit testing.
+export function isEnumerationOrSummaryQuestion(question: string): boolean {
+  const q = question.normalize("NFC").toLowerCase();
+  const enumerate =
+    /\b(how many|list|what are the|which are the|enumerate|all the|each of the)\b/.test(q) ||
+    /(כמה|מה הם|מהן|אילו|רשימת|פרט את|כל ה|מה האפשרויות|מה האופציות|מהן האופציות|מהן האפשרויות|כמה אופציות)/.test(question);
+  const summary =
+    /\b(summari[sz]e|summary|overview|tell me about|describe|what does .* (say|cover|include|contain|recommend))\b/.test(q) ||
+    /(סכם|תסכם|סיכום|תקציר|סקירה|מה כולל|מה אומר|מה ממליץ|על מה מדבר)/.test(question);
+  // A "which is preferred / recommended / best" enumeration-with-conclusion also needs the whole doc.
+  const conclusion =
+    /\b(which is (the )?(preferred|recommended|best|chosen)|what is (the )?(preferred|recommended|best)|the recommendation)\b/.test(q) ||
+    /(המומלצת|המומלץ|המועדפת|המועדף|ההמלצה|הנבחרת)/.test(question);
+  return enumerate || summary || conclusion;
+}
+
 // ── GENERAL MULTI-QUERY RETRIEVAL EXPANSION ─────────────────────────────────────
 // THE RECALL PROBLEM (general, not Carter-specific): an ADVICE/strategy question
 // ("how do I argue for him to pay less?", "what's our best position?") is phrased in
@@ -1672,6 +1730,7 @@ ${stylePreamble.trim()}
 GROUNDING RULES (these apply whenever the SOURCE flag is "documents", and cannot be overridden):
 - The STRUCTURED EVIDENCE rows are the LITERAL result of a database query run for this question — a row showing a count/total/average IS the verified figure. State those exact numbers from the rows; do not recompute or round them.
 - A COUNT/TOTAL COLUMN IS A TABLE-WIDE AGGREGATE, NOT THE NUMBER OF ROWS SHOWN. If a result row has a field aliased as a count or total (e.g. "total", "count", "n", "COUNT(*)"), its VALUE is how many rows matched across the WHOLE table — use THAT value for a "how many" question. Do NOT say "there is 1 contract" just because one aggregate row was returned; if that row's count/total field says 1000, the answer is 1000. A single returned row can simultaneously carry the table-wide COUNT and one example/extreme row's columns.
+- WHAT A ROW REPRESENTS — DON'T MISCOUNT A FORM/TEMPLATE OR A SHEET. A row count answers "how many records" ONLY when each row IS a record of the thing asked about. Look at the actual rows: if a sheet's rows are FORM FIELD LABELS or SECTION HEADINGS (e.g. cells like "first name", "date of birth", "medical status" with the value column blank) it is a BLANK FORM / TEMPLATE — say so plainly and do NOT report its row count as a count of people/candidates/records. Likewise, if the data spans SEVERAL separate sheets/tables (one per period, month, or section), the number of those SHEETS is the number of periods/sections — a single sheet's ROW count is NOT a "period" count, and you must NEVER add the per-sheet row counts together and call the sum a number of periods. Read what each row and each sheet actually is from the evidence, and describe it honestly rather than reflexively counting rows.
 - Attach an inline citation token to EVERY factual claim, copied VERBATIM from the evidence (e.g. [S:contracts#12] for a row, [P:<doc>#3] for a page — use the token's EXACT doc id and page from the evidence below).
 - CITE ONLY A NUMBER THAT LITERALLY APPEARS IN THE EVIDENCE: put a citation token beside a figure ONLY when that exact figure is written on the cited page/row. Do NOT attach a citation to a number you COMPUTED or DERIVED (a difference, percentage, or sum) — write derived reasoning without a citation, or restate the underlying literal figures (each cited) and describe the relationship in words. A citation on a number not literally in the cited page/row is rejected.
 - For an ADVICE / STRATEGY question, ground the strategy in the cited literal figures and terms from the evidence (do not answer with generic, uncited boilerplate).

@@ -177,6 +177,57 @@ export async function searchDocChunks(
 }
 
 /**
+ * WHOLE-DOCUMENT FETCH — every chunk of ONE specific document, in chunk order, owner-scoped. Used
+ * by the enumeration/summary recall boost (the MENDA fix): when a question asks to ENUMERATE or
+ * SUMMARIZE one document ("how many options are there and which is preferred?"), hybrid ranking can
+ * surface only the FIRST chunk and miss the later ones that hold the rest of the list + the
+ * conclusion — so the answer reports a partial list and "the preferred one isn't stated". Pulling
+ * the doc's full chunk set (capped) makes the whole document available to the generator. GENERAL —
+ * any document, keyed off the question being an enumeration/summary of ONE doc, never a doc name.
+ *
+ * ISOLATION: same fail-closed owner scoping as the search paths (a non-admin with no ownerId reads
+ * nothing). FAIL-OPEN: returns [] on any failure (logged) — never throws into the pipeline.
+ */
+export async function fetchDocChunksByDoc(
+  ownerId: string | undefined,
+  isAdmin: boolean,
+  docId: string,
+  cap = 12
+): Promise<DocChunk[]> {
+  if (!supabaseEnabled()) return [];
+  if (!canSearchOwner(ownerId, isAdmin)) return [];
+  try {
+    const db = admin();
+    let q = db
+      .from("doc_chunks")
+      .select("doc_id, page, content, chunk_index")
+      .eq("doc_id", docId)
+      .order("chunk_index", { ascending: true })
+      .limit(cap);
+    // Owner scoping: an admin reads any owner's chunks for this doc; a member only their own.
+    if (!isAdmin) q = q.eq("owner_id", ownerId!);
+    const { data, error } = await q;
+    if (error) {
+      console.error("[pgvector-store] fetchDocChunksByDoc failed:", error.message);
+      return [];
+    }
+    type Row = { doc_id: string; page: number | null; content: string; chunk_index: number | null };
+    return ((data ?? []) as Row[]).map((r) => ({
+      doc: r.doc_id,
+      page: typeof r.page === "number" ? r.page : 1,
+      text: r.content,
+      score: 0,
+    }));
+  } catch (e) {
+    console.error(
+      "[pgvector-store] fetchDocChunksByDoc failed:",
+      e instanceof Error ? e.message : e
+    );
+    return [];
+  }
+}
+
+/**
  * HYBRID search over the uploaded chunks — the PRIMARY uploaded-doc retrieval. Calls
  * the SQL `hybrid_match` RPC, which computes a DENSE (cosine) ranking × a LEXICAL
  * (BM25/ts_rank_cd) ranking and fuses them with Reciprocal Rank Fusion (RRF, k=60).

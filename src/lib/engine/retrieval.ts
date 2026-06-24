@@ -83,6 +83,20 @@ export function vectorSearch(queryEmbedding: number[], k = 5, docFilter?: string
   return scored.slice(0, k);
 }
 
+/** WHOLE-DOCUMENT FETCH over the BUNDLED index — every chunk of ONE bundled doc, in page order
+ *  (capped). The bundled-corpus sibling of pgvector-store.fetchDocChunksByDoc: an enumeration/
+ *  summary question about ONE document needs the whole doc, not just its top-ranked chunk, so the
+ *  answer enumerates the FULL list and reaches the conclusion. Excludes admin-hidden docs. Pure. */
+export function fetchBundledDocChunks(docId: string, cap = 12): DocChunk[] {
+  const idx = getVectors();
+  const hidden = deletedSourceIds();
+  return idx.records
+    .filter((r) => !hidden.has(r.doc) && r.doc === docId)
+    .map((r) => ({ doc: r.doc, page: r.page, text: r.text, score: 0 }))
+    .sort((a, b) => a.page - b.page)
+    .slice(0, cap);
+}
+
 /** HYBRID RAG over the BUNDLED vector index (the Carter corpus — vectors.json),
  *  done IN-PROCESS so it matches the uploaded-doc pgvector lane: a DENSE cosine
  *  ranking × a LEXICAL BM25 ranking, fused with the SAME Reciprocal Rank Fusion

@@ -96,16 +96,44 @@ function isAttributeSuperlative(question: string): boolean {
   );
 }
 
+// A PLACEHOLDER / positional column name — the fingerprint of a sheet that had NO real header row,
+// so ingestion auto-named its columns. A calendar/scheduling GRID (day-columns with no headers) ends
+// up like this: `__EMPTY`, `__EMPTY_3`, `empty`, `empty_2`, `col5`, `column_7`, `unnamed: 4`, a bare
+// number, or `1`/`2`. A CLEAN tabular sheet instead has DISTINCT, meaningful headers (participant,
+// coach, session, date). This is the structural signal that separates "text-to-SQL can't parse this
+// (no columns to GROUP BY)" from "this is an ordinary table the model should read/query directly".
+// Pure; keyed only off the column NAME, no dataset/value hardcoding.
+function isPlaceholderColumnName(name: string): boolean {
+  const n = name.normalize("NFC").trim().toLowerCase();
+  if (!n) return true;
+  return (
+    /^_*empty(_\d+)?$/.test(n) ||           // __EMPTY, __EMPTY_3, empty, empty_2
+    /^unnamed(:?\s*\d+)?$/.test(n) ||        // "unnamed", "unnamed: 4"
+    /^(col|column|field|c|f|var)_?\d+$/.test(n) || // col5, column_7, field3, c1
+    /^\d+$/.test(n)                          // a bare numeric header (1, 2, 3 …)
+  );
+}
+
 /**
- * GRID SHAPE: many columns, most free-text (not numeric) — the layout where a value recurs ACROSS
- * columns (a calendar/scheduling grid). A narrow or mostly-numeric table is a normal SQL aggregate,
- * not this. Shared by both grid detectors. Pure.
+ * GRID SHAPE: a calendar/scheduling GRID that single-SELECT text-to-SQL CANNOT parse — many columns,
+ * mostly free-text, AND dominated by PLACEHOLDER/positional column names (the sheet had no header row,
+ * so a value recurs ACROSS unnamed day-columns). The placeholder-name requirement is what stops the
+ * occurrence-tally from HIJACKING a CLEAN tabular sheet (e.g. participant/coach/session/date): a clean
+ * table has distinct named columns, so text-to-SQL can `GROUP BY participant` and get the EXACT count
+ * — the occurrence-counter (which tallies a name across ALL columns, over-counting when the name also
+ * appears in another column) must NOT intercept it. Only a genuinely header-less grid, where there is
+ * no real column to GROUP BY, falls to the tally. Shared by all three grid detectors. Pure.
  */
 export function isGridShaped(table: TableSchema): boolean {
   const dataCols = table.columns.filter((c) => !ANCHOR_COLS.has(c.name.toLowerCase()));
   if (dataCols.length < 4) return false;
   const textCols = dataCols.filter((c) => (c.type || "TEXT").toUpperCase() !== "REAL");
-  return textCols.length >= Math.max(3, Math.ceil(dataCols.length / 2));
+  if (textCols.length < Math.max(3, Math.ceil(dataCols.length / 2))) return false;
+  // The DISCRIMINATOR: a true grid's columns are mostly placeholders (no header row to GROUP BY on).
+  // If MOST data columns are distinct, meaningful headers, this is a CLEAN table → let text-to-SQL
+  // read/query the real columns (exact COUNT/GROUP BY), do NOT route to the occurrence-tally.
+  const placeholderCols = dataCols.filter((c) => isPlaceholderColumnName(c.name));
+  return placeholderCols.length >= Math.ceil(dataCols.length / 2);
 }
 
 /**

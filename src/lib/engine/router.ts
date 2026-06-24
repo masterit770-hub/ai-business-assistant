@@ -69,6 +69,7 @@ Rules:
 - If documents ARE listed and the question is a content/factual/narrative/lookup question, choose "documents" (the labels are terse — let retrieval judge; do not require the label to spell out the answer).
 - If tables ARE listed and the question counts/totals/averages/looks up/filters rows, choose "structured".
 - Choose BOTH only when the question genuinely spans a listed document AND a listed table.
+- SUMMARY / OVERVIEW / "WHAT IS / WHAT DOES X INCLUDE / TELL ME ABOUT / DESCRIBE X" questions: the subject "X" the user names (a track, a program, a process, a topic) may live in EITHER the documents OR the structured TABLES (a multi-sheet program is often a set of TABLES, not a document). The table NAMES below are terse and may not spell out the subject, but a sheet whose name shares a word with the subject — or a set of related sheets — can BE the thing to summarize. So for a summary/overview/"what does X include" question, when BOTH documents AND tables are listed, route to BOTH (let retrieval judge which holds the subject) rather than guessing documents-only. If ONLY tables are listed, route to "structured"; if ONLY documents are listed, route to "documents". NEVER answer a summary of the user's OWN named subject with an empty route when their tables/documents are listed — that strands their own data and forces a wrong general-knowledge answer.
 - Return [] for a greeting/small-talk/general-knowledge question, or when the needed catalog is empty (that source is unavailable).
 - If documents are relevant to ONE specific listed document, set docFilter to its id; otherwise null.
 
@@ -160,11 +161,47 @@ export async function routeQuestion(
       hasAccessibleTables
     );
   }
-  // DETERMINISTIC EMPTY-CATALOG GUARD (RED #3). Independent of what the LLM returned: drop
-  // "documents" when the caller has NO accessible documents and "structured" when there are
-  // NO tables. This makes the no-hallucinated-source property hold even if a modest model
-  // ignores the prompt and guesses a source the catalog doesn't contain.
-  return guardEmptyCatalogs(normalizePlan(parsed), hasAccessibleDocs, hasAccessibleTables);
+  // DETERMINISTIC SUMMARY-OVER-OWN-DATA GUARD (the summary-routing fix). A modest router LLM
+  // intermittently routes a SUMMARY/OVERVIEW of the user's OWN named subject ("summarize the
+  // Danieli track", "what does X include") to documents-ONLY (or empty), stranding the user's
+  // structured SHEETS — which is where a multi-sheet program actually lives — and forcing a wrong
+  // general-knowledge answer that DENIES their data holds it (the live RED). When the question is a
+  // summary/overview AND the caller HAS structured tables, we deterministically ADD "structured" so
+  // their sheets get retrieved; documents stays too (retrieval judges which holds the subject). This
+  // is keyed only off the question SHAPE (a summary cue) + "the caller has tables", never a table
+  // name or subject — a non-summary question is untouched.
+  const planned = guardEmptyCatalogs(normalizePlan(parsed), hasAccessibleDocs, hasAccessibleTables);
+  return guardSummaryOverOwnData(planned, question, hasAccessibleTables);
+}
+
+// A SUMMARY / OVERVIEW / "what is / what does X include / tell me about / describe X" cue (EN + HE).
+// Conservative: a real "summarize/overview/describe/what does … include/tell me about" phrasing, not
+// a plain fact lookup. Pure + exported so the guard is unit-tested without an LLM.
+export function isSummaryQuestion(question: string): boolean {
+  const q = question.normalize("NFC").toLowerCase();
+  return (
+    /\b(summari[sz]e|summary|overview|tell me about|describe|walk me through|what (is|are|does|do)\b.*\b(include|cover|consist|contain|about))\b/.test(q) ||
+    /\b(what does .* include|give me .* (overview|summary))\b/.test(q) ||
+    /(סכם|תסכם|סיכום|תקציר|סקירה|מה כולל|מה כוללת|ספר לי על|תאר|מה זה|על מה|מה יש ב)/.test(question)
+  );
+}
+
+// DETERMINISTIC: for a SUMMARY question over a caller WITH structured tables, ensure "structured"
+// is in the route (so their own sheets are retrieved) without removing "documents". A non-summary
+// question, or a caller with no tables, is returned unchanged. Pure + exported.
+export function guardSummaryOverOwnData(
+  plan: RoutePlan,
+  question: string,
+  hasAccessibleTables: boolean
+): RoutePlan {
+  if (!hasAccessibleTables) return plan;
+  if (!isSummaryQuestion(question)) return plan;
+  if (plan.sources.includes("structured")) return plan;
+  return {
+    sources: [...plan.sources, "structured"],
+    docFilter: plan.docFilter,
+    rationale: `${plan.rationale || "summary"}; also routing to the caller's structured sheets (a summary of their own subject may live in their tables, not only documents)`,
+  };
 }
 
 // Deterministic post-routing guard: a source the caller cannot access (empty catalog)

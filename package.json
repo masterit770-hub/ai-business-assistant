@@ -19,6 +19,8 @@
     "eval:recommendation": "node tests/evals/recommendation-substance.mjs",
     "eval:keyless": "node tests/evals/keyless-model-error.mjs",
     "eval:reliability": "node tests/evals/answer-reliability.mjs",
+    "eval:her-data-generality": "node tests/evals/her-data-generality.mjs",
+    "eval:clean-table": "node tests/evals/clean-table-not-occurrence-count.mjs",
     "test:gate": "node scripts/answer-quality-gate.mjs"
   },
   "dependencies": {
