@@ -13,6 +13,7 @@ visible. A capability is "done" only when every cell it touches is green AND it 
 | **Unit** | one pure function/module in isolation; fast, deterministic, no I/O | validator/parser/algorithm/logic bugs | the network, a DB, a browser | `tests/unit/*.test.mts` |
 | **Integration** | real seams wired together — engine pipeline (route→retrieve→generate→validate), API↔DB↔engine, text-to-SQL↔SQLite, the **real Supabase** path, cold-start | wiring/contract/data-flow bugs, owner-scoping, durability, grounding behavior | mocking the thing under test; the in-memory fallback when the real path is claimed | `tests/evals/*.mjs` |
 | **Component** | one **stateful UI component** rendered in isolation; props → state → interaction → render | UI-state bugs (the "Saved"-lie, greying, confirm flows, disabled states) | hitting the real backend (mock the fetch, assert the state machine) | `tests/components/*.test.tsx` **← does not exist yet** |
+| **API contract** | one **route handler** driven directly (the real handler runs); only its I/O seams (auth resolver, the Supabase client/stores, `NextResponse`) are `mock.module`'d | HTTP-contract bugs the client hits — wrong status/validation order, auth/role gating, **per-user owner-scoping**, the write-only-key protection, self-lockout guards, demo-gating, error→status mapping, the never-500 contracts | mocking the handler itself; a live DB/network (assert the handler's decisions, not the store) | `tests/api/*.test.mts` |
 | **E2E / Journey** | the real user flow through the **deployed** app in a real browser | the integration of *everything* + the deployed env (keys/config) + what the user actually sees | demo-mode shortcuts standing in for the real deployed run | `tests/journeys/*.mjs` + `evals/golden-evals.mjs` (Playwright) |
 
 **Plus, orthogonal to the layers:** a per-capability **scenario design** — client-asked + lead-derived
@@ -67,8 +68,24 @@ and `tsc` + the full unit suite are green. The verifier gates against **this doc
 ## 5. Run
 ```
 npx tsc --noEmit
-npm test                                                       # unit (+ component, once added)
+npm test                                                       # unit + api + component (the deterministic gate)
+npm run test:unit                                              # unit only
+npm run test:api                                               # API route-handler contracts (tests/api/*) — see §6
+npm run test:components                                        # component (vitest) only
 for f in tests/evals/*.mjs; do node --experimental-strip-types "$f"; done   # integration (serial; creds)
 # E2E: Playwright via chromium-1223 vs nucleus-woad (or a preview)
 ```
 Checklists: [README.md](./README.md) (45 journeys) · [count-coverage.md](./count-coverage.md) (24 count rows).
+
+## 6. The API contract layer (`tests/api/*`)
+Every route handler under `src/app/api/*` is driven directly — the **real handler runs**; only its I/O
+seams are `mock.module`'d (the auth resolver, the Supabase client/stores, `NextResponse`). This guards the
+HTTP contract a **non-technical client hits**, which the engine evals and the live journeys did not cover
+deterministically: auth/role gating (401/403), input validation + status codes, **per-user owner-scoping**
+(a member's reads/writes carry `.eq("owner_id", self)`; an admin's do not), the **write-only-key**
+protection (a blank submit must not wipe a stored key; `__clear__` clears it), the **self-lockout** guards
+(an admin can't deactivate/demote themselves), demo-gating of the bundled corpus, the friendly/redacted
+error mapping (a provider key never reaches the client), and the **never-500** contracts (local-models
+probe, history with the store off). 100 cases across all 9 handlers; every guarded branch proven RED-first
+by removing the guard and watching exactly its test fail. Harness: `tests/api/_harness/` (the `@/`-alias +
+`next/server` resolve hook, and a recording fake Supabase builder that captures the owner-scoping).
