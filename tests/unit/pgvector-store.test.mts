@@ -8,6 +8,7 @@ import {
   searchDocChunks,
   reportedPersistCount,
   persistDropped,
+  isTransientOwnerFkError,
 } from "../../src/lib/engine/pgvector-store.ts";
 
 // The uploaded-doc pgvector lane. These tests cover the two things that must be exactly
@@ -107,4 +108,23 @@ test("a non-admin with no owner id never searches even if Supabase were on (gate
   // this caller can only ever get [] — verified directly via the pure predicate above
   // and here end-to-end (Supabase off → [] regardless).
   assert.deepEqual(await hybridSearch(undefined, false, [0.1], "q", 8), []);
+});
+
+// ── isTransientOwnerFkError: the doc_chunks.owner_id FK-race classifier (#82) ──────────────────────
+// A just-created auth user isn't yet FK-visible, so an immediate ingest is rejected with the owner_id
+// FK violation — but it self-heals on a retry. We retry ONLY that transient FK error, never a real
+// data/constraint/RLS error. This pins the classification so the retry can't accidentally loop on a
+// genuine failure. (The race silently dropped doc_chunks → empty catalog → route=[] → the Beyoncé
+// fabrication; the retry + the existing read-back close it.)
+test("isTransientOwnerFkError: matches the owner_id FK violation (by code 23503 and by message)", () => {
+  assert.equal(isTransientOwnerFkError({ code: "23503", message: "insert violates foreign key constraint" }), true);
+  assert.equal(isTransientOwnerFkError({ message: 'violates foreign key constraint "doc_chunks_owner_id_fkey"' }), true);
+  assert.equal(isTransientOwnerFkError({ message: 'violates foreign key constraint "uploaded_rows_owner_id_fkey"' }), true);
+});
+test("isTransientOwnerFkError: does NOT match a different error (no false retry)", () => {
+  assert.equal(isTransientOwnerFkError(null), false);
+  assert.equal(isTransientOwnerFkError({ message: "permission denied for table doc_chunks" }), false); // RLS
+  assert.equal(isTransientOwnerFkError({ message: "null value in column content violates not-null constraint" }), false);
+  assert.equal(isTransientOwnerFkError({ message: 'violates foreign key constraint "some_other_fkey"' }), false); // a non-owner FK
+  assert.equal(isTransientOwnerFkError({ code: "23505", message: "duplicate key" }), false); // unique violation
 });

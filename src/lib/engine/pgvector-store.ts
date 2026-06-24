@@ -59,6 +59,18 @@ export function persistDropped(requested: number, verified: number): boolean {
   return Math.max(0, verified) < requested;
 }
 
+// A TRANSIENT owner_id foreign-key violation: a just-created auth user isn't yet visible to the
+// doc_chunks.owner_id → auth.users(id) FK, so an immediate insert is rejected, but the owner becomes
+// visible moments later — so it is safe to RETRY. We match by the Postgres FK error (code 23503 /
+// "foreign key constraint" / the constraint name) so a DIFFERENT error (bad data, a real constraint,
+// RLS) is NOT retried. Pure + exported so the classification is unit-tested without a DB.
+export function isTransientOwnerFkError(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  if (error.code === "23503") return true; // Postgres foreign_key_violation
+  const m = (error.message ?? "").toLowerCase();
+  return m.includes("foreign key constraint") && m.includes("owner_id");
+}
+
 // pgvector accepts a vector literal as a bracketed, comma-joined list: "[0.1,0.2,...]".
 // supabase-js sends it as a JSON string param; Postgres casts text → vector(384). We
 // format it ourselves (rather than rely on driver coercion) so the on-wire shape is
@@ -122,7 +134,19 @@ export async function storeDocChunks(
       urgency: urgency ?? null,
       embedding: toVectorLiteral(c.embedding),
     }));
-    const { error } = await db.from("doc_chunks").insert(rows);
+    // INSERT with a retry on a TRANSIENT owner_id FK violation. The doc_chunks.owner_id FK references
+    // auth.users(id); a just-created user (admin.createUser) can RETURN before that row is FK-visible,
+    // so an immediate ingest gets "violates foreign key constraint doc_chunks_owner_id_fkey" → 0 rows
+    // → empty doc catalog → route=[] → the recorded fabrication. The owner becomes visible within a
+    // moment, so we retry the insert a few times with a short backoff. (A NON-FK error — bad data,
+    // RLS, a real constraint — is NOT retried; it returns 0 immediately and the read-back below still
+    // reports the truth.) This is the GENERAL fix: any flow that ingests right after creating the
+    // owner now self-heals instead of silently dropping the doc.
+    let error = (await db.from("doc_chunks").insert(rows)).error;
+    for (let attempt = 0; attempt < 4 && error && isTransientOwnerFkError(error); attempt++) {
+      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      error = (await db.from("doc_chunks").insert(rows)).error;
+    }
     if (error) {
       console.error("[pgvector-store] insert failed:", error.message);
       return 0;

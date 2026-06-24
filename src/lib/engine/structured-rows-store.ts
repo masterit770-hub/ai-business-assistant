@@ -18,6 +18,7 @@
 // FAIL-OPEN on writes: storeUploadedRows never throws into ingest (a Supabase blip must
 // not break an upload) — it logs and returns 0, mirroring storeDocChunks.
 import { admin, supabaseEnabled } from "./supabase.ts";
+import { isTransientOwnerFkError } from "./pgvector-store.ts";
 
 // One uploaded structured row ready to persist: the sanitized table id, its 1-based
 // per-table row id (the [S:<table>#row] citation anchor), and the full keyed row data.
@@ -82,7 +83,14 @@ export async function storeUploadedRows(
       row_id: r.rowId,
       data: r.data,
     }));
-    const { error } = await db.from("uploaded_rows").insert(payload);
+    // INSERT with a retry on a TRANSIENT owner_id FK violation (same race as doc_chunks): a just-
+    // created owner isn't yet FK-visible, so an immediate ingest is rejected → 0 rows → empty catalog.
+    // The owner becomes visible moments later, so retry. A non-FK error is NOT retried.
+    let error = (await db.from("uploaded_rows").insert(payload)).error;
+    for (let attempt = 0; attempt < 4 && error && isTransientOwnerFkError(error); attempt++) {
+      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      error = (await db.from("uploaded_rows").insert(payload)).error;
+    }
     if (error) {
       console.error("[structured-rows-store] insert failed:", error.message);
       return 0;
