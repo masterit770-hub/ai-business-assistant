@@ -75,7 +75,10 @@ export type CellTallyResult = {
 //     slip can't reopen AD2.
 //   • A PLAIN LOOKUP ("who is scheduled on Aug 1", "when is X scheduled") is NOT a ranking/count → none.
 export type OccurrenceKind = "ranking" | "specific-count" | "filter" | "none";
-export type OccurrenceIntent = { kind: OccurrenceKind; direction: "most" | "least"; usage?: ChatUsage };
+// `errored` is TRUE only when the classifier LLM call itself failed (network/timeout/provider error),
+// distinct from the model deliberately judging "none". The router guard uses it to FAIL-SAFE: on an
+// error over the caller's OWN grid it still routes structured (engage their data) rather than punt.
+export type OccurrenceIntent = { kind: OccurrenceKind; direction: "most" | "least"; errored: boolean; usage?: ChatUsage };
 
 // A compact, language-neutral schema description for the intent prompt: each grid table + its columns.
 function describeGridCatalog(tables: TableSchema[]): string {
@@ -99,7 +102,7 @@ export async function classifyOccurrenceIntent(
   const direction = tallyDirection(question);
   // Deterministic AD2 backstop: an intrinsic-attribute superlative is NEVER an occurrence ranking —
   // short-circuit BEFORE the model so a model slip can't crown the most-scheduled person as "oldest".
-  if (isAttributeSuperlative(question)) return { kind: "none", direction };
+  if (isAttributeSuperlative(question)) return { kind: "none", direction, errored: false };
   // Run the classifier; RETRY ONCE on "none". A "none" can mean a genuine non-occurrence question OR a
   // degraded/garbled completion from a momentarily-overloaded provider (a 429-retried-but-truncated
   // response that parsed to {} → "none"). A genuine "none" is STABLE — a plain lookup / attribute
@@ -126,14 +129,29 @@ ${describeGridCatalog(gridTables)}
 QUESTION: ${question}
 
 Return the JSON now.`;
-  const callOnce = async (): Promise<{ kind: OccurrenceKind; usage: ChatUsage }> => {
-    const { content, usage } = await chatWithUsage(
-      [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      { json: true, temperature: 0 }
-    );
+  const callOnce = async (): Promise<{ kind: OccurrenceKind; usage: ChatUsage; errored: boolean }> => {
+    let content: string;
+    let usage: ChatUsage;
+    try {
+      // TEST-ONLY: simulate a classifier LLM outage so a test can prove the fail-safe (route
+      // structured, never punt) without a real provider failure. Never set in production.
+      if (process.env.__INTENT_FORCE_ERROR === "1") throw new Error("forced intent-classifier error (test)");
+      ({ content, usage } = await chatWithUsage(
+        [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        { json: true, temperature: 0 }
+      ));
+    } catch (e) {
+      // FAIL-SAFE: the classifier is an LLM call — on a network/timeout/provider error it must NOT
+      // crash the answer pipeline. Return errored:true so the CALLER can degrade toward ENGAGING the
+      // caller's own structured data (never punt to a general "can't find" over her own grid). The
+      // `kind` here is "none" (no specific lane), but `errored` distinguishes "the model judged none"
+      // from "we couldn't ask" — the router guard uses that to still route structured on error.
+      void e;
+      return { kind: "none", usage: { live: false, provider: "—", model: "—" } as ChatUsage, errored: true };
+    }
     let kind: OccurrenceKind = "none";
     try {
       const parsed = JSON.parse(content);
@@ -141,21 +159,23 @@ Return the JSON now.`;
         kind = parsed.kind;
       }
     } catch {
-      kind = "none"; // fail-open: classifier hiccup → no cell lane, text-to-SQL still runs
+      kind = "none"; // unparseable JSON → no cell lane, text-to-SQL still runs (not an error)
     }
-    return { kind, usage };
+    return { kind, usage, errored: false };
   };
-  let { kind, usage } = await callOnce();
+  let { kind, usage, errored } = await callOnce();
   if (kind === "none") {
-    // Retry once — a flaky false-none (degraded/truncated provider response) recovers; a real none
-    // (lookup / attribute superlative) stays none. We keep the first usage for telemetry.
+    // Retry once — a flaky false-none (degraded/truncated provider response) OR a transient error
+    // recovers; a real none (lookup / attribute superlative) stays none. We keep the first usage.
     const retry = await callOnce();
     if (retry.kind !== "none") kind = retry.kind;
+    // Stay errored ONLY if BOTH calls errored (a persistent provider outage), so the guard fail-safes.
+    errored = errored && retry.errored;
   }
   // Post-check (defense in depth): a "filter" must actually name a target integer; if it doesn't,
   // treat it as a ranking ("who is scheduled the most/least") rather than a broken filter.
   if (kind === "filter" && filterTargetCount(question) == null) kind = "ranking";
-  return { kind, direction, usage };
+  return { kind, direction, errored, usage };
 }
 
 // Does the question ask for the LEAST/FEWEST rather than the MOST? EN + HE. Conservative: only

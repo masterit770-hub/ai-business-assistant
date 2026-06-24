@@ -238,11 +238,18 @@ export async function guardGridCellOverOwnData(
   const gridTables = tables.filter((t) => isGridShaped(t));
   if (gridTables.length === 0) return plan;
   const intent = await classifyOccurrenceIntent(question, gridTables);
-  if (intent.kind === "none") return plan;
+  // FAIL-SAFE (no punt on own data): if the intent classifier itself ERRORED (provider outage), we
+  // could not tell whether this is a grid occurrence question — but the caller HAS grid sheets and the
+  // router stranded the question. Rather than leave them with an ungrounded general "can't find" over
+  // their own data, route structured: the structured lane reads their sheets and either answers or
+  // gives an honest grounded limit. A genuine kind:"none" (the model decided) is left unchanged.
+  if (intent.kind === "none" && !intent.errored) return plan;
   return {
     sources: [...plan.sources, "structured"],
     docFilter: plan.docFilter,
-    rationale: `${plan.rationale || "grid occurrence question"}; also routing to the caller's structured sheets (an occurrence-${intent.kind} over their schedule grid is answered by the cell-tally lane, not plain SQL)`,
+    rationale: intent.errored
+      ? `${plan.rationale || "grid question"}; intent classifier unavailable — routing to the caller's structured sheets anyway (never punt to general over their own data)`
+      : `${plan.rationale || "grid occurrence question"}; also routing to the caller's structured sheets (an occurrence-${intent.kind} over their schedule grid is answered by the cell-tally lane, not plain SQL)`,
   };
 }
 

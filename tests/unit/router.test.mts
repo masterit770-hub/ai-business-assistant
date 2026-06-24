@@ -147,6 +147,21 @@ test("grid-cell guard: NO-OP when 'structured' is already routed (no LLM call, s
   assert.equal(p, already, "returns the same object unchanged when structured is already present");
 });
 
+test("grid-cell guard: FAIL-SAFE — on a classifier ERROR over the caller's grid, routes structured (never punts)", async () => {
+  // The intent classifier is an LLM call; on a provider outage it must NOT leave a stranded grid
+  // question to answer ungrounded "can't find" over the user's OWN data. We force the classifier to
+  // error (test hook) and assert the guard still routes structured so the structured lane reads their
+  // sheets (answer or honest grounded limit). This is item-2 of the #70 close: no punt on own data.
+  const stranded = { sources: [] as ("structured" | "documents")[], docFilter: null, rationale: "router punted" };
+  process.env.__INTENT_FORCE_ERROR = "1";
+  try {
+    const p = await guardGridCellOverOwnData(stranded, "who participates the most?", [gridSheet]);
+    assert.deepEqual(p.sources, ["structured"], "a classifier outage over a grid must fail-safe to structured");
+  } finally {
+    delete process.env.__INTENT_FORCE_ERROR;
+  }
+});
+
 test("grid-cell guard: NO-OP when the caller has NO grid-shaped table (no LLM call, short-circuit)", async () => {
   const stranded = { sources: [] as ("structured" | "documents")[], docFilter: null, rationale: "greeting" };
   // With only a clean table, the cell-tally lane can't apply → the guard returns the plan unchanged

@@ -237,7 +237,7 @@ export async function answerStructured(
   const anyGrid = gridCatalog.length > 0;
   const intent: OccurrenceIntent = anyGrid
     ? await classifyOccurrenceIntent(question, gridCatalog)
-    : { kind: "none", direction: "most" };
+    : { kind: "none", direction: "most", errored: false };
   if (intent.usage) usages.push(intent.usage);
   // Per-lane predicates now key off table SHAPE (deterministic) × the model's INTENT flag (phrasing-
   // independent) — the regex predicates are gone. A grid table is a tally/count/filter candidate iff
