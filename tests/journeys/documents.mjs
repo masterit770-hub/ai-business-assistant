@@ -54,11 +54,21 @@ export async function run() {
       "download returns a real PDF (Content-Type application/pdf + %PDF magic)",
       `status=${head.status} ctype=${head.ctype} bytes=${head.bytes} magic=${JSON.stringify(head.magic)}`);
 
-    // 6c. Admin deletes the BUNDLED family-court source. The remove() uses confirm(),
-    // so auto-accept the dialog, then verify the row disappears from the rail.
-    page.on("dialog", (d) => d.accept().catch(() => {}));
+    // 6c. Admin deletes the BUNDLED family-court source. The shipped UI uses a TWO-STEP
+    // INLINE confirm (DeleteControl), NOT window.confirm() — native confirm() can be
+    // browser-suppressed, which was the client's "the delete is unreachable" bug. So the
+    // real flow is: click "Delete" to ARM, then click the inline "Delete" (…-yes) to
+    // confirm. (An earlier version of this journey drove the OLD window.confirm path with
+    // page.on("dialog") + a single click — a stale FALSE-RED; the product was correct.)
     if (rmPresent > 0) {
       await page.click(`[data-testid="bundled-remove-${FAMILY}"]`);
+      const armed = await page
+        .locator(`[data-testid="bundled-remove-${FAMILY}-yes"]`)
+        .waitFor({ state: "visible", timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
+      rec.check(armed, "delete arms a two-step inline confirm (no native dialog to suppress)", `armed=${armed}`);
+      await page.click(`[data-testid="bundled-remove-${FAMILY}-yes"]`);
       await page.waitForFunction((id) => !document.querySelector(`[data-testid="bundled-row-${id}"]`),
         FAMILY, { timeout: 20000 }).catch(() => {});
       const rowGone = (await page.locator(`[data-testid="bundled-row-${FAMILY}"]`).count()) === 0;

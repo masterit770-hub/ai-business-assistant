@@ -7,11 +7,17 @@ export async function run() {
   const rec = makeRecorder("ADMIN");
   const browser = await launch();
   try {
-    const { ctx, page } = await signIn(browser, "admin", "/settings");
+    // Settings is now SUB-TABBED (Prompts · Models · Appearance · Users); the panels are
+    // kept mounted but `hidden` when inactive, so the Users panel is in the DOM yet not
+    // visible/clickable until its tab is active. SimpleTabs honors ?tab=<value>, so deep-
+    // link straight to the Users tab. (An earlier version landed on the default Prompts
+    // tab and FALSE-FAILED: users-panel hidden→not "visible", create-user inputs not
+    // actionable — a stale test from the redesign, not a product break.)
+    const { ctx, page } = await signIn(browser, "admin", "/settings?tab=users");
     // The role-change controls live in a `hidden ... sm:flex` container, so a narrow
     // viewport hides them. Use a desktop width to exercise the real admin UI.
     await page.setViewportSize({ width: 1400, height: 900 });
-    await page.goto(`${BASE}/settings`, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.goto(`${BASE}/settings?tab=users`, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForTimeout(2000); // let the real user list load
     await page.locator('[data-testid="users-panel"]').waitFor({ state: "visible", timeout: 30000 }).catch(() => {});
 

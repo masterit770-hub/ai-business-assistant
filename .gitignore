@@ -52,3 +52,6 @@ supabase/.temp/
 # OCR trained data (large, regenerable)
 eng.traineddata
 heb.traineddata
+
+# Raw test-evidence logs may contain real client data (names from her sheets) — keep local, never commit.
+docs/testing/evidence/

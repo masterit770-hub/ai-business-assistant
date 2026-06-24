@@ -148,6 +148,14 @@ const SCHED_OWNER = "3d1ca025-d718-4d55-bab5-821a239cadbf";
 const DEMO_ADMIN = { isDemo: true, role: "admin" };           // bundled + ALL uploaded docs/tables
 const GMAIL = { ownerId: GMAIL_OWNER, isDemo: false, role: "member" }; // ONLY her file
 const SCHED = { ownerId: SCHED_OWNER, isDemo: false, role: "member" }; // ONLY her Excel sheets
+// THE OWNER'S REAL ACCOUNT STATE: owner 3d1ca025 is is_demo=true in prod, so her catalog holds
+// BOTH her uploaded שיבוצים scheduling sheets AND the bundled demo corpus (contracts/payroll/
+// people/…). The cross-corpus mis-routing bug (an EN people-superlative answering with COMPANY
+// names from the bundled contracts table) ONLY reproduces under this condition — SCHED's
+// isDemo:false sandboxes the bundled corpus away and so can NEVER exercise the failure it is
+// meant to gate (the recorded META-MISS: a green eval that can't see the bug). SCHED_DEMO mirrors
+// the real account so the cross-corpus regression case below actually reproduces the condition.
+const SCHED_DEMO = { ownerId: SCHED_OWNER, isDemo: true, role: "member" }; // her sheets + bundled corpus
 
 // ── GRADING PRIMITIVES (fact + citation presence, never exact string) ──────────
 const cites = (a) => [...(a || "").matchAll(/\[[SP]:[^\]]+\]/g)].map((m) => m[0]);
@@ -562,6 +570,34 @@ const QUESTIONS = [
     id: "EN/sched-most-active-qualified", ctx: SCHED, mustGround: false,
     q: "who is the most active person in the schedules?",
     grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // CROSS-CORPUS REGRESSION (the recorded bug + the verifier's META-MISS fix). This is the SAME
+    // EN people-superlative, but run under SCHED_DEMO (isDemo:true) — the owner's REAL account
+    // state, where the bundled demo corpus (contracts/payroll/people) is visible ALONGSIDE her
+    // scheduling sheets. THAT is the only condition under which the bug reproduces: the live RED
+    // answered with COMPANY names from the bundled `contracts` table ("Blogspan and Brainsphere,
+    // 5 occurrences [S:contracts#…]") instead of the most-scheduled PERSON. The isDemo:false
+    // SCHED variant above CANNOT see the bundled corpus, so it could stay green even if the
+    // mis-routing returned — this case closes that gap by reproducing the real condition. It must
+    // ground to נגה מאירסון @29 AND must NOT cite a bundled table or name a bundled company.
+    id: "EN/sched-most-active-crosscorpus", ctx: SCHED_DEMO, mustGround: false,
+    q: "who is the most active person",
+    grade: (res) => {
+      const base = gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER })(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      // Belt-and-braces over the faithful grader: no bundled-corpus citation, no bundled company.
+      // (The faithful grader already requires 29 + נגה מאירסון, which a contracts answer fails; this
+      // makes the cross-corpus intent explicit and catches a "names נגה but ALSO cites contracts".)
+      if (/\[S:(contracts|payroll|people|enrollment|maintenance)/i.test(a)) {
+        return { ok: false, why: "cited a BUNDLED demo table for a people-superlative over her sheets (cross-corpus mis-route)" };
+      }
+      if (/\b(Blogspan|Brainsphere)\b/i.test(a)) {
+        return { ok: false, why: "named a bundled-corpus COMPANY as the most-active person (the recorded cross-corpus RED)" };
+      }
+      return { ok: true };
+    },
   },
   {
     // VARIATION: the LEAST direction — must compute the MINIMUM group, not the max. Ground truth:
