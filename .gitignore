@@ -56,9 +56,9 @@ heb.traineddata
 # Raw test-evidence logs may contain real client data (names from her sheets) — keep local, never commit.
 docs/testing/evidence/
 
-# Client PII — her ENTIRE uploaded corpus (youth-name scheduling sheets, the family-court case-file
-# PDF, the Carter story, the school-data CSVs) is the client's private data and MUST NEVER be committed
-# or deployed. Ignore ALL of data/ (the files stay on disk for local evals; they're just never tracked).
-# Root-level raw grid dumps (grid-*.txt) are the same PII in another form — ignore those too.
-data/
+# PII — ONLY the 2 Hebrew scheduling xlsx carry real-looking youth names → never commit/deploy them.
+# The rest of data/ (the Mockaroo-synthetic school-data CSVs, the explicitly-MOCK family-court PDF, the
+# fictional Carter story, pdf-pages.json) is invented test data that committed evals depend on — those
+# STAY tracked. Root-level raw grid dumps (grid-*.txt) are the xlsx content in another form — ignore too.
+data/*.xlsx
 grid-*.txt
