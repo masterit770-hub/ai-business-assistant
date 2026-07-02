@@ -24,7 +24,7 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
           Terms
         </Link>
         <span className="mx-3">·</span>
-        <span>© 2026 AI Business Assistant</span>
+        <span>© 2026 NUCLEUS 770</span>
       </footer>
     </div>
   );

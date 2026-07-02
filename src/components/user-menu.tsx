@@ -38,7 +38,7 @@ export function UserMenu() {
   const label = resolveDisplayLabel(displayName, email);
   // When a display name is set, surface the email underneath; otherwise keep the
   // existing subtitle so nothing looks empty.
-  const subtitle = displayName && email ? email : "AI Business Assistant";
+  const subtitle = displayName && email ? email : "NUCLEUS 770";
 
   // Initials come from the resolved label (a name's words, or the email local part).
   const initialsSource = displayName?.trim() || email?.split("@")[0] || "";

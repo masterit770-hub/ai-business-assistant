@@ -7,6 +7,9 @@ import { getVectors, loadReport } from "./retrieval.ts";
 import { DOCUMENTS } from "./documents.ts";
 import { TABLES } from "./schema.ts";
 import { deletedSourceIds } from "./deleted-sources.ts";
+import { classifyUrgency } from "./urgency.ts";
+import { getSetting, setSetting } from "./settings.ts";
+import type { Urgency } from "./doc-store.ts";
 
 // A document's primary language, derived HONESTLY from its real indexed text (not
 // fabricated). "en"/"he" when we can tell; null when unknown → the UI omits the chip.
@@ -18,6 +21,7 @@ export type BundledSource = {
   kind: "document" | "structured";
   detail: string; // e.g. "PDF · 24 pages" or "Table · 760 rows"
   lang: DocLang; // primary language of a document source (null for structured/unknown)
+  urgency?: Urgency | null; // classified urgency for a bundled DOCUMENT (enriched async)
 };
 
 // Hebrew Unicode block. We classify a document as Hebrew when a meaningful share of
@@ -91,4 +95,60 @@ export function bundledSources(): BundledSource[] {
   }
 
   return out;
+}
+
+// Each bundled DOCUMENT's indexed text (capped), for urgency classification.
+function bundledDocTexts(): Map<string, string> {
+  const acc = new Map<string, string[]>();
+  try {
+    for (const r of getVectors().records) {
+      if (!acc.has(r.doc)) acc.set(r.doc, []);
+      acc.get(r.doc)!.push(r.text ?? "");
+    }
+  } catch {
+    /* index not built — no texts */
+  }
+  return new Map([...acc].map(([doc, parts]) => [doc, parts.join(" ").slice(0, 4000)]));
+}
+
+/**
+ * Attach an urgency badge to each bundled DOCUMENT so the dashboard shows urgency on
+ * EVERY document, not just uploads. The verdict is CLASSIFIED (real LLM call, via the
+ * admin-editable urgency prompt) ONCE and cached durably in engine_settings
+ * (`bundled_urgency`), so it costs no LLM call per request afterwards. The cache is
+ * cleared when the urgency prompt changes (settings.setSetting), so it RE-DERIVES — the
+ * #G behavior, now applied to bundled docs too. Best-effort: a classification failure
+ * just leaves that doc's badge off (never throws into the documents listing).
+ */
+export async function enrichBundledUrgency(sources: BundledSource[]): Promise<BundledSource[]> {
+  const docs = sources.filter((s) => s.kind === "document");
+  if (docs.length === 0) return sources;
+  let map: Record<string, Urgency> = {};
+  try {
+    map = JSON.parse((await getSetting("bundled_urgency")) || "{}");
+  } catch {
+    map = {};
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const texts = bundledDocTexts();
+  let changed = false;
+  for (const s of docs) {
+    if (map[s.doc] === undefined) {
+      try {
+        map[s.doc] = await classifyUrgency(texts.get(s.doc) ?? s.label, today);
+        changed = true;
+      } catch {
+        /* leave unset → badge omitted for this doc only */
+      }
+    }
+    s.urgency = map[s.doc] ?? null;
+  }
+  if (changed) {
+    try {
+      await setSetting("bundled_urgency", JSON.stringify(map));
+    } catch {
+      /* cache write best-effort */
+    }
+  }
+  return sources;
 }

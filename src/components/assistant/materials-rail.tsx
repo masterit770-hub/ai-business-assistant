@@ -1,62 +1,171 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { FileText, Database, Trash2, Loader2, RefreshCw, Download } from "lucide-react";
-import { UploadButton } from "@/components/upload-button";
+import { useRouter } from "next/navigation";
+import { FileText, Database, Trash2, Loader2, RefreshCw, Download, Table, Check, X } from "lucide-react";
+import { ChatUpload } from "@/components/assistant/chat-upload";
 import { UrgencyBadge } from "@/components/urgency-badge";
+import { TableViewer } from "@/components/assistant/table-viewer";
 import type { Urgency } from "@/lib/mock";
 
 type DocLang = "en" | "he" | null;
-type DocMeta = { doc: string; label: string; urgency: Urgency | null };
+type DocMeta = {
+  doc: string;
+  label: string;
+  urgency: Urgency | null;
+  lang?: DocLang;
+  pages?: number;
+  session_id?: string | null;
+  chatLabel?: string | null;
+  space_id?: string | null;
+  spaceLabel?: string | null;
+};
+// An uploaded STRUCTURED source (a spreadsheet) — answered by text-to-SQL, surfaced with
+// the [S] chip + a row viewer. Durable + owner-scoped from /api/documents.structuredTables.
+type StructuredTable = {
+  doc: string;
+  label: string;
+  rows: number;
+  detail: string;
+  session_id?: string | null;
+  chatLabel?: string | null;
+  space_id?: string | null;
+  spaceLabel?: string | null;
+};
 type BundledSource = {
   doc: string;
   label: string;
   kind: "document" | "structured";
   detail: string;
   lang?: DocLang;
+  urgency?: Urgency | null; // documents carry an urgency badge too, for a consistent bucket
+  session_id?: string | null; // virtual session (e.g. SAMPLE_DATA_SESSION_ID for demo docs)
+  chatLabel?: string | null;  // e.g. "Sample data" for demo bundled sources
 };
 
-// Honest, lightweight language detection for an UPLOADED doc, from the only text we
-// have client-side: its label. Hebrew letters → "he", Latin letters → "en", neither
-// → null (the chip is omitted — we never fabricate a language we can't see).
+// Fallback language guess for an uploaded doc when the server didn't supply a
+// content-detected language (older rows / Supabase off): infer from the label.
+// PREFER the server's `lang` (detected from the doc's REAL indexed text) — a Hebrew
+// invoice named "hebrew-invoice.pdf" must read HE from its content, not EN from its
+// Latin filename. Hebrew letters → "he", Latin → "en", neither → null (chip omitted).
 function labelLang(label: string): DocLang {
   if (/[֐-׿]/.test(label)) return "he";
   if (/[A-Za-z]/.test(label)) return "en";
   return null;
 }
 
-// The "Your materials" rail — the real sources the assistant can answer from, with
-// the upload control. Each item carries a [P] (document) or [S] (structured) chip so
-// it visibly maps to the citation tokens the answers use. Real data from
-// /api/documents (owner-scoped uploads + the bundled corpus). Publishes counts on
-// `nucleus:docs` / `nucleus:bundled` so the dashboard stat cards stay in sync.
-export function MaterialsRail() {
+// Props for mode selection:
+//   mode="global" (default) — all docs, shows chatLabel badges, no upload panel.
+//   mode="chat" + sessionId — this chat's docs only, shows upload panel, no chatLabels.
+//   spaceId — when set, scopes docs to this Knowledge Space.
+//   globalMode — when true, shows all docs across all spaces (with space badges).
+export type MaterialsRailProps = {
+  mode?: "global" | "chat";
+  sessionId?: string;
+  spaceId?: string | null;
+  globalMode?: boolean;
+};
+
+// The "Your materials" rail — two modes:
+//   GLOBAL (Sources page): shows ALL docs with chatLabel badges (which chat they belong
+//   to), no upload control. Clicking a doc row with a session_id navigates to that chat.
+//   CHAT (dashboard right panel): shows only THIS chat's docs, upload control present,
+//   no chatLabel shown (the UI already knows which chat it is).
+// Each item carries a [P] (document) or [S] (structured) chip so it visibly maps to
+// the citation tokens the answers use. Real data from /api/documents (owner-scoped).
+// Publishes counts on `nucleus:docs` / `nucleus:bundled` so the dashboard stat cards
+// stay in sync.
+export function MaterialsRail({
+  mode = "global",
+  sessionId,
+  spaceId,
+  globalMode = false,
+}: MaterialsRailProps = {}) {
+  const isGlobal = mode === "global";
+  const router = useRouter();
+
   const [uploaded, setUploaded] = useState<DocMeta[] | null>(null);
+  const [tables, setTables] = useState<StructuredTable[] | null>(null);
   const [bundled, setBundled] = useState<BundledSource[] | null>(null);
   const [role, setRole] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  // The source row awaiting a delete confirmation (its `doc` id), or null. We use an
+  // INLINE confirm (Delete? / Delete / Cancel) instead of the native window.confirm()
+  // dialog: native confirm() can be suppressed by the browser ("prevent this page from
+  // creating more dialogs"), which made delete silently do nothing and feel unreachable.
+  const [confirming, setConfirming] = useState<string | null>(null);
+  // The structured table currently open in the viewer (FIX 1), or null.
+  const [viewing, setViewing] = useState<{ table: string; label: string } | null>(null);
+  // Retrievability of each UPLOADED doc's original file, probed via HEAD (FIX 3):
+  // undefined = unknown/checking, true = downloadable, false = no stored original.
+  const [retrievable, setRetrievable] = useState<Record<string, boolean>>({});
 
   async function load() {
     try {
-      const res = await fetch("/api/documents");
+      // Build the documents URL with all relevant scoping params.
+      let url: string;
+      if (globalMode) {
+        // Cross-space global search: fetch all owner docs with space attribution.
+        url = "/api/documents?global=1";
+      } else if (spaceId) {
+        // Space-scoped: fetch only files in this space.
+        url = `/api/documents?space_id=${encodeURIComponent(spaceId)}`;
+      } else if (!isGlobal && sessionId) {
+        // Legacy per-chat: fetch only this chat's files.
+        url = `/api/documents?session_id=${encodeURIComponent(sessionId)}`;
+      } else {
+        // All docs (Sources page, no space or chat filter).
+        url = "/api/documents";
+      }
+      const res = await fetch(url);
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "failed to load");
       const docs: DocMeta[] = d.documents ?? [];
-      const b: BundledSource[] = d.bundled ?? [];
+      const t: StructuredTable[] = d.structuredTables ?? [];
+      // Chat mode: don't show bundled sources (they aren't chat-scoped; global view covers them).
+      const b: BundledSource[] = isGlobal ? (d.bundled ?? []) : [];
       setUploaded(docs);
+      setTables(t);
       setBundled(b);
       setRole(d.role ?? null);
       setError(null);
+      // Probe each uploaded doc's original-file retrievability (FIX 3) so the rail only
+      // offers a download for docs whose original is actually stored — never a dead 404.
+      probeRetrievability(docs);
+      // Publish the RAW counts (not a pre-summed "total") so every consumer computes its
+      // own stat consistently and nothing double-counts: uploads, bundled, and the
+      // high-urgency count across the WHOLE bucket (uploads + bundled docs).
+      const high =
+        docs.filter((x) => x.urgency === "high").length +
+        b.filter((x) => x.urgency === "high").length;
       window.dispatchEvent(
         new CustomEvent("nucleus:docs", {
-          detail: { total: docs.length, high: docs.filter((x) => x.urgency === "high").length },
+          // Uploaded count includes structured tables (spreadsheets) — they're sources too.
+          detail: { uploaded: docs.length + t.length, bundled: b.length, high },
         })
       );
-      window.dispatchEvent(new CustomEvent("nucleus:bundled", { detail: { count: b.length } }));
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load");
     }
+  }
+
+  // For each uploaded doc, HEAD /api/documents/file to learn whether its original is
+  // retrievable. 200 → show download; 404 → no stored original (show a clear tooltip,
+  // not a dead link). Bundled docs always have a committed original, so we don't probe.
+  async function probeRetrievability(docs: DocMeta[]) {
+    await Promise.all(
+      docs.map(async (d) => {
+        try {
+          const res = await fetch(`/api/documents/file?doc=${encodeURIComponent(d.doc)}`, {
+            method: "HEAD",
+          });
+          setRetrievable((m) => ({ ...m, [d.doc]: res.ok }));
+        } catch {
+          setRetrievable((m) => ({ ...m, [d.doc]: false }));
+        }
+      })
+    );
   }
 
   useEffect(() => {
@@ -64,19 +173,19 @@ export function MaterialsRail() {
     const onUploaded = () => load();
     window.addEventListener("nucleus:uploaded", onUploaded);
     return () => window.removeEventListener("nucleus:uploaded", onUploaded);
-  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, spaceId, globalMode]);
 
+  // Delete a source (after the INLINE confirm). No native confirm() — the caller arms
+  // the confirmation via `confirming`, this just performs the DELETE and refreshes the
+  // list. Owner-scoped server-side; `scope: "bundled"` is the admin-only shared-source
+  // soft-delete. On success the list reloads, which re-publishes the `nucleus:docs` count
+  // event so the header stats and the chat's source count stay in sync.
   async function remove(
     doc: string,
-    label: string,
     scope: "upload" | "bundled" = "upload",
     kind?: "document" | "structured"
   ) {
-    const prompt =
-      scope === "bundled"
-        ? `Remove the built-in source “${label}”? It will no longer be used in answers for the whole workspace.`
-        : `Remove “${label}”? It will no longer be searchable.`;
-    if (!confirm(prompt)) return;
     setRemoving(doc);
     try {
       const q = new URLSearchParams({ doc, scope });
@@ -84,6 +193,7 @@ export function MaterialsRail() {
       const res = await fetch(`/api/documents?${q.toString()}`, { method: "DELETE" });
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "remove failed");
+      setConfirming(null);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "remove failed");
@@ -97,49 +207,110 @@ export function MaterialsRail() {
     window.open(`/api/documents/file?doc=${encodeURIComponent(doc)}`, "_blank", "noopener");
   }
 
-  return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto" data-testid="materials-rail">
-      {/* ADD SOURCES */}
-      <div className="rounded-2xl border border-line bg-surface p-4 shadow-soft">
-        <div className="flex items-center justify-between">
-          <span className="text-[11px] font-semibold uppercase tracking-wide text-faint">
-            Add sources
-          </span>
-          <button
-            onClick={load}
-            className="inline-flex items-center gap-1 text-[11px] text-faint hover:text-ink"
-            title="Refresh"
-          >
-            <RefreshCw className="size-3" />
-            Refresh
-          </button>
-        </div>
-        <div className="mt-3 rounded-xl border border-dashed border-line bg-surface-2 px-4 py-5 text-center">
-          <p className="text-sm font-medium text-ink">Upload PDF or spreadsheet</p>
-          <p className="mt-1 text-xs text-faint">PDFs, scanned docs, CSV or Excel</p>
-          <div className="mt-3 flex justify-center">
-            <UploadButton />
-          </div>
-        </div>
-        {error && (
-          <p className="mt-2 text-xs text-high">Couldn’t load materials: {error}</p>
-        )}
-      </div>
+  // Navigate to a chat by its session_id. Used in global mode when the user clicks a row.
+  function navigateToChat(sid: string | null | undefined) {
+    if (sid) {
+      router.push(`/dashboard?session=${encodeURIComponent(sid)}`);
+    } else {
+      router.push("/dashboard");
+    }
+  }
 
-      {/* YOUR MATERIALS — uploads */}
+  return (
+    <div
+      className="flex h-full flex-col gap-4 overflow-y-auto"
+      data-testid="materials-rail"
+      data-testid-mode={isGlobal ? "materials-rail-global" : "materials-rail-chat"}
+      {...(isGlobal
+        ? { "data-materials-rail-global": "true" }
+        : { "data-materials-rail-chat": "true" }
+      )}
+    >
+      {/* ADD SOURCES — chat mode only; global mode shows an informational note instead */}
+      {isGlobal ? (
+        <div className="rounded-2xl border border-line bg-surface p-4 shadow-soft" data-testid="materials-rail-global">
+          <p className="text-sm text-faint">
+            {globalMode
+              ? "Showing all documents across all spaces."
+              : spaceId
+              ? "Documents in this space — upload inside a space chat to add files here."
+              : "Upload inside a chat — documents are linked to that chat."}
+          </p>
+          {error && (
+            <p className="mt-2 text-xs text-high">Couldn’t load materials: {error}</p>
+          )}
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-line bg-surface p-4 shadow-soft" data-testid="materials-rail-chat">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-faint">
+              Add sources
+            </span>
+            <button
+              onClick={load}
+              className="inline-flex items-center gap-1 text-[11px] text-faint hover:text-ink"
+              title="Refresh"
+            >
+              <RefreshCw className="size-3" />
+              Refresh
+            </button>
+          </div>
+          <div className="mt-3 rounded-xl border border-dashed border-line bg-surface-2 px-4 py-5 text-center">
+            <p className="text-sm font-medium text-ink">Upload PDF or spreadsheet</p>
+            <p className="mt-1 text-xs text-faint">PDFs, scanned docs, Word, CSV or Excel</p>
+            <div className="mt-3 flex justify-center">
+              {/* EVERY upload links to a chat — ChatUpload always attaches a session_id,
+                  minting one if this chat is brand-new. The old <UploadButton/> (no
+                  session_id → unassigned doc) is gone: unassigned uploads are impossible. */}
+              <ChatUpload sessionId={sessionId} spaceId={spaceId} />
+            </div>
+          </div>
+          {error && (
+            <p className="mt-2 text-xs text-high">Couldn’t load materials: {error}</p>
+          )}
+        </div>
+      )}
+
+      {/* YOUR MATERIALS — ONE bucket: your uploads + (for demo accounts in global mode) the
+          sample corpus, in a single list. There is no separate "Built-in business data"
+          section: a real client user (non-demo) gets an empty bundled list from the
+          API, so this is purely their own uploads; a demo account sees both together. */}
       <div className="rounded-2xl border border-line bg-surface shadow-soft" data-testid="uploaded-docs">
         <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
           <span className="text-[11px] font-semibold uppercase tracking-wide text-faint">
-            Your materials
+            {globalMode
+              ? "All spaces — materials"
+              : spaceId
+              ? "This space's files"
+              : isGlobal
+              ? "All materials"
+              : "This chat's files"}
           </span>
-          <span className="text-[11px] text-faint">{uploaded?.length ?? 0} uploaded</span>
+          {isGlobal && (
+            <button
+              onClick={load}
+              className="inline-flex items-center gap-1 text-[11px] text-faint hover:text-ink"
+              title="Refresh"
+            >
+              <RefreshCw className="size-3" />
+              Refresh
+            </button>
+          )}
+          <span className="text-[11px] text-faint">
+            {(uploaded?.length ?? 0) + (tables?.length ?? 0) + (bundled?.length ?? 0)} sources
+          </span>
         </div>
         {uploaded === null ? (
           <p className="px-4 py-4 text-xs text-faint">Loading…</p>
-        ) : uploaded.length === 0 ? (
-          <p className="px-4 py-4 text-xs text-faint">
-            No uploads yet. Upload a PDF, CSV, or Excel — it appears here with a [P]/[S] chip and
-            is answerable instantly.
+        ) : uploaded.length === 0 && (tables?.length ?? 0) === 0 && (bundled?.length ?? 0) === 0 ? (
+          <p className="px-4 py-4 text-xs text-faint" data-testid="materials-empty">
+            {globalMode
+              ? "No materials across any space yet. Open a space and upload a file to get started."
+              : spaceId
+              ? "No files in this space yet. Open a chat in this space and upload a file."
+              : isGlobal
+              ? "No materials yet. Upload a PDF, Word, CSV, or Excel inside a chat — it appears here."
+              : "No materials yet. Upload a PDF, Word, CSV, or Excel — it appears here with a [P]/[S] chip and is answerable instantly."}
           </p>
         ) : (
           <ul>
@@ -147,97 +318,335 @@ export function MaterialsRail() {
               <li
                 key={d.doc}
                 data-testid={`doc-row-${d.doc}`}
-                className="flex items-center gap-2 border-b border-line px-4 py-2.5 last:border-0"
+                className="border-b border-line px-4 py-3 last:border-0"
               >
-                <SourceChip kind="document" />
-                <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{d.label}</span>
-                <LangChip lang={labelLang(d.label)} />
-                {d.urgency && (
-                  <span data-testid={`doc-urgency-${d.doc}`}>
-                    <UrgencyBadge urgency={d.urgency} />
+                {/* line 1: the document NAME gets the full width (no longer crammed by
+                    chips); only the action icons share the line. */}
+                <div className="flex items-center gap-2">
+                  <SourceChip kind="document" />
+                  <span
+                    data-testid={`doc-name-${d.doc}`}
+                    title={d.label}
+                    className={`min-w-0 flex-1 truncate text-sm font-medium ${isGlobal && d.session_id ? "cursor-pointer text-accent hover:underline" : "text-ink"}`}
+                    onClick={isGlobal ? () => navigateToChat(d.session_id) : undefined}
+                  >
+                    {d.label}
                   </span>
-                )}
-                <button
-                  onClick={() => openFile(d.doc)}
-                  data-testid={`doc-download-${d.doc}`}
-                  title="Open / download"
-                  className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
-                >
-                  <Download className="size-3.5" />
-                </button>
-                <button
-                  onClick={() => remove(d.doc, d.label)}
-                  disabled={removing === d.doc}
-                  data-testid={`doc-remove-${d.doc}`}
-                  title="Remove"
-                  className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
-                >
-                  {removing === d.doc ? (
-                    <Loader2 className="size-3.5 animate-spin" />
+                  {retrievable[d.doc] === false ? (
+                    <span
+                      data-testid={`doc-no-original-${d.doc}`}
+                      title="Original file not stored — this upload was indexed but its source file isn't kept, so it can't be downloaded."
+                      className="inline-flex size-6 cursor-default items-center justify-center rounded-md text-faint/40"
+                    >
+                      <Download className="size-3.5" />
+                    </span>
                   ) : (
-                    <Trash2 className="size-3.5" />
+                    <button
+                      onClick={() => openFile(d.doc)}
+                      data-testid={`doc-download-${d.doc}`}
+                      title="Open / download"
+                      className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                    >
+                      <Download className="size-3.5" />
+                    </button>
                   )}
-                </button>
+                  <DeleteControl
+                    testid={`doc-remove-${d.doc}`}
+                    confirming={confirming === d.doc}
+                    busy={removing === d.doc}
+                    onArm={() => {
+                      setError(null);
+                      setConfirming(d.doc);
+                    }}
+                    onCancel={() => setConfirming(null)}
+                    onConfirm={() => remove(d.doc)}
+                  />
+                </div>
+                {/* line 2: the metadata chips, indented under the name. */}
+                <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-7">
+                  <LangChip lang={d.lang ?? labelLang(d.label)} />
+                  {typeof d.pages === "number" && d.pages > 0 && (
+                    <span data-testid={`doc-pages-${d.doc}`} className="text-[11px] text-faint">
+                      PDF · {d.pages} page{d.pages === 1 ? "" : "s"}
+                    </span>
+                  )}
+                  {d.urgency && (
+                    <span data-testid={`doc-urgency-${d.doc}`}>
+                      <UrgencyBadge urgency={d.urgency} />
+                    </span>
+                  )}
+                  {/* Space badge — shown when a space is known */}
+                  {(isGlobal || globalMode) && d.spaceLabel && (
+                    <span
+                      data-testid={`doc-space-label-${d.doc}`}
+                      className="inline-flex items-center rounded-md border border-accent-ring/50 bg-accent-soft/60 px-1.5 py-0.5 text-[10px] font-semibold text-accent"
+                    >
+                      {d.spaceLabel}
+                    </span>
+                  )}
+                  {/* Chat label badge — global mode only */}
+                  {isGlobal && !globalMode && (
+                    <span
+                      data-testid={`doc-chat-label-${d.doc}`}
+                      className="text-[11px] text-faint"
+                    >
+                      · Chat: {d.chatLabel ?? "Unassigned"}
+                    </span>
+                  )}
+                </div>
+              </li>
+            ))}
+            {/* uploaded STRUCTURED tables (spreadsheets) — [S] chip + row viewer + CSV
+                export + remove, in the SAME list. Durable + owner-scoped; they survive a
+                serverless cold start (the text-to-SQL lane answers from uploaded_rows). */}
+            {(tables ?? []).map((t) => (
+              <li
+                key={t.doc}
+                data-testid={`table-row-${t.doc}`}
+                className="border-b border-line px-4 py-3 last:border-0"
+              >
+                <div className="flex items-center gap-2">
+                  <SourceChip kind="structured" />
+                  <span
+                    data-testid={`table-name-${t.doc}`}
+                    title={t.label}
+                    className={`min-w-0 flex-1 truncate text-sm font-medium ${isGlobal && t.session_id ? "cursor-pointer text-accent hover:underline" : "text-ink"}`}
+                    onClick={isGlobal ? () => navigateToChat(t.session_id) : undefined}
+                  >
+                    {t.label}
+                  </span>
+                  <button
+                    onClick={() => setViewing({ table: t.doc, label: t.label })}
+                    data-testid={`table-view-${t.doc}`}
+                    title="View rows"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                  >
+                    <Table className="size-3.5" />
+                  </button>
+                  <button
+                    onClick={() =>
+                      window.open(
+                        `/api/table?table=${encodeURIComponent(t.doc)}&format=csv`,
+                        "_blank",
+                        "noopener"
+                      )
+                    }
+                    data-testid={`table-export-${t.doc}`}
+                    title="Export CSV"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                  >
+                    <Download className="size-3.5" />
+                  </button>
+                  <DeleteControl
+                    testid={`table-remove-${t.doc}`}
+                    confirming={confirming === t.doc}
+                    busy={removing === t.doc}
+                    onArm={() => {
+                      setError(null);
+                      setConfirming(t.doc);
+                    }}
+                    onCancel={() => setConfirming(null)}
+                    onConfirm={() => remove(t.doc)}
+                  />
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-7">
+                  <span data-testid={`table-detail-${t.doc}`} className="text-[11px] text-faint">
+                    {t.detail}
+                  </span>
+                  {/* Space badge for tables */}
+                  {(isGlobal || globalMode) && t.spaceLabel && (
+                    <span
+                      data-testid={`table-space-label-${t.doc}`}
+                      className="inline-flex items-center rounded-md border border-accent-ring/50 bg-accent-soft/60 px-1.5 py-0.5 text-[10px] font-semibold text-accent"
+                    >
+                      {t.spaceLabel}
+                    </span>
+                  )}
+                  {/* Chat label badge — global mode only */}
+                  {isGlobal && !globalMode && (
+                    <span
+                      data-testid={`table-chat-label-${t.doc}`}
+                      className="text-[11px] text-faint"
+                    >
+                      · Chat: {t.chatLabel ?? "Unassigned"}
+                    </span>
+                  )}
+                </div>
+              </li>
+            ))}
+            {/* the bundled sample corpus, in the SAME list (demo accounts only; empty
+                for a real client user, and hidden in chat mode). data-testid kept so
+                existing checks resolve. */}
+            {(bundled ?? []).map((s) => (
+              <li
+                key={s.doc}
+                data-testid={`bundled-row-${s.doc}`}
+                className="border-b border-line px-4 py-3 last:border-0"
+              >
+                {/* line 1: full-width name + actions */}
+                <div className="flex items-center gap-2">
+                  <SourceChip kind={s.kind} />
+                  <span
+                    data-testid={`bundled-name-${s.doc}`}
+                    title={s.label}
+                    className="min-w-0 flex-1 truncate text-sm font-medium text-ink"
+                  >
+                    {s.label}
+                  </span>
+                  {s.kind === "document" && (
+                    <button
+                      onClick={() => openFile(s.doc)}
+                      data-testid={`bundled-download-${s.doc}`}
+                      title="Open / download"
+                      className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                    >
+                      <Download className="size-3.5" />
+                    </button>
+                  )}
+                  {s.kind === "structured" && (
+                    <>
+                      <button
+                        onClick={() => setViewing({ table: s.doc, label: s.label })}
+                        data-testid={`bundled-view-${s.doc}`}
+                        title="View rows"
+                        className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                      >
+                        <Table className="size-3.5" />
+                      </button>
+                      <button
+                        onClick={() =>
+                          window.open(
+                            `/api/table?table=${encodeURIComponent(s.doc)}&format=csv`,
+                            "_blank",
+                            "noopener"
+                          )
+                        }
+                        data-testid={`bundled-export-${s.doc}`}
+                        title="Export CSV"
+                        className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
+                      >
+                        <Download className="size-3.5" />
+                      </button>
+                    </>
+                  )}
+                  {role === "admin" && (
+                    <DeleteControl
+                      testid={`bundled-remove-${s.doc}`}
+                      title="Remove built-in source (admin)"
+                      confirming={confirming === s.doc}
+                      busy={removing === s.doc}
+                      onArm={() => {
+                        setError(null);
+                        setConfirming(s.doc);
+                      }}
+                      onCancel={() => setConfirming(null)}
+                      onConfirm={() => remove(s.doc, "bundled", s.kind)}
+                    />
+                  )}
+                </div>
+                {/* line 2: metadata — lang (docs only) + detail + urgency badge */}
+                <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-7">
+                  {s.kind === "document" && <LangChip lang={s.lang ?? null} />}
+                  <span className="text-[11px] text-faint">{s.detail}</span>
+                  {s.urgency && (
+                    <span data-testid={`bundled-urgency-${s.doc}`}>
+                      <UrgencyBadge urgency={s.urgency} />
+                    </span>
+                  )}
+                  {/* Bundled sources — show chat label (e.g. "Sample data") instead of
+                      the old "Built-in" label, since they are now chat-scoped. */}
+                  {isGlobal && s.chatLabel && (
+                    <span
+                      data-testid={`bundled-chat-label-${s.doc}`}
+                      className="text-[11px] text-faint"
+                    >
+                      · Chat: {s.chatLabel}
+                    </span>
+                  )}
+                </div>
               </li>
             ))}
           </ul>
         )}
       </div>
 
-      {/* BUILT-IN business data */}
-      {bundled && bundled.length > 0 && (
-        <div className="rounded-2xl border border-line bg-surface shadow-soft" data-testid="bundled-docs">
-          <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-faint">
-              Built-in business data
-            </span>
-            <span className="text-[11px] text-faint">{bundled.length} sources</span>
-          </div>
-          <ul>
-            {bundled.map((s) => (
-              <li
-                key={s.doc}
-                data-testid={`bundled-row-${s.doc}`}
-                className="flex items-center gap-2 border-b border-line px-4 py-2.5 last:border-0"
-              >
-                <SourceChip kind={s.kind} />
-                <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{s.label}</span>
-                {/* Documents carry an honest EN/HE chip from their indexed text; structured tables don't. */}
-                {s.kind === "document" && <LangChip lang={s.lang ?? null} />}
-                <span className="shrink-0 text-[11px] text-faint">{s.detail}</span>
-                {/* Only a PDF/document source has an openable original file. */}
-                {s.kind === "document" && (
-                  <button
-                    onClick={() => openFile(s.doc)}
-                    data-testid={`bundled-download-${s.doc}`}
-                    title="Open / download"
-                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-accent-soft hover:text-accent"
-                  >
-                    <Download className="size-3.5" />
-                  </button>
-                )}
-                {/* Built-in data is SHARED → only an admin can remove it (workspace-wide). */}
-                {role === "admin" && (
-                  <button
-                    onClick={() => remove(s.doc, s.label, "bundled", s.kind)}
-                    disabled={removing === s.doc}
-                    data-testid={`bundled-remove-${s.doc}`}
-                    title="Remove built-in source (admin)"
-                    className="inline-flex size-6 items-center justify-center rounded-md text-faint transition-colors hover:bg-high-soft hover:text-high disabled:opacity-50"
-                  >
-                    {removing === s.doc ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Trash2 className="size-3.5" />
-                    )}
-                  </button>
-                )}
-              </li>
-            ))}
-          </ul>
-        </div>
+      {/* FIX 1: the structured-table viewer modal (real columns + rows + paging + CSV). */}
+      {viewing && (
+        <TableViewer
+          table={viewing.table}
+          label={viewing.label}
+          onClose={() => setViewing(null)}
+        />
       )}
     </div>
+  );
+}
+
+// The per-source DELETE control. Two states, no native dialog:
+//   • disarmed → a labelled "Delete" button (text, not just a bare trash icon) so a
+//     non-technical user can actually find how to remove a source. This is the fix for
+//     "the sources are not reachable for deleting them" — the affordance was an
+//     easy-to-miss icon, and the native confirm() it used could be browser-suppressed.
+//   • armed (`confirming`) → an INLINE "Delete this source? Delete / Cancel" confirm,
+//     mirroring the conversation-delete pattern in history-panel.tsx. While the DELETE
+//     is in flight (`busy`) the confirm button shows a spinner and both are disabled.
+function DeleteControl({
+  testid,
+  title = "Remove source",
+  confirming,
+  busy,
+  onArm,
+  onCancel,
+  onConfirm,
+}: {
+  testid: string;
+  title?: string;
+  confirming: boolean;
+  busy: boolean;
+  onArm: () => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  if (confirming) {
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1.5" data-testid={`${testid}-confirm`}>
+        <span className="hidden text-[11px] font-medium text-high sm:inline">Delete?</span>
+        <button
+          type="button"
+          onClick={onConfirm}
+          disabled={busy}
+          data-testid={`${testid}-yes`}
+          className="inline-flex items-center gap-1 rounded-md bg-high px-2 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-high/90 disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="size-3 animate-spin" /> : <Check className="size-3" />}
+          Delete
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={busy}
+          data-testid={`${testid}-no`}
+          className="inline-flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] font-medium text-subtle transition-colors hover:bg-surface-2 hover:text-ink disabled:opacity-50"
+        >
+          <X className="size-3" />
+          Cancel
+        </button>
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onArm}
+      disabled={busy}
+      data-testid={testid}
+      title={title}
+      aria-label={title}
+      className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-1 text-[11px] font-medium text-subtle transition-colors hover:border-high/40 hover:bg-high-soft hover:text-high disabled:opacity-50"
+    >
+      <Trash2 className="size-3.5" />
+      <span className="hidden sm:inline">Delete</span>
+    </button>
   );
 }
 

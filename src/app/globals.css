@@ -91,6 +91,35 @@
   color-scheme: dark;
 }
 
+/* ── BRAND axis (orthogonal to light/dark) ──────────────────────────────────────
+   `data-brand="teal"` on <html> re-skins the app to the TEAL accent by overriding ONLY
+   the accent tokens + a faint surface tint — the light/dark choice is untouched. No
+   attribute = the default violet accent (above).
+   The urgency/status colors stay semantic (not re-tinted). */
+html[data-brand="teal"] {
+  --accent: #0d9488;        /* teal-600 */
+  --accent-strong: #0f766e; /* teal-700 (hover / pressed) */
+  --accent-soft: #f0fdfa;   /* teal-50 wash (chips, active nav) */
+  --accent-ring: #99f6e4;   /* teal-200 focus ring */
+  --accent-glow: 13 148 136;
+  --canvas: #f5fbfa;        /* faint teal-tinted off-white */
+  --line: #e1efed;          /* teal-tinted hairline */
+  --line-strong: #cee4e0;
+}
+html[data-brand="teal"][data-theme="dark"] {
+  --accent: #2dd4bf;        /* teal-400 — pops on dark */
+  --accent-strong: #5eead4; /* teal-300 */
+  --accent-fg: #06211d;
+  --accent-soft: #0c2e2a;   /* soft teal wash on dark */
+  --accent-ring: #156e63;
+  --accent-glow: 45 212 191;
+  --canvas: #07140f;        /* deep teal-charcoal */
+  --surface: #0e1c18;
+  --surface-2: #14241f;
+  --line: #1f352f;
+  --line-strong: #2c473f;
+}
+
 @theme inline {
   /* ── Map the Tailwind utilities onto the runtime variables above ── */
   --color-canvas: var(--canvas);
@@ -276,8 +305,27 @@ h1, h2, h3, h4 {
   animation: pulse-dot 2s ease-out infinite;
 }
 
+/* ── Integrations marquee (landing) — two rows of brand logos auto-scrolling ── */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.marquee {
+  display: flex;
+  width: max-content;
+  gap: 0.75rem;
+  animation: marquee 48s linear infinite;
+}
+.marquee:hover { animation-play-state: paused; }
+.marquee-reverse { animation-direction: reverse; }
+.marquee-mask {
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to right, transparent, black 7%, black 93%, transparent);
+  mask-image: linear-gradient(to right, transparent, black 7%, black 93%, transparent);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .reveal { opacity: 1; transform: none; transition: none; }
-  .caret, .chip-pop, .line-rise, .step-in, .pulse-dot { animation: none; }
+  .caret, .chip-pop, .line-rise, .step-in, .pulse-dot, .marquee { animation: none; }
   body, [data-theme] { transition: none; }
 }

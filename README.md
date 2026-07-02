@@ -10,7 +10,7 @@ An AI assistant that answers questions about your documents and business data �
 It is a **single Next.js application** (the UI and the retrieval/answer engine run together), deployed once.
 
 ## Live demo
-**https://nucleus-woad.vercel.app/sign-in** — sample data is preloaded so you can try it right away. (Demo logins are provided separately.)
+**https://nucleus-770.vercel.app/sign-in** — sample data is preloaded so you can try it right away. (Demo logins are provided separately.)
 
 ## Run it on your own accounts
 See **[docs/HANDOFF.md](docs/HANDOFF.md)** — a step-by-step setup guide written so a non-technical owner (or an AI assistant) can follow it: which accounts to open (GitHub, Vercel, Supabase, Google Gemini), how to deploy, and how to make yourself the first admin. Copy `.env.example` to `.env.local` and fill in your own keys.

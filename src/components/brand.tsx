@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { cn } from "@/lib/utils";
 
-// The AI Business Assistant mark: a rounded violet square (neon gradient) with a
+// The NUCLEUS 770 mark: a rounded violet square (neon gradient) with a
 // stacked "layers" glyph — the inspector/orchestration motif from the reference UI.
 // Pure SVG + CSS, no libraries. `size` controls the square; the glyph scales with it.
 export function AssistantMark({ className }: { className?: string }) {
@@ -13,7 +13,7 @@ export function AssistantMark({ className }: { className?: string }) {
         className
       )}
       role="img"
-      aria-label="AI Business Assistant"
+      aria-label="NUCLEUS 770"
     >
       <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
         {/* a stacked-layers / orchestration glyph */}
@@ -50,17 +50,21 @@ export function Wordmark({
   className,
   href = "/",
   subtitle = true,
+  // The product name to display. Defaults to the in-app name; the public landing
+  // passes "Nucleus".
+  name = "NUCLEUS 770",
 }: {
   className?: string;
   href?: string;
   subtitle?: boolean;
+  name?: string;
 }) {
   return (
     <Link href={href} className={cn("inline-flex items-center gap-2.5", className)}>
       <AssistantMark />
       <span className="flex flex-col leading-none">
         <span className="font-display text-[1.15rem] font-bold tracking-tight text-ink">
-          AI Business Assistant
+          {name}
         </span>
         {subtitle && (
           <span className="mt-0.5 text-[11px] font-medium text-faint">

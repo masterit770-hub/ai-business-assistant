@@ -1,0 +1,37 @@
+# fly.toml — nucleus-agent (agent-sdk branch)
+# Fly.io configuration for the agentic Nucleus build.
+# The app runs the Next.js standalone server + Claude Agent SDK subprocess.
+
+app = "nucleus-agent"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "3000"
+  NEXT_TELEMETRY_DISABLED = "1"
+  # ANSWER_ENGINE and ANTHROPIC_API_KEY are set as Fly secrets (not here).
+  # Supabase + LLM_* secrets are set as Fly secrets (not here).
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  # min-0: scale to zero — the machine SUSPENDS when idle and auto-resumes on the next
+  # request (resume is fast; the first ask after a long idle just feels a touch slower).
+  # Ends the min-1 always-warm trial (2026-06-27 → 2026-07-03; Chris: not worth ~$10-15/mo).
+  # Billing then only accrues while a request is actually being served.
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"

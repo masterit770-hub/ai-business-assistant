@@ -124,3 +124,65 @@ test("counting null/blank cells in an uploaded column works (a real analytical q
   if (r.ok) assert.equal(r.rows[0].data.missing, 2);
   reset();
 });
+
+// ── HEBREW / UNICODE TABLE NAMES — the data-loss + name-blindness regression ──────────
+// The recorded client bug: a Hebrew-named uploaded sheet ("שיבוצים-אוגוסט-2024-…") had its
+// entire meaningful name stripped by the old ASCII-only sanitizer down to "_2024", so (1)
+// distinct monthly sheets COLLIDED to the same identifier and one clobbered the other on
+// materialize (the "only 1 row for June" report), and (2) the planner saw a meaningless name
+// and couldn't route "August scheduling" to its table. Both must stay fixed: Unicode letters
+// are preserved AND distinct sheets get distinct, queryable tables.
+
+test("a Hebrew-named uploaded table keeps a MEANINGFUL Unicode identifier (not stripped to _2024)", () => {
+  reset();
+  addRuntimeRows([
+    { table: "שיבוצים-אוגוסט-2024", id: 1, data: { id: 1, "שם": "שירה עושרי", "יום": "ראשון" } },
+    { table: "שיבוצים-אוגוסט-2024", id: 2, data: { id: 2, "שם": "אדירה סגל", "יום": "שני" } },
+  ]);
+  const { catalog } = introspectSchema();
+  const t = catalog.find((c) => c.table.includes("שיבוצים") && c.table.includes("אוגוסט"));
+  assert.ok(t, "the Hebrew table name is preserved (Unicode letters kept, not annihilated to _2024)");
+  // It is a real, queryable table whose Hebrew columns are present and citable.
+  const cols = t!.columns.map((c) => c.name);
+  assert.ok(cols.includes("rowid_anchor"));
+  assert.ok(cols.some((c) => c.includes("שם")), "Hebrew column name preserved");
+  reset();
+});
+
+test("two distinct Hebrew sheets that sanitize alike get SEPARATE tables (no collision/data-loss)", () => {
+  reset();
+  // Two real-shaped names that the OLD sanitizer collapsed to the SAME identifier. Each has a
+  // DIFFERENT row count; if they collided, one would overwrite the other (the June data-loss).
+  addRuntimeRows([
+    { table: "שיבוצים-יוני-2024-גיליון1", id: 1, data: { id: 1, "שם": "נועה רז" } },
+    { table: "שיבוצים-יוני-2024-גיליון1", id: 2, data: { id: 2, "שם": "שיר אביטן" } },
+    { table: "שיבוצים-יוני-2024-גיליון1", id: 3, data: { id: 3, "שם": "רינה אנטוב" } },
+    { table: "שיבוצים-יולי-2024-גיליון1", id: 1, data: { id: 1, "שם": "חן טובי" } },
+  ]);
+  const { catalog } = introspectSchema();
+  const uploaded = catalog.filter((c) => c.table.includes("שיבוצים"));
+  assert.equal(uploaded.length, 2, "both monthly sheets are materialized as distinct tables — neither clobbers the other");
+  // Each table holds its OWN rows (3 vs 1) — proof the data was not lost to a collision.
+  const june = catalog.find((c) => c.table.includes("יוני"));
+  const july = catalog.find((c) => c.table.includes("יולי"));
+  assert.ok(june && july, "june and july are both present");
+  const countJune = runGeneratedSelect(`SELECT COUNT(*) AS n FROM "${june!.table}"`, june!.table, catalog);
+  const countJuly = runGeneratedSelect(`SELECT COUNT(*) AS n FROM "${july!.table}"`, july!.table, catalog);
+  assert.equal(countJune.ok && countJune.rows[0].data.n, 3, "June kept all 3 of its rows (not clobbered)");
+  assert.equal(countJuly.ok && countJuly.rows[0].data.n, 1, "July kept its 1 row");
+  reset();
+});
+
+test("a guarded SELECT over a Hebrew-named table executes and cites real rows", () => {
+  reset();
+  addRuntimeRows([
+    { table: "שיבוצים-אוגוסט", id: 1, data: { id: 1, "שם": "שירה עושרי" } },
+    { table: "שיבוצים-אוגוסט", id: 2, data: { id: 2, "שם": "אדירה סגל" } },
+  ]);
+  const { catalog } = introspectSchema();
+  const t = catalog.find((c) => c.table.includes("שיבוצים"))!;
+  const r = runGeneratedSelect(`SELECT COUNT(*) AS n FROM "${t.table}"`, t.table, catalog);
+  assert.equal(r.ok, true, r.ok ? "" : r.reason);
+  if (r.ok) assert.equal(r.rows[0].data.n, 2, "the Hebrew table is fully readable (all rows), not 1");
+  reset();
+});

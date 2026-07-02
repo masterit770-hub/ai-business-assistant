@@ -22,9 +22,9 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "AI Business Assistant — Multi-source retrieval & orchestration",
+  title: "NUCLEUS 770 — Multi-source retrieval & orchestration",
   description:
-    "An AI Business Assistant that searches and answers across your documents and structured data — with a routing decision, an orchestrator trace, real retrieval scores, and a citation on every fact.",
+    "NUCLEUS 770 — searches and answers across your documents and structured data — with a routing decision, an orchestrator trace, real retrieval scores, and a citation on every fact.",
 };
 
 export default function RootLayout({

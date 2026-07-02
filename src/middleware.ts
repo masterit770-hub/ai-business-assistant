@@ -1,13 +1,34 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
+import { backendOnlyRedirect, PRODUCTION_FRONTEND_URL } from "@/lib/backend-redirect";
 
 // Auth middleware — refreshes the Supabase session cookie on every request AND
 // protects the app routes: no session → bounced to /sign-in. This is what makes
 // the dashboard genuinely gated (not just a client-side redirect that a URL can
 // skip).
-const PROTECTED = ["/dashboard", "/settings", "/history", "/account"];
+//
+// BACKEND-ONLY MODE (Fly): when BACKEND_ONLY=1 is set, this deployment is a pure
+// agent backend. Any request whose path is NOT under /api/ is redirected (308) to
+// the Vercel frontend (FRONTEND_URL). Only /api/* (especially /api/agent) is served
+// here. This flag is set on the Fly app only — never on Vercel.
+const PROTECTED = ["/dashboard", "/sources", "/settings", "/history", "/account"];
 
 export async function middleware(request: NextRequest) {
+  // BACKEND-ONLY redirect — must happen before any Supabase work (no cookies needed).
+  if (process.env.BACKEND_ONLY === "1") {
+    const path = request.nextUrl.pathname;
+    const dest = backendOnlyRedirect(
+      path,
+      true,
+      process.env.FRONTEND_URL ?? PRODUCTION_FRONTEND_URL
+    );
+    if (dest) {
+      return NextResponse.redirect(dest, { status: 308 });
+    }
+    // /api/* passes through — no auth redirect, no cookie gymnastics.
+    return NextResponse.next({ request });
+  }
+
   let response = NextResponse.next({ request });
 
   const supabase = createServerClient(

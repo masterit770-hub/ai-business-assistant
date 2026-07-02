@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import type { EngineResult } from "./types";
 import { cn } from "@/lib/utils";
+import { extractCitationTokens } from "@/lib/engine/citations";
 
 const isHebrew = (s: string) => /[֐-׿]/.test(s);
 
@@ -38,22 +39,46 @@ const statusDot: Record<string, string> = {
 // ── Status tiles row (QUESTION · ROUTE · RETRIEVAL · EVIDENCE · ANSWER · CITATIONS)
 export function StatusTiles({ result }: { result: EngineResult }) {
   const insp = result.inspector;
-  const sources = result.route.sources;
+  // Guard: result.route.sources may be absent on legacy/malformed persisted turns;
+  // treat any non-array as an empty list so the label reads "NONE" rather than crashing.
+  const sources: string[] = Array.isArray(result.route?.sources) ? result.route.sources : [];
   const routeLabel =
     sources.length === 0 ? "NONE" : sources.length > 1 ? "HYBRID" : sources[0].toUpperCase();
   const passages = insp?.passages ?? result.evidence.chunks.length;
   const evidence = insp?.evidenceCount ?? result.evidence.rows.length + result.evidence.chunks.length;
   const isGeneral = result.grounded === false || result.mode === "general";
   const lang = isHebrew(result.answer) ? "Hebrew" : "English";
-  const answerState = isGeneral
-    ? evidence === 0
-      ? "insufficient"
-      : "general"
-    : result.validation.ok
-      ? "grounded"
-      : "rejected";
-  const citationsCount = isGeneral ? 0 : result.evidence.rows.length + result.evidence.chunks.length;
-  const citationsOk = isGeneral ? false : result.validation.ok;
+  // Is the answer actually grounded in the user's evidence? Derive it from the answer
+  // ITSELF — does it cite resolvable [S:…]/[P:…] tokens AND pass the citation gate? — not
+  // solely the raw evidence counter. A cell-tally count answer (e.g. "who is scheduled the
+  // most") has evidenceCount 0 (the count is computed by code over the grid, so no per-row
+  // evidence is attached) yet IS grounded: it cites the structured rows and validateAnswer
+  // passed. Keying "insufficient" off `evidence === 0` alone mislabeled that real grounded
+  // answer as having no evidence. GENERAL — it reads the citation tokens the user actually
+  // saw (same extractor the logger uses), not any value/keyword, so it holds on unseen data.
+  const isCitedGrounded =
+    extractCitationTokens(result.answer).length > 0 && result.validation.ok === true;
+  const answerState = isCitedGrounded
+    ? "grounded"
+    : isGeneral
+      ? evidence === 0
+        ? "insufficient"
+        : "general"
+      : result.validation.ok
+        ? "grounded"
+        : "rejected";
+  // CITATIONS tile — kept consistent with the ANSWER verdict. For a cited-grounded answer
+  // whose count was code-computed (no per-row evidence), the honest citation count is the
+  // number of distinct tokens the user actually saw in the answer; validation passed, so
+  // the check reads OK. Otherwise: a real general answer carries no citations (count 0,
+  // skipped), and a normal grounded answer counts its retrieved rows/chunks.
+  const evidenceCitations = result.evidence.rows.length + result.evidence.chunks.length;
+  const citationsCount = isCitedGrounded
+    ? evidenceCitations || new Set(extractCitationTokens(result.answer)).size
+    : isGeneral
+      ? 0
+      : evidenceCitations;
+  const citationsOk = isCitedGrounded ? true : isGeneral ? false : result.validation.ok;
 
   const tiles: {
     label: string;
@@ -92,7 +117,9 @@ export function StatusTiles({ result }: { result: EngineResult }) {
       value: String(citationsCount),
       icon: ShieldCheck,
       tone: citationsOk ? "ok" : "neutral",
-      badge: isGeneral ? undefined : citationsOk ? "check" : "cross",
+      // Show the verified-check badge whenever the answer is grounded (cited + validated),
+      // including the cell-tally case; a genuine general answer shows no badge.
+      badge: isCitedGrounded ? "check" : isGeneral ? undefined : citationsOk ? "check" : "cross",
     },
   ];
 
@@ -177,7 +204,8 @@ function Panel({
 // ── Routing decision ─────────────────────────────────────────────────────────
 export function RoutingDecision({ result }: { result: EngineResult }) {
   const insp = result.inspector;
-  const sources = result.route.sources;
+  // Guard: same defensive coercion as StatusTiles — legacy rows may have a non-array here.
+  const sources: string[] = Array.isArray(result.route?.sources) ? result.route.sources : [];
   const routeLabel =
     sources.length === 0 ? "NONE" : sources.length > 1 ? "HYBRID" : sources[0].toUpperCase();
   const conf = insp?.confidence;
@@ -268,16 +296,23 @@ export function OrchestratorTrace({ result }: { result: EngineResult }) {
   );
 }
 
-// ── Document retrieval table (REAL per-passage scores) ───────────────────────
+// ── Document retrieval table (REAL hybrid dense / BM25 / RRF per passage) ─────
 export function DocumentRetrieval({ result }: { result: EngineResult }) {
   const insp = result.inspector;
   const chunks = result.evidence.chunks;
   const rows = result.evidence.rows;
-  // Sort document chunks by real score (desc) for the table.
-  const ranked = [...chunks]
-    .map((c, i) => ({ ...c, rank: i }))
-    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  const maxScore = Math.max(0.0001, ...ranked.map((c) => c.score ?? 0));
+  // Rank by the REAL fused RRF score (desc) — the value the engine ordered by. Fall
+  // back to `score` (which IS the rrf score for a hybrid result) so order is stable.
+  const ranked = [...chunks].sort(
+    (a, b) => (b.rrfScore ?? b.score ?? 0) - (a.rrfScore ?? a.score ?? 0)
+  );
+  const maxRrf = Math.max(0.0001, ...ranked.map((c) => c.rrfScore ?? c.score ?? 0));
+  // Are these hybrid results (carrying real dense/BM25 ranks)? Every uploaded + bundled
+  // chunk now does; the flag just guards the legacy/empty case.
+  const isHybrid = ranked.some((c) => c.denseRank !== undefined || c.rrfScore !== undefined);
+  // A rank of 0 means "that lane did not rank this chunk" (e.g. no keyword overlap → no
+  // BM25 rank). Show it as an em dash, not "0", so the absence is honest.
+  const rankCell = (r?: number) => (r === undefined ? "n/a" : r === 0 ? "—" : `#${r}`);
 
   return (
     <Panel
@@ -291,28 +326,32 @@ export function DocumentRetrieval({ result }: { result: EngineResult }) {
         </span>
       }
     >
-      {/* Honest method label + lane chips — NOT a copied "dense × BM25 → RRF → rerank". */}
+      {/* Honest method label — the document lane is a REAL hybrid (dense × BM25 → RRF). */}
       <p className="text-[13px] text-subtle">
         Retrieval method:{" "}
         <span className="font-medium text-ink">{insp?.retrievalMethod ?? "—"}</span>
       </p>
-      {/* The dense-lane config chips ONLY apply when the documents lane actually ran. */}
+      {/* The hybrid-lane config chips ONLY apply when the documents lane actually ran. */}
       {chunks.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5">
-          {["embed: multilingual-e5 (local)", "similarity: cosine", "rerank: none", "top_k: 8"].map(
-            (chip) => (
-              <span
-                key={chip}
-                className="rounded-md border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-faint"
-              >
-                {chip}
-              </span>
-            )
-          )}
+          {[
+            "embed: multilingual-e5 (local)",
+            "dense: cosine",
+            "lexical: BM25",
+            "fusion: RRF (k=60)",
+            "top_k: 8",
+          ].map((chip) => (
+            <span
+              key={chip}
+              className="rounded-md border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-faint"
+            >
+              {chip}
+            </span>
+          ))}
         </div>
       )}
 
-      {/* Document passages — REAL cosine scores */}
+      {/* Document passages — REAL hybrid dense rank, BM25 rank, RRF score */}
       {ranked.length > 0 && (
         <div className="mt-4 overflow-hidden rounded-xl border border-line">
           <table className="w-full border-collapse text-[13px]" data-testid="retrieval-table">
@@ -321,35 +360,52 @@ export function DocumentRetrieval({ result }: { result: EngineResult }) {
                 <th className="px-3 py-2 font-semibold">#</th>
                 <th className="px-3 py-2 font-semibold">Document</th>
                 <th className="px-2 py-2 text-center font-semibold">p.</th>
-                <th className="px-3 py-2 font-semibold">score (cosine)</th>
+                <th className="px-2 py-2 text-center font-semibold" title="Dense (cosine) ranking">
+                  dense
+                </th>
+                <th className="px-2 py-2 text-center font-semibold" title="BM25 (lexical/keyword) ranking">
+                  BM25
+                </th>
+                <th className="px-3 py-2 font-semibold" title="Reciprocal Rank Fusion score (k=60)">
+                  RRF
+                </th>
               </tr>
             </thead>
             <tbody>
-              {ranked.map((c, i) => (
-                <tr key={c.token} className="border-t border-line">
-                  <td className="px-3 py-2 text-faint tabular">{i + 1}</td>
-                  <td className="px-3 py-2">
-                    <span className="inline-flex items-center gap-1.5 font-medium text-ink">
-                      <FileText className="size-3.5 text-accent" />
-                      {c.doc}
-                    </span>
-                  </td>
-                  <td className="px-2 py-2 text-center tabular text-subtle">{c.page}</td>
-                  <td className="px-3 py-2">
-                    <span className="flex items-center gap-2">
-                      <span className="h-1.5 w-16 overflow-hidden rounded-full bg-surface-2">
-                        <span
-                          className="block h-full rounded-full bg-accent"
-                          style={{ width: `${Math.round(((c.score ?? 0) / maxScore) * 100)}%` }}
-                        />
+              {ranked.map((c, i) => {
+                const rrf = c.rrfScore ?? c.score ?? 0;
+                return (
+                  <tr key={c.token} className="border-t border-line">
+                    <td className="px-3 py-2 text-faint tabular">{i + 1}</td>
+                    <td className="px-3 py-2">
+                      <span className="inline-flex items-center gap-1.5 font-medium text-ink">
+                        <FileText className="size-3.5 text-accent" />
+                        {c.doc}
                       </span>
-                      <span className="tabular text-xs text-subtle">
-                        {c.score !== undefined ? c.score.toFixed(3) : "n/a"}
+                    </td>
+                    <td className="px-2 py-2 text-center tabular text-subtle">{c.page}</td>
+                    <td className="px-2 py-2 text-center tabular text-subtle" data-testid="dense-rank">
+                      {rankCell(c.denseRank)}
+                    </td>
+                    <td className="px-2 py-2 text-center tabular text-subtle" data-testid="bm25-rank">
+                      {rankCell(c.bm25Rank)}
+                    </td>
+                    <td className="px-3 py-2">
+                      <span className="flex items-center gap-2">
+                        <span className="h-1.5 w-16 overflow-hidden rounded-full bg-surface-2">
+                          <span
+                            className="block h-full rounded-full bg-accent"
+                            style={{ width: `${Math.round((rrf / maxRrf) * 100)}%` }}
+                          />
+                        </span>
+                        <span className="tabular text-xs text-subtle" data-testid="rrf-score">
+                          {isHybrid ? rrf.toFixed(4) : "n/a"}
+                        </span>
                       </span>
-                    </span>
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -395,6 +451,13 @@ export function MetricsPanels({ result }: { result: EngineResult }) {
   if (!insp) return null;
   const { cost, timings } = insp;
   const isGeneral = result.grounded === false || result.mode === "general";
+  // Guard: validation may be null on legacy persisted rows.
+  const validation = result.validation ?? { ok: true, reasons: [] as string[] };
+  // A cited + validated answer is grounded even when no per-row evidence is attached
+  // (the cell-tally case) — so the citation check reads "verified", not "skipped". Same
+  // derivation as StatusTiles: the answer cites resolvable tokens AND the gate passed.
+  const isCitedGrounded =
+    extractCitationTokens(result.answer).length > 0 && validation.ok === true;
 
   const tokensLine =
     cost.promptTokens !== undefined
@@ -436,11 +499,11 @@ export function MetricsPanels({ result }: { result: EngineResult }) {
       <div className="rounded-2xl border border-line bg-surface p-4 shadow-soft">
         <p className="text-[11px] font-semibold uppercase tracking-wide text-faint">Citation check</p>
         <div className="mt-2" data-testid="citation-check">
-          {isGeneral ? (
+          {isGeneral && !isCitedGrounded ? (
             <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-surface-2 px-2.5 py-1 text-xs font-semibold text-faint">
               skipped
             </span>
-          ) : result.validation.ok ? (
+          ) : validation.ok ? (
             <span className="inline-flex items-center gap-1.5 rounded-full border border-ok/30 bg-ok-soft px-2.5 py-1 text-xs font-semibold text-ok">
               <Check className="size-3.5" strokeWidth={3} /> verified
             </span>
@@ -451,11 +514,11 @@ export function MetricsPanels({ result }: { result: EngineResult }) {
           )}
         </div>
         <p className="mt-2 text-[11px] leading-relaxed text-faint">
-          {isGeneral
+          {isGeneral && !isCitedGrounded
             ? "General answer — citation gate skipped (no citations expected)."
-            : result.validation.ok
+            : validation.ok
               ? "Every cited fact resolves to retrieved evidence (validateAnswer passed)."
-              : result.validation.reasons.join("; ")}
+              : validation.reasons.join("; ")}
         </p>
       </div>
     </div>

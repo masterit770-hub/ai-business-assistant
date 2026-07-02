@@ -1,0 +1,30 @@
+# CI — the hard floor. Every push/PR runs the zero-cost suites (typecheck + unit +
+# api + components). These are exactly the suites that were silently RED at HEAD for
+# weeks (bulk-delete/documents/history route tests + 3 component files) because
+# nothing ever ran them — a green check here makes that class of rot impossible.
+#
+# Journeys (tests/journeys) and evals (tests/evals) are NOT run here: they need a
+# live deployment, real Supabase credentials, and (for SDK-gated steps) a billed
+# Claude key — they stay deliberate, human-triggered runs per CLAUDE.md's cost rules.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run test:unit
+      - run: npm run test:api
+      - run: npm run test:components

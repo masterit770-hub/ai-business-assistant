@@ -33,6 +33,9 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 !.env.example
+# pulled prod env for local in-process evals (carries the LLM key) — NEVER commit.
+# Re-derive with: vercel env pull .vercel-prod.env --environment=production
+.vercel-prod.env
 
 # vercel
 .vercel
@@ -45,3 +48,24 @@ next-env.d.ts
 # Supabase CLI local artifacts
 supabase/.temp/
 .branches/
+
+# OCR trained data (large, regenerable)
+eng.traineddata
+heb.traineddata
+
+# Raw test-evidence logs may contain real client data (names from her sheets) — keep local, never commit.
+docs/testing/evidence/
+
+# PII — ONLY the 2 Hebrew scheduling xlsx carry real-looking youth names → never commit/deploy them.
+# The rest of data/ (the Mockaroo-synthetic school-data CSVs, the explicitly-MOCK family-court PDF, the
+# fictional Carter story, pdf-pages.json) is invented test data that committed evals depend on — those
+# STAY tracked. Root-level raw grid dumps (grid-*.txt) are the xlsx content in another form — ignore too.
+data/*.xlsx
+grid-*.txt
+
+# client PII — never commit
+client-data/
+
+# scratchpad is session debris — NEVER tracked (a committed scratchpad script once embedded the
+# Supabase service-role key; caught 2026-07-03 during the client-repo sync scan)
+scratchpad/

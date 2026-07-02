@@ -1,45 +1,34 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { FileText, Clock, User, Settings } from "lucide-react";
+import { MessageSquare, FileText, Clock, User, Settings } from "lucide-react";
 import { AssistantMark } from "@/components/brand";
 import { UserMenu } from "@/components/user-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { cn } from "@/lib/utils";
 
-// Real, reachable destinations only. "Ask" was removed (it rendered the same
-// dashboard; the Ask panel lives on /dashboard). "Sources" was removed (the
-// connectors feature is out of scope — no real connected sources exist).
-// `adminOnly` items are hidden from non-admins (server access is also gated; this
-// just avoids dead-end links into a forbidden page).
+// Real, reachable destinations only. Chat (/dashboard) is the assistant; Sources
+// (/sources) is the documents + data bucket. `adminOnly` items are hidden from
+// non-admins (server access is also gated; this just avoids dead-end links into a
+// forbidden page).
 const nav = [
-  { label: "Documents", href: "/dashboard", icon: FileText, match: "documents" },
+  { label: "Chat", href: "/dashboard", icon: MessageSquare, match: "chat" },
+  { label: "Sources", href: "/sources", icon: FileText, match: "sources" },
   { label: "History", href: "/history", icon: Clock, match: "history" },
+  // Settings is PER-USER (each user owns their prompt + model config), so it's visible to
+  // everyone; only the Users tab inside it is admin-only (gated in the settings page).
+  { label: "Settings", href: "/settings", icon: Settings, match: "settings" },
   { label: "Account", href: "/account", icon: User, match: "account" },
-  { label: "Settings", href: "/settings", icon: Settings, match: "settings", adminOnly: true },
 ];
 
 export function AppSidebar({ active }: { active: string }) {
   const pathname = usePathname();
   void pathname; // pathname kept for future client-side active detection
 
-  // Resolve the real role to gate admin-only nav (the dashboard is reachable by
-  // everyone; Settings/Users is admin-only). Defaults to hiding admin items until
-  // the role is known, so a member never briefly sees a dead-end link.
-  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
-  useEffect(() => {
-    let alive = true;
-    fetch("/api/me")
-      .then((r) => r.json())
-      .then((d) => alive && setIsAdmin(d?.user?.role === "admin"))
-      .catch(() => alive && setIsAdmin(false));
-    return () => {
-      alive = false;
-    };
-  }, []);
-  const visibleNav = nav.filter((item) => !item.adminOnly || isAdmin === true);
+  // Every nav destination is reachable by every signed-in user (Settings is per-user; only
+  // the Users TAB inside it is admin-only, gated in the settings page).
+  const visibleNav = nav;
 
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-line bg-surface">
@@ -49,7 +38,7 @@ export function AppSidebar({ active }: { active: string }) {
           <AssistantMark className="size-8 shrink-0" />
           <span className="flex min-w-0 flex-col leading-none">
             <span className="truncate font-display text-[0.95rem] font-bold tracking-tight text-ink">
-              AI Business Assistant
+              NUCLEUS 770
             </span>
             <span className="mt-0.5 truncate text-[10px] font-medium text-faint">
               Multi-source retrieval

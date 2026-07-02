@@ -1,10 +1,24 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Shield, Loader2, AlertCircle, RefreshCw, UserPlus } from "lucide-react";
+import {
+  Shield,
+  Loader2,
+  AlertCircle,
+  RefreshCw,
+  UserPlus,
+  Copy,
+  Check,
+  Link2,
+  X,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+
+// The credentials block an admin hands a new teammate after creating their account:
+// a clickable invite link (set-your-own-password) + the temp password as a fallback.
+type Invite = { email: string; inviteLink: string | null; tempPassword: string };
 
 type UserStatus = "active" | "deactivated";
 type AdminUser = {
@@ -46,6 +60,8 @@ export function UsersPanel() {
   const [newEmail, setNewEmail] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [creating, setCreating] = useState(false);
+  // After a successful create, hold the invite/credentials to hand the teammate.
+  const [invite, setInvite] = useState<Invite | null>(null);
 
   async function load() {
     try {
@@ -87,13 +103,22 @@ export function UsersPanel() {
     setCreating(true);
     setError(null);
     try {
+      const email = newEmail.trim();
       const res = await fetch("/api/admin/users", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "create", email: newEmail.trim(), password: newPassword }),
+        body: JSON.stringify({ action: "create", email, password: newPassword }),
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d?.error ?? "could not create user");
+      // Surface the invite link + temp password so the admin has something to send.
+      setInvite(
+        (d.invite as Invite | undefined) ?? {
+          email,
+          inviteLink: null,
+          tempPassword: newPassword,
+        }
+      );
       setNewEmail("");
       setNewPassword("");
       await load();
@@ -101,6 +126,30 @@ export function UsersPanel() {
       setError(e instanceof Error ? e.message : "could not create user");
     } finally {
       setCreating(false);
+    }
+  }
+
+  // Promote/demote via the existing setRole action, with a confirm and optimistic
+  // list update. The server refuses a self-demote (lockout guard); we surface that.
+  async function setUserRole(u: AdminUser, nextRole: "user" | "admin") {
+    if (nextRole === u.role) return;
+    const verb = nextRole === "admin" ? "Make admin" : "Make member";
+    if (!window.confirm(`${verb}: change ${u.email}'s role to "${nextRole}"?`)) return;
+    setBusyId(u.id);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: u.id, action: "setRole", role: nextRole }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d?.error ?? "could not change role");
+      setUsers((prev) => prev?.map((x) => (x.id === u.id ? { ...x, role: d.role } : x)) ?? null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "could not change role");
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -171,6 +220,43 @@ export function UsersPanel() {
         </Button>
       </form>
 
+      {/* invite hand-off card — shown after a create or a row "Copy invite" */}
+      {invite && (
+        <div
+          data-testid="invite-card"
+          className="border-b border-accent-ring bg-accent-soft/60 px-6 py-4"
+        >
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="flex items-center gap-2 text-sm font-semibold text-ink">
+              <Link2 className="size-4 text-accent" />
+              Invite for <span className="font-mono text-[13px]">{invite.email}</span>
+            </p>
+            <button
+              onClick={() => setInvite(null)}
+              className="text-faint hover:text-ink"
+              title="Dismiss"
+              data-testid="invite-dismiss"
+            >
+              <X className="size-4" />
+            </button>
+          </div>
+          <p className="mb-3 text-xs text-subtle">
+            Share these sign-in details with the teammate. They can change their password
+            from the Account page once they’re signed in.
+          </p>
+
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <CopyField label="Email" value={invite.email} testid="invite-email" mono />
+            <CopyField
+              label="Temp password"
+              value={invite.tempPassword}
+              testid="invite-password"
+              mono
+            />
+          </div>
+        </div>
+      )}
+
       {!users && !error && (
         <div className="flex items-center gap-2 px-6 py-8 text-sm text-faint">
           <Loader2 className="size-4 animate-spin" /> Loading real users…
@@ -205,16 +291,33 @@ export function UsersPanel() {
                     last sign-in {ago(u.lastSignInAt)}
                   </p>
                 </div>
-                <span
-                  className={cn(
-                    "hidden rounded-full border px-2.5 py-0.5 text-[11px] font-medium sm:inline-flex",
-                    u.role === "admin"
-                      ? "border-accent-ring bg-accent-soft text-accent"
-                      : "border-line bg-muted text-faint"
+                {/* role control: a pill showing the current role + a toggle that
+                    promotes/demotes via setRole (with a confirm). Self-demote is
+                    blocked server-side, so we don't offer it on your own row. */}
+                <div className="hidden items-center gap-1.5 sm:flex">
+                  <span
+                    data-testid={`user-role-${u.email}`}
+                    className={cn(
+                      "rounded-full border px-2.5 py-0.5 text-[11px] font-medium",
+                      u.role === "admin"
+                        ? "border-accent-ring bg-accent-soft text-accent"
+                        : "border-line bg-muted text-faint"
+                    )}
+                  >
+                    {u.role}
+                  </span>
+                  {!u.isSelf && (
+                    <button
+                      onClick={() => setUserRole(u, u.role === "admin" ? "user" : "admin")}
+                      disabled={busyId === u.id}
+                      data-testid={`user-role-toggle-${u.email}`}
+                      title={u.role === "admin" ? "Demote to member" : "Promote to admin"}
+                      className="rounded-md border border-line px-2 py-0.5 text-[11px] font-medium text-subtle transition-colors hover:border-accent-ring hover:text-ink disabled:opacity-50"
+                    >
+                      {u.role === "admin" ? "Make member" : "Make admin"}
+                    </button>
                   )}
-                >
-                  {u.role}
-                </span>
+                </div>
                 <span
                   data-testid={`user-status-${u.email}`}
                   className={cn(
@@ -258,6 +361,66 @@ export function UsersPanel() {
         Live · real Supabase users. Deactivate bans the user and revokes their sessions —
         they’re signed out and blocked on their next request.
       </p>
+    </div>
+  );
+}
+
+// A read-only field with a Copy button — the building block of the invite card so the
+// admin can one-click copy the link / email / temp password to paste to a teammate.
+function CopyField({
+  label,
+  value,
+  testid,
+  mono,
+}: {
+  label: string;
+  value: string;
+  testid: string;
+  mono: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  async function onCopy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      /* clipboard blocked (e.g. insecure context) — the value is still selectable */
+    }
+  }
+  return (
+    <div className="mb-2 last:mb-0">
+      <label className="mb-1 block text-[11px] font-medium text-faint">{label}</label>
+      <div className="flex items-stretch gap-2">
+        <input
+          readOnly
+          value={value}
+          data-testid={`${testid}-value`}
+          onFocus={(e) => e.currentTarget.select()}
+          className={cn(
+            "h-9 min-w-0 flex-1 rounded-lg border border-line bg-surface px-2.5 text-xs text-ink",
+            mono && "font-mono"
+          )}
+        />
+        <button
+          type="button"
+          onClick={onCopy}
+          data-testid={`${testid}-copy`}
+          className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 text-xs font-medium text-subtle transition-colors hover:border-accent-ring hover:text-ink"
+        >
+          {copied ? (
+            <>
+              <Check className="size-3.5 text-accent" strokeWidth={2.5} />
+              Copied
+            </>
+          ) : (
+            <>
+              <Copy className="size-3.5" />
+              Copy
+            </>
+          )}
+        </button>
+      </div>
     </div>
   );
 }

@@ -9,6 +9,9 @@ export type NucleusUser = {
   email: string | null;
   role: "user" | "admin";
   disabled: boolean;
+  // Seed/demo account: sees the bundled sample corpus (the test docs + tables). A real
+  // client user (the default, false) starts with a clean bucket — only their uploads.
+  isDemo: boolean;
 };
 
 // The current request's user + profile, or null if not signed in.
@@ -24,7 +27,7 @@ export async function getCurrentUser(): Promise<NucleusUser | null> {
   const admin = createAdminClient();
   const { data: profile } = await admin
     .from("profiles")
-    .select("role, disabled")
+    .select("role, disabled, is_demo")
     .eq("id", user.id)
     .maybeSingle();
 
@@ -33,6 +36,7 @@ export async function getCurrentUser(): Promise<NucleusUser | null> {
     email: user.email ?? null,
     role: (profile?.role as "user" | "admin") ?? "user",
     disabled: Boolean(profile?.disabled),
+    isDemo: Boolean(profile?.is_demo),
   };
 }
 

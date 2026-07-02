@@ -18,9 +18,22 @@ import { chatWithUsage, type ChatUsage } from "./llm.ts";
 import {
   introspectSchema,
   runGeneratedSelect,
+  hydrateUploadedTables,
+  type CatalogScope,
   type SqlRow,
 } from "./structured-store.ts";
 import type { TableSchema } from "./sql-guard.ts";
+import {
+  classifyOccurrenceIntent,
+  type OccurrenceIntent,
+  filterTargetCount,
+  isGridShaped,
+  tallyCellOccurrencesAcross,
+  countNamedEntityAcross,
+  filterEntitiesAtCountAcross,
+  tableScopeForTally,
+  selectTallyGridsByKind,
+} from "./cell-tally.ts";
 
 // `||` (not `??`) so an empty env value ("") falls through to the real date instead
 // of producing a broken date filter like date('', '+90 days') → NULL.
@@ -42,6 +55,18 @@ export type StructuredResult = {
   // A human note when we couldn't answer structurally (no table matched, or the
   // query failed twice) — surfaced honestly, never as a fabricated answer.
   note?: string;
+  // The cell-tally lane's VERIFIED top-group summary (exact code counts + model-classified
+  // entities), e.g. "X = 5, Y = 5; next: Z = 4". Distinct from `note` (a couldn't-answer
+  // signal): this is AUTHORITATIVE evidence the grounded generator restates so it names every
+  // co-leader, not just the one cited row. Undefined when the tally lane didn't run.
+  verifiedTally?: string;
+  // The STRUCTURED form of that verified top group — the exact max count and the FULL list of
+  // tied leaders (entity names). The content-fidelity gate (validateCellTallyAnswer) uses this to
+  // FAIL any answer whose stated max/leaders don't match the code-computed tally (a collapsed tie
+  // or a non-max-as-max). Undefined when the cell-tally lane didn't run. The two fields move
+  // together: `verifiedTally` is what the model restates; `verifiedTopGroup` is what the gate
+  // checks the restatement AGAINST.
+  verifiedTopGroup?: { maxCount: number; leaders: string[] };
   usages: ChatUsage[];
 };
 
@@ -130,7 +155,14 @@ async function generateSql(
 - SELECT only. Never INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/ATTACH/PRAGMA.
 - Use ONLY the columns listed for the table. Do not invent columns.
 - For an aggregate question (total/sum/count/average/top-N), use SQL aggregates (SUM, COUNT, AVG, GROUP BY, ORDER BY … LIMIT). When the answer is a single aggregate, also SELECT the id column so the row can be cited.
+- "WHICH <category> HAS THE MOST / LEAST / FEWEST <thing>" (a COUNT-by-group superlative — e.g. "which course has the most students", "which vendor has the most contracts", "which department has the most staff"): GROUP BY the category column, COUNT(*) (or SUM of the measure) per group, and ORDER BY that count DESC (most) or ASC (least). Return the RANKED GROUPS — do NOT collapse to LIMIT 1. Returning the ranking (not just the single winner) is REQUIRED: the winner is the FIRST row, and the remaining rows PROVE it is the extreme among many — a lone LIMIT-1 row makes the answer read as "there is only one <category>", which is FALSE and forbidden. Either omit LIMIT entirely (the system caps the result for safety) or use a LIMIT large enough to show the full ranking, never LIMIT 1. Shape (illustrative columns — use the schema's real ones): SELECT <category_col>, COUNT(*) AS cnt, MIN(id) AS id FROM <table> GROUP BY <category_col> ORDER BY cnt DESC. The reader takes the top row as the answer; the rest are the ranking context. (Only use LIMIT 1 if the question explicitly asks for ONLY the single top item by name with no count framing.)
+- For a SUMMARIZE / OVERVIEW / "describe this data" / "summarize the <rows/invoices/records>" question (the user wants the big picture of the whole table, not a list of rows), you MUST return a SINGLE aggregate row — NEVER a list of individual rows. Compute: COUNT(*) of all rows, plus SUM over every clearly-numeric amount/cost/total/price/value column. Optionally add AVG. Do this as ONE row with no GROUP BY and no LIMIT-1 over raw rows. The headline of a summary is the row count and the column totals, so they MUST be computed, not sampled. (Include an id column alias if the table has one so the single aggregate row can be cited.) Example SHAPE (column names are illustrative — use the ACTUAL numeric columns from the schema): SELECT COUNT(*) AS n, SUM(<amount_col>) AS total_<amount_col> FROM <table>. This is general: derive which columns are numeric from the schema/sample rows; never assume a specific column name and never hardcode a figure.
 - ALWAYS include the id column (the integer primary key) in the projection so each row can be cited — unless the query is a pure single-aggregate, in which case selecting the aggregate alone is fine.
+- WRITE ONE SIMPLE SELECT — the only supported shape is: SELECT <columns/aggregates> FROM <table> [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT ...]. The following are NOT supported and will be REJECTED — do NOT use them: WINDOW FUNCTIONS / OVER( ... ) clauses (e.g. SUM(x) OVER ()), Common Table Expressions / WITH clauses, subqueries in the FROM/SELECT, UNION, and JOINs.
+- COMPOUND QUESTIONS (two things asked at once) — handle them in ONE plain SELECT, NO window functions / subqueries / WITH:
+  • "HOW MANY … AND <which row is the X-est>" (a COUNT plus a single extreme row): put COUNT(*) in the projection ALONGSIDE the extreme row's columns and order by the extreme — write exactly this shape: SELECT COUNT(*) AS total, id, <key cols> FROM <table> ORDER BY <extreme col> [DESC] LIMIT 1. In SQLite, COUNT(*) beside non-aggregated columns returns the table-wide count next to the single row picked by ORDER BY + LIMIT 1 — so that one row carries BOTH the total count AND the extreme row. The "how many" part REQUIRES COUNT(*) — never drop it, and NEVER report a LIMIT-1 row as if it were the total count.
+  • "which rows match AND their combined total / value" (a filtered set plus an overall SUM): the COMBINED TOTAL must be COMPUTED BY SQL, not left to be added up by hand from a long row list. Write a SINGLE aggregate SELECT that computes BOTH the count and the sum over the matching set: SELECT COUNT(*) AS n, SUM(<amount_col>) AS total_<amount_col>, MIN(id) AS id FROM <table> WHERE <filter>. That one aggregate row carries the count + the combined total (cite it with its id). Do NOT return every matching row and rely on the model to add them up — for a large matched set that is error-prone and can truncate. (If the user ALSO explicitly wants the individual rows listed, a few representative rows may be added, but the COMBINED TOTAL itself must come from the SUM aggregate, never from hand-addition.)
+- A "how many" / count question's answer MUST include COUNT(*) — never answer a count with a single sampled row and call it the count.
 - Add a LIMIT (<= 200). For "top N" use LIMIT N.
 - A numeric column stored as TEXT may need CAST(col AS REAL) for math; a money string like "$1,234.50" is already numeric here if its column type is REAL.
 - For DATE filtering, prefer a column already in ISO form (a column ending in "_iso" sorts/compares correctly as YYYY-MM-DD). To filter "within the next N days of today", use: column_iso BETWEEN '<today>' AND date('<today>', '+N days'). Today's date is provided below.`;
@@ -159,9 +191,28 @@ Write the single SELECT query now (SQL only).`;
  * run a SELECT (one retry on failure) → collect cited rows. Pure-ish: the only
  * external effects are the LLM calls and a read-only DB query.
  */
-export async function answerStructured(question: string): Promise<StructuredResult> {
+export async function answerStructured(
+  question: string,
+  // Demo accounts query the bundled sample tables; a non-demo user (includeBundled=false)
+  // queries only their own uploaded tables — the sample data is invisible to them.
+  includeBundled = true,
+  // The OWNER-ISOLATION scope (per-user). A member scope materializes ONLY that owner's
+  // uploaded tables; an admin scope sees all; undefined = legacy default (all uploaded
+  // rows — single-user / direct callers / the existing tests). Threaded into the
+  // introspect + every runGeneratedSelect so the guarded catalog == the queried DB.
+  scope?: CatalogScope,
+  // Per-chat scoping (migration 014): when provided, hydrate only rows from this chat +
+  // legacy (session_id = chatId OR session_id = null). Undefined = all owner rows.
+  chatId?: string | null
+): Promise<StructuredResult> {
   const usages: ChatUsage[] = [];
-  const { catalog, samples } = introspectSchema();
+  // DURABLE COLD-START FIX: before the SYNCHRONOUS introspect, rehydrate this owner's
+  // uploaded rows from Supabase into the runtime store (owner-scoped, fail-open). After a
+  // Vercel cold start the in-memory store is empty, so without this the SQL lane would
+  // have no uploaded tables and a spreadsheet question would wrongly answer "there are
+  // none". No-op when Supabase is off or the caller is fail-closed.
+  if (scope) await hydrateUploadedTables(scope.ownerId, !!scope.isAdmin, chatId);
+  const { catalog, samples } = introspectSchema(3, includeBundled, scope);
   if (catalog.length === 0) {
     return { table: null, sql: null, rows: [], ok: false, note: "no structured tables loaded", usages };
   }
@@ -169,7 +220,37 @@ export async function answerStructured(question: string): Promise<StructuredResu
 
   const { plan, usage: planUsage } = await planTables(question, catalogText);
   usages.push(planUsage);
-  if (plan.tables.length === 0) {
+  // EARLY-RETURN GUARD — but NOT when the question is a grid tally/count over grids that EXIST.
+  // The planner is a flaky LLM: for an UNSCOPED specific-person count ("how many times is <X>
+  // scheduled", no month) the cryptic Hebrew sheet names give it no anchor, so it returns
+  // tables:[] and we used to bail here with "no relevant table" — even though the cell-count
+  // lane below counts that name across ALL her grids perfectly (the live RED: רינה אנטוב = 15
+  // deflected to a general "couldn't find scheduling info, try COUNTIF"). The grid lanes already
+  // own a "planner picked no grid → fall back to every matching grid" path (familyGrids), so when
+  // THIS question is a grid tally/count and at least one grid table exists, we must NOT bail —
+  // we let the lanes fire on the full-grid fallback. A non-grid question (the planner's empty
+  // pick is genuinely correct) still returns the honest "no relevant table". GENERAL — keyed off
+  // table SHAPE + the question's tally/count shape, never a dataset.
+  // OCCURRENCE INTENT — the PHRASING-INDEPENDENT trigger (replaced the regex cue-gate). ONE LLM call
+  // reads the question + the grid schemas and emits {kind: ranking|specific-count|filter|none}. CODE
+  // then runs the matching deterministic lane. We only pay for it when a grid-shaped table actually
+  // exists (the only place these lanes can apply); a pure non-grid catalog skips it entirely and
+  // behaves exactly as before. Fail-open to "none" → text-to-SQL still runs. The model decides intent;
+  // code does the counting (the existing pure tally/count/filter lanes), so no maintained phrase list.
+  const gridCatalog = catalog.filter((c) => isGridShaped(c));
+  const anyGrid = gridCatalog.length > 0;
+  const intent: OccurrenceIntent = anyGrid
+    ? await classifyOccurrenceIntent(question, gridCatalog)
+    : { kind: "none", direction: "most", errored: false };
+  if (intent.usage) usages.push(intent.usage);
+  // Per-lane predicates now key off table SHAPE (deterministic) × the model's INTENT flag (phrasing-
+  // independent) — the regex predicates are gone. A grid table is a tally/count/filter candidate iff
+  // it is grid-shaped AND the intent matches that lane.
+  const isTally = (c: TableSchema): boolean => isGridShaped(c) && intent.kind === "ranking";
+  const isCount = (c: TableSchema): boolean => isGridShaped(c) && intent.kind === "specific-count";
+  const isFilter = (c: TableSchema): boolean => isGridShaped(c) && intent.kind === "filter";
+  const isGridTallyOrCount = anyGrid && (intent.kind === "ranking" || intent.kind === "specific-count");
+  if (plan.tables.length === 0 && !isGridTallyOrCount) {
     return { table: null, sql: null, rows: [], ok: false, note: "no relevant table for this question", usages };
   }
 
@@ -178,10 +259,198 @@ export async function answerStructured(question: string): Promise<StructuredResu
   const allRows: SqlRow[] = [];
   let primaryTable: string | null = null;
   let primarySql: string | null = null;
+  let verifiedTally: string | undefined;
+  let verifiedTopGroup: { maxCount: number; leaders: string[] } | undefined;
+  // Set ONLY when the cell-count lane resolved a named value that occurs ZERO times — an HONEST
+  // zero (the value genuinely never appears), carried so the answer states "X does not appear"
+  // even though there are no rows to cite. Distinct from a query-failure note.
+  let countZeroNote: string | undefined;
   const failures: string[] = [];
 
+  // ── CELL-TALLY LANE (UNIFIED, runs ONCE across all the grid tables it spans) ──────────────
+  // A "which <entity> recurs the MOST" question over a WIDE/GRID table that a single SELECT can't
+  // express (a scheduling grid: a person spread across many day columns). The OLD code ran the
+  // tally PER TABLE inside the loop below, overwriting one `verifiedTally` while accumulating each
+  // sheet's local top group into the rows — so the stated leader/count and the cited rows
+  // disagreed (a tie collapsed to one name; a non-max sheet reported as the max). We now run it
+  // ONCE over ALL the grid tables the question spans and aggregate, so the tally and the cited
+  // rows are consistent and a no-month / system-wide question surfaces the TRUE cross-sheet max.
+  // GENERAL — keyed off the question shape + table shape, never a specific dataset.
+  //
+  // CANDIDATE GRID SET — expanded beyond the planner's picks to the planner-picked grid's FAMILY.
+  // The planner is an LLM that, for a vague "how many times is <X> scheduled" / "who is scheduled
+  // most", often picks just ONE sheet (the live RED: it picked a December sheet where the name
+  // never appears and answered "0"). A tally/count over a scheduling grid is inherently a
+  // CROSS-SHEET operation, so we expand to the OTHER grids in the SAME FAMILY as a planner-picked
+  // grid — "same family" = they share a meaningful name segment (the monthly שיבוצים sheets share
+  // their stem; an unrelated intake/assessment grid does NOT). This both fixes the wrong-single-
+  // sheet bug AND avoids dragging in a different grid family (e.g. assessment forms whose names
+  // merely also contain a month word). Then tableScopeForTally narrows by the question's month
+  // words. Gated on "the planner routed to ≥1 grid" so a non-grid question is never hijacked.
+  // GENERAL — keyed off table SHAPE + shared name segments, never a dataset.
+  const plannerGrids = plan.tables.filter((t) => {
+    const s = catalog.find((c) => c.table === t);
+    return s && isGridShaped(s);
+  });
+  // The candidate grids for a predicate: ALL catalog grids matching it, narrowed to the planner-
+  // picked grid's name-FAMILY *when the planner picked one* (so a month query stays in the right
+  // family). When the planner picked NO grid (it is a FLAKY LLM that intermittently routes a
+  // ranking-over-grids question to a non-grid table — the live RED where a system-wide count fell
+  // to a SQL monthly-total GROUP BY), we do NOT gate the lane off: we fall back to every catalog
+  // grid that matches the question, then tableScopeForTally narrows by the question's month words.
+  // This makes the cell-tally/count lane fire DETERMINISTICALLY for a grid-ranking question instead
+  // of depending on the planner's coin-flip. GENERAL — keyed off table SHAPE + the question.
+  const familyGrids = (predicate: (s: TableSchema) => boolean): string[] => {
+    const matching = catalog.filter((c) => predicate(c));
+    const inFamily =
+      plannerGrids.length > 0
+        ? matching.filter((c) => plannerGrids.some((pt) => shareNameFamily(pt, c.table, question)))
+        : [];
+    // Prefer the planner's family; fall back to ALL matching grids when the planner picked no grid
+    // (or its picks share no family with the matching grids).
+    return (inFamily.length > 0 ? inFamily : matching).map((c) => c.table);
+  };
+  // EVERY catalog grid matching a predicate, IGNORING the planner's family narrowing — the full
+  // candidate pool the entity-kind selector chooses from. Needed because the planner can land on a
+  // WRONG-CORPUS grid (the live RED: an English "most active person" routed to the bundled
+  // `contracts` grid), which would make familyGrids narrow to that wrong corpus. We pool all the
+  // matching grids and let selectTallyGridsByKind pick the corpus whose recurring values are the
+  // question's entity KIND. GENERAL — table SHAPE + predicate, never a dataset name.
+  const allMatchingGrids = (predicate: (s: TableSchema) => boolean): string[] =>
+    catalog.filter((c) => predicate(c)).map((c) => c.table);
+  // The tally candidate pool: the planner-family grids UNION every matching grid, so the right
+  // corpus is always IN the pool even when the planner picked the wrong one. selectTallyGridsByKind
+  // then narrows to the corpus matching the question's entity kind (the cross-corpus fix); when only
+  // one corpus/family is present this is a no-op fast-path (the normal Hebrew scheduling path).
+  const tallyCandidates = [
+    ...new Set([
+      ...familyGrids(isTally),
+      ...allMatchingGrids(isTally),
+    ]),
+  ];
+  const kindSel = await selectTallyGridsByKind(question, tallyCandidates, catalog, scope);
+  for (const u of kindSel.usages) usages.push(u);
+  const gridTables = kindSel.tables;
+  const handledByTally = new Set<string>();
+  if (gridTables.length > 0) {
+    const scopeTables = tableScopeForTally(question, gridTables);
+    const t = await tallyCellOccurrencesAcross(question, scopeTables, catalog, scope);
+    for (const u of t.usages) usages.push(u);
+    if (t.ok && t.rows.length > 0) {
+      for (const tbl of scopeTables) handledByTally.add(tbl);
+      primaryTable = t.table ?? scopeTables[0];
+      primarySql =
+        scopeTables.length > 1
+          ? `cell-tally across ${scopeTables.length} grid sheets (${scopeTables.join(", ")}) — occurrence frequency across cells, summed per entity`
+          : `cell-tally over "${scopeTables[0]}" (occurrence frequency across cells)`;
+      allRows.push(...t.rows);
+      // Summarize the FULL verified EXTREME group so the grounded generator names EVERY co-leader,
+      // not just one — and append the NEXT few (toward the other end) so the LLM can never re-rank
+      // a tie. Counts are EXACT (code-computed, summed across the sheets); entities are
+      // model-classified. The `tally` is sorted DESCENDING, so the extreme group is the FIRST few
+      // for "most" and the LAST few for "least"; the "next:" entries step one rank inward.
+      const least = t.direction === "least";
+      const extremeCount = least ? t.tally[t.tally.length - 1].count : t.tally[0].count;
+      const extreme = t.tally.filter((x) => x.count === extremeCount);
+      const rest = least
+        ? t.tally.filter((x) => x.count !== extremeCount).slice(-3).reverse()
+        : t.tally.filter((x) => x.count !== extremeCount).slice(0, 3);
+      const label = least ? "fewest" : "most";
+      verifiedTally = `[${label}] ${extreme.map((x) => `${x.entity} = ${x.count}`).join(", ")}${
+        rest.length > 0 ? `; next: ${rest.map((x) => `${x.entity} = ${x.count}`).join(", ")}` : ""
+      }`;
+      // The structured extreme group the GATE checks the answer against (exact extreme count + full
+      // tie). `maxCount` here means "the count at the asked-for extreme" (max for most, min for
+      // least) — the value the answer MUST state as the winner's count.
+      verifiedTopGroup = { maxCount: extreme[0].count, leaders: extreme.map((x) => x.entity) };
+    } else {
+      // The tally is THE correct lane for this grid-ranking question but it couldn't apply this turn
+      // (the classifier returned no entities even after a retry, or the tables were empty). We must
+      // NOT let these grid sheets fall through to the generic SQL lane — a single-column GROUP BY
+      // over a calendar grid produces a MISLEADING "monthly total" answer (the observed
+      // intermittency: "each row shows a total of N schedules, no names"). Mark them handled so SQL
+      // is skipped; with no rows cited, the generation layer gives an HONEST grounded-limit answer
+      // ("I couldn't rank your sheets reliably this turn") rather than a fabricated aggregate.
+      for (const tbl of scopeTables) handledByTally.add(tbl);
+      if (!primaryTable) {
+        primaryTable = scopeTables[0];
+        primarySql = `cell-tally over ${scopeTables.length} grid sheet(s) — could not classify the ranked entity this turn (no fabricated aggregate)`;
+      }
+    }
+  }
+
+  // ── CELL-COUNT LANE (a SPECIFIC value's occurrence count over the grid) ────────────────────
+  // "How many times is <X> scheduled?" is NOT a ranking — it asks for ONE named value's frequency
+  // ACROSS the grid's many columns, which a single guarded GROUP BY on one column cannot express.
+  // The live RED: the SQL lane wrote a one-column COUNT and answered "0" for a name that appears
+  // 15× across the sheets — a fabricated wrong count. We count it in code (exact), spanning the
+  // same scope the tally would. Runs only when the tally did NOT already handle these tables.
+  // Candidate grids (via the same family-or-all fallback as the tally, so a flaky planner pick
+  // doesn't gate the lane off), excluding any the tally already handled.
+  const countGrids = familyGrids(isCount).filter(
+    (t) => !handledByTally.has(t)
+  );
+  if (countGrids.length > 0) {
+    const scopeTables = tableScopeForTally(question, countGrids);
+    const c = await countNamedEntityAcross(question, scopeTables, catalog, scope);
+    for (const u of c.usages) usages.push(u);
+    if (c.ok && c.entity) {
+      for (const tbl of scopeTables) handledByTally.add(tbl);
+      if (!primaryTable) {
+        primaryTable = c.tables[0] ?? scopeTables[0];
+        primarySql = `cell-count of "${c.entity}" across ${scopeTables.length} grid sheet(s) — exact occurrence count across cells = ${c.count}`;
+      }
+      if (c.count > 0) {
+        allRows.push(...c.rows);
+      }
+      // The verified count is AUTHORITATIVE (code-computed). Pass it as the tally so the grounded
+      // generator states the exact number — including an HONEST 0 ("X does not appear") with no
+      // fabrication. (A count is not a ranking, so no verifiedTopGroup/tie gate applies.)
+      verifiedTally = `[count] ${c.entity} = ${c.count} occurrence(s) across ${scopeTables.length} sheet(s)`;
+      if (c.count === 0) {
+        countZeroNote = `the value "${c.entity}" does not appear in the spanned scheduling sheet(s) — its occurrence count is 0`;
+      }
+    }
+    // If the count lane couldn't pin the named value, the grid tables fall through to SQL below.
+  }
+
+  // ── CELL-FILTER-BY-COUNT LANE (DV5: "who is scheduled EXACTLY N times") ────────────────────
+  // Asks for the SET of entities whose occurrence frequency EQUALS a specific N — not a ranking,
+  // not one named value's count. A single guarded SELECT can't express "count a value across the
+  // grid's many columns AND keep those == N", so we use the cell machinery: tally occurrences,
+  // classify the asked-for kind, keep those at exactly N. An empty result is an HONEST "no one is
+  // scheduled exactly N times" (never fabricated). Runs only for grids the tally/count didn't take.
+  const filterTarget = filterTargetCount(question);
+  const filterGrids =
+    filterTarget != null
+      ? familyGrids(isFilter).filter((t) => !handledByTally.has(t))
+      : [];
+  if (filterTarget != null && filterGrids.length > 0) {
+    const scopeTables = tableScopeForTally(question, filterGrids);
+    const f = await filterEntitiesAtCountAcross(question, filterTarget, scopeTables, catalog, scope);
+    for (const u of f.usages) usages.push(u);
+    if (f.ok) {
+      for (const tbl of scopeTables) handledByTally.add(tbl);
+      if (!primaryTable) {
+        primaryTable = f.tables[0] ?? scopeTables[0];
+        primarySql = `cell-filter-by-count = ${filterTarget} across ${scopeTables.length} grid sheet(s) — ${f.members.length} entity(ies) at exactly ${filterTarget}`;
+      }
+      if (f.members.length > 0) {
+        allRows.push(...f.rows);
+        // AUTHORITATIVE: the exact set at N, code-computed. The generator names them all, cited.
+        verifiedTally = `[exactly ${filterTarget}] ${f.members.map((m) => m.entity).join(", ")}`;
+      } else {
+        // HONEST empty: nobody occurs exactly N times. Carry a note so the generator says so plainly.
+        countZeroNote = `no one in the spanned scheduling sheet(s) is scheduled exactly ${filterTarget} time(s)`;
+        verifiedTally = `[exactly ${filterTarget}] (none)`;
+      }
+    }
+    // If the filter lane couldn't apply, the grid tables fall through to SQL below.
+  }
+
   for (const table of plan.tables) {
-    const outcome = await runForTable(question, table, catalog, samples, usages);
+    if (handledByTally.has(table)) continue; // already answered by the unified cell-tally / count
+    const outcome = await runForTable(question, table, catalog, samples, usages, scope);
     if (outcome.ok && outcome.rows.length > 0) {
       if (!primaryTable) { primaryTable = table; primarySql = outcome.sql; }
       allRows.push(...outcome.rows);
@@ -195,7 +464,17 @@ export async function answerStructured(question: string): Promise<StructuredResu
   }
 
   if (allRows.length > 0) {
-    return { table: primaryTable, sql: primarySql, rows: allRows, ok: true, usages };
+    // verifiedTally (when set) is the cell-tally lane's authoritative top-group summary, passed
+    // to the grounded generator so it restates every co-leader's exact count, not just one row.
+    // verifiedTopGroup is its structured form, used by the content-fidelity gate downstream.
+    return { table: primaryTable, sql: primarySql, rows: allRows, ok: true, verifiedTally, verifiedTopGroup, usages };
+  }
+  // HONEST-ZERO cell-count: the named value genuinely occurs 0 times. There are no rows to cite,
+  // but this is an authoritative, code-verified answer (not a query failure) — return ok:true with
+  // the count note + verifiedTally so the generator states "X does not appear" rather than
+  // fabricating a number or punting to a generic "no matching rows".
+  if (countZeroNote) {
+    return { table: primaryTable, sql: primarySql, rows: [], ok: true, note: countZeroNote, verifiedTally, usages };
   }
   // No rows cited. If a table was chosen + a valid query ran but matched nothing, that
   // is an honest empty result (ok:true, zero rows) — the generation layer states "no
@@ -220,13 +499,16 @@ async function runForTable(
   table: string,
   catalog: TableSchema[],
   samples: Map<string, Record<string, unknown>[]>,
-  usages: ChatUsage[]
+  usages: ChatUsage[],
+  // The OWNER-ISOLATION scope — passed to runGeneratedSelect so the query runs against
+  // the SAME per-owner handle the catalog was introspected from.
+  scope?: CatalogScope
 ): Promise<{ ok: boolean; rows: SqlRow[]; sql: string | null; note?: string }> {
   let priorError: string | undefined;
   for (let attempt = 1; attempt <= 2; attempt++) {
     const gen = await generateSql(question, table, catalog, samples, priorError);
     usages.push(gen.usage);
-    const run = runGeneratedSelect(gen.sql, table, catalog);
+    const run = runGeneratedSelect(gen.sql, table, catalog, scope);
     if (run.ok) {
       return { ok: true, rows: run.rows, sql: cleanSql(gen.sql) };
     }
@@ -242,4 +524,25 @@ function cleanSql(sql: string): string {
     .replace(/\s*```$/i, "")
     .replace(/;\s*$/, "")
     .trim();
+}
+
+// Do two table names belong to the SAME FAMILY of grids — i.e. do they share a meaningful name
+// segment that is NOT just a scope word from the question? The monthly שיבוצים scheduling sheets
+// share their stem "שיבוצים"; an unrelated intake/assessment grid does NOT — even though BOTH may
+// also contain a month word like "אוגוסט". So the month word is NOT a family signal: we EXCLUDE any
+// shared segment the question itself mentions (a month/scope word the user typed) and require a
+// shared segment that survives that exclusion (the real family stem). We split each sanitized
+// identifier on `_`/digits and keep segments of length ≥ 3 (a real word, not a number/short token).
+// GENERAL — no dataset/month/stem is named; it compares the tables' OWN names against the question.
+function shareNameFamily(a: string, b: string, question: string): boolean {
+  const q = question.normalize("NFC").toLowerCase();
+  const segs = (t: string) =>
+    t.normalize("NFC").toLowerCase().split(/[_\d]+/).filter((s) => s.length >= 3);
+  const sb = new Set(segs(b));
+  for (const s of segs(a)) {
+    // A segment the QUESTION mentions is a scope word (a month), not a family identifier — skip it.
+    if (q.includes(s)) continue;
+    if (sb.has(s)) return true;
+  }
+  return false;
 }

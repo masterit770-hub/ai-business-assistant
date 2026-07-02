@@ -7,7 +7,7 @@ export function MarketingNav() {
   return (
     <header className="sticky top-0 z-40 border-b border-line bg-canvas/80 backdrop-blur-md">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
-        <Wordmark subtitle={false} />
+        <Wordmark subtitle={false} name="Nucleus" />
         <nav className="hidden items-center gap-8 md:flex">
           <Link
             href="/#features"
@@ -33,7 +33,7 @@ export function MarketingFooter() {
       <div className="mx-auto max-w-6xl px-6 py-12">
         <div className="flex flex-col items-start justify-between gap-6 sm:flex-row sm:items-center">
           <div className="max-w-md">
-            <Wordmark subtitle={false} />
+            <Wordmark subtitle={false} name="Nucleus" />
             <p className="mt-3 text-sm leading-relaxed text-faint">
               Grounded, cited answers across your documents and data — in English
               and Hebrew. Access managed by your workspace admin.
@@ -44,7 +44,7 @@ export function MarketingFooter() {
           </Button>
         </div>
         <div className="mt-10 border-t border-line pt-6 text-sm text-faint">
-          <p>© 2026 AI Business Assistant</p>
+          <p>© 2026 Nucleus</p>
         </div>
       </div>
     </footer>

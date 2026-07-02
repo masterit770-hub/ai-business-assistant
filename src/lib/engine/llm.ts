@@ -140,6 +140,39 @@ export class CloudProviderNotConfiguredError extends Error {
   }
 }
 
+/** The cloud/HIPAA provider REJECTED the request's key (a 401/403 — the key is set but
+ *  invalid/expired/forbidden). This is the "key doesn't work" case (distinct from the
+ *  keyless CloudProviderNotConfiguredError). It is TYPED so the answer pipeline can let
+ *  it PROPAGATE as a clear, actionable error instead of swallowing it into a fake
+ *  'general' answer (the bug: a failed model masquerading as a real reply). Carries the
+ *  provider so the surfaced message can name it; the raw provider body is NOT included. */
+export class CloudProviderAuthError extends Error {
+  readonly code = "CLOUD_PROVIDER_AUTH" as const;
+  readonly provider: string;
+  readonly status: number;
+  constructor(provider: string, status: number) {
+    super(`Cloud provider "${provider}" rejected the API key (HTTP ${status}).`);
+    this.name = "CloudProviderAuthError";
+    this.provider = provider;
+    this.status = status;
+  }
+}
+
+/** True for ANY "the configured model could not RUN" failure that must surface a clear
+ *  error and NOT degrade to a generic 'general' answer: a keyless cloud/HIPAA/local
+ *  backend, a rejected key (401/403), or an unreachable backend. The structured lane's
+ *  catch + the general fallback re-throw these (rather than swallowing them) so case (b)
+ *  "model FAILED to run" stays separate from case (a) "model worked, no docs → general". */
+export function isModelRunFailure(e: unknown): boolean {
+  return (
+    isCloudProviderNotConfigured(e) ||
+    isCloudProviderAuth(e) ||
+    isHipaaNotConfigured(e) ||
+    isLocalNotConfigured(e) ||
+    isLocalUnreachable(e)
+  );
+}
+
 export function isLocalNotConfigured(e: unknown): e is LocalNotConfiguredError {
   return e instanceof LocalNotConfiguredError ||
     (e instanceof Error && (e as { code?: string }).code === "LOCAL_NOT_CONFIGURED");
@@ -155,6 +188,10 @@ export function isHipaaNotConfigured(e: unknown): e is HipaaNotConfiguredError {
 export function isCloudProviderNotConfigured(e: unknown): e is CloudProviderNotConfiguredError {
   return e instanceof CloudProviderNotConfiguredError ||
     (e instanceof Error && (e as { code?: string }).code === "CLOUD_PROVIDER_NOT_CONFIGURED");
+}
+export function isCloudProviderAuth(e: unknown): e is CloudProviderAuthError {
+  return e instanceof CloudProviderAuthError ||
+    (e instanceof Error && (e as { code?: string }).code === "CLOUD_PROVIDER_AUTH");
 }
 
 // "Configured" means there IS a backend able to answer. Cloud needs an API key in
@@ -334,6 +371,7 @@ async function chatCloud(
   });
 
   let lastErr = "";
+  let lastStatus = 0;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const res = await fetch(target.url, {
       method: "POST",
@@ -350,10 +388,18 @@ async function chatCloud(
     const body = await res.text().catch(() => "");
     // Provider-labelled so a billing/auth error names the active backend.
     lastErr = `${target.provider} (${target.model}) ${res.status}: ${body.slice(0, 300)}`;
+    lastStatus = res.status;
     // Only retry transient capacity/rate errors; surface real config errors now.
     if (!RETRYABLE.has(res.status) || attempt === MAX_ATTEMPTS) break;
     // Exponential backoff with jitter (the free tier's 503 spikes are brief).
     await sleep(700 * 2 ** (attempt - 1) + Math.floor(Math.random() * 300));
+  }
+  // A 401/403 means the configured key is REJECTED (set but invalid/expired/forbidden).
+  // Throw the TYPED auth error so the answer pipeline surfaces a clear "key isn't working"
+  // error and never swallows it into a fake 'general' answer. (The raw provider body stays
+  // server-side in the route's log; the typed error carries only provider + status.)
+  if (lastStatus === 401 || lastStatus === 403) {
+    throw new CloudProviderAuthError(target.provider, lastStatus);
   }
   throw new Error(lastErr);
 }
@@ -378,6 +424,7 @@ async function chatHipaa(
   });
 
   let lastErr = "";
+  let lastStatus = 0;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const res = await fetch(target.url, {
       method: "POST",
@@ -393,8 +440,14 @@ async function chatHipaa(
     }
     const body = await res.text().catch(() => "");
     lastErr = `${target.provider} (${target.model}) ${res.status}: ${body.slice(0, 300)}`;
+    lastStatus = res.status;
     if (!RETRYABLE.has(res.status) || attempt === MAX_ATTEMPTS) break;
     await sleep(700 * 2 ** (attempt - 1) + Math.floor(Math.random() * 300));
+  }
+  // Same typed-auth-error handling as chatCloud: a rejected Azure key (401/403) surfaces
+  // a clear error, never a swallowed 'general' degrade.
+  if (lastStatus === 401 || lastStatus === 403) {
+    throw new CloudProviderAuthError(target.provider, lastStatus);
   }
   throw new Error(lastErr);
 }

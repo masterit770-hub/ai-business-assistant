@@ -8,6 +8,7 @@
 // missing/blank value falls back to the built-in default, so the engine always
 // has a working prompt.
 import { supabaseEnabled, admin } from "./supabase.ts";
+import { currentOwner } from "./request-context.ts";
 
 // Editable settings are of two shapes:
 //  • PROMPT settings (system_prompt, urgency_prompt) — long free text; a blank
@@ -42,7 +43,16 @@ export type SettingKey =
   | "hipaa_api_key"
   | "hipaa_endpoint"
   | "hipaa_api_version"
-  | "hipaa_model";
+  | "hipaa_model"
+  // Cache (JSON map docId→urgency) of the bundled sample docs' classified urgency, so
+  // the dashboard shows a badge on EVERY document (not just uploads) without an LLM call
+  // per request. Derived (classified) once + cleared when urgency_prompt changes (so it
+  // re-derives — the #G behavior for bundled docs).
+  | "bundled_urgency"
+  // Flag set once per owner when the default Knowledge Spaces have been seeded.
+  // Value "1" = already seeded; absent/non-"1" = not yet seeded. Gated on the FLAG,
+  // NOT on "0 spaces" — so a user who deletes their spaces doesn't re-trigger the seed.
+  | "spaces_seeded";
 
 // The built-in defaults. The system-prompt default is the FULL generation
 // contract (kept in answer.ts historically); here we expose only the
@@ -56,7 +66,7 @@ export type SettingKey =
 // → the friendly guidance fires, never a crash). `local_model` defaults to a
 // sensible Ollama model so the owner usually only has to set the endpoint.
 export const DEFAULTS: Record<SettingKey, string> = {
-  system_prompt: `You are the AI Business Assistant, a sharp, helpful business assistant. Answer clearly, concretely, and concisely. When the user's documents or data are provided as evidence, ground your answer strictly in them and cite every fact; otherwise answer from your general knowledge.`,
+  system_prompt: `You are NUCLEUS 770, a sharp, helpful business assistant. Answer clearly, concretely, and concisely. When the user's documents or data are provided as evidence, ground your answer strictly in them and cite every fact; otherwise answer from your general knowledge.`,
   urgency_prompt: `Classify the document's urgency for the dashboard badge.
 - HIGH: contracts/notices expiring within 30 days, renewals, anything time-critical or financially material this month.
 - MEDIUM: items needing attention this quarter — pending reviews, upcoming renewals 30–90 days out.
@@ -76,9 +86,12 @@ Answer with exactly one word: high, medium, or low.`,
   // HIPAA mode (Azure OpenAI) override — all blank by default = "not configured".
   // Independent of the cloud_* slots, so the two keys never collide.
   hipaa_api_key: "",
+  bundled_urgency: "{}",
   hipaa_endpoint: "",
   hipaa_api_version: "",
   hipaa_model: "",
+  // Not seeded by default (empty string → first listSpaces() call triggers seeding).
+  spaces_seeded: "",
 };
 
 // In-memory fallback store (used when Supabase isn't configured). On globalThis so
@@ -89,14 +102,27 @@ function mem(): Partial<Record<SettingKey, string>> {
   return g.__nucleusSettings;
 }
 
-/** Read a setting (the stored override, or the built-in default). */
-export async function getSetting(key: SettingKey): Promise<string> {
+/**
+ * Read a setting for the CURRENT USER (the stored per-user override, else the shared
+ * NULL-owner workspace default, else the built-in default). The owner is the per-request
+ * ALS owner (`currentOwner()`); pass `ownerId` explicitly to override. `bundled_urgency`
+ * is a workspace-level cache (NOT a user setting) so it is always read globally.
+ */
+export async function getSetting(key: SettingKey, ownerId = currentOwner()): Promise<string> {
+  const owner = key === "bundled_urgency" ? undefined : ownerId;
   if (!supabaseEnabled()) return mem()[key] ?? DEFAULTS[key];
-  const { data, error } = await admin()
-    .from("engine_settings")
-    .select("value")
-    .eq("key", key)
-    .maybeSingle();
+  let q = admin().from("engine_settings").select("value, owner_id").eq("key", key);
+  if (owner) {
+    // The user's OWN row OR the shared (NULL-owner) default; order so the user's row
+    // (non-null owner) wins when present, the default is the fallback.
+    q = q
+      .or(`owner_id.eq.${owner},owner_id.is.null`)
+      .order("owner_id", { ascending: true, nullsFirst: false })
+      .limit(1);
+  } else {
+    q = q.is("owner_id", null).limit(1);
+  }
+  const { data, error } = await q.maybeSingle();
   if (error) throw new Error(`settings read failed: ${error.message}`);
   const v = data?.value;
   return v && v.trim() ? v : DEFAULTS[key];
@@ -106,7 +132,10 @@ export async function getSetting(key: SettingKey): Promise<string> {
 // raw `cloud_api_key` — the secret is WRITE-ONLY over the API. Instead the panel
 // gets `cloud_api_key_set` (a boolean) so the UI can show "key saved" without ever
 // echoing the secret back. All other cloud-provider fields are non-secret config.
-export type AdminSettings = Omit<Record<SettingKey, string>, "cloud_api_key" | "hipaa_api_key"> & {
+export type AdminSettings = Omit<
+  Record<SettingKey, string>,
+  "cloud_api_key" | "hipaa_api_key" | "bundled_urgency" | "spaces_seeded"
+> & {
   cloud_api_key_set: boolean;
   hipaa_api_key_set: boolean;
 };
@@ -232,15 +261,34 @@ export async function getHipaaConfig(): Promise<HipaaConfig> {
   };
 }
 
-/** Persist a setting override. Empty/blank clears it (back to the default). */
-export async function setSetting(key: SettingKey, value: string): Promise<void> {
+/**
+ * Persist a setting override for the CURRENT USER (per-request ALS owner, or `ownerId`
+ * if passed). Empty/blank clears it (the read then falls back to the shared default).
+ * `bundled_urgency` is a workspace-level cache → always written globally (NULL owner).
+ */
+export async function setSetting(
+  key: SettingKey,
+  value: string,
+  ownerId = currentOwner()
+): Promise<void> {
+  const owner = key === "bundled_urgency" ? null : ownerId ?? null;
   if (!supabaseEnabled()) {
     if (value.trim()) mem()[key] = value;
     else delete mem()[key];
+    // Editing the urgency prompt invalidates the cached bundled-doc urgency so it
+    // re-derives on the next documents load (the #G re-derivation, for bundled docs).
+    if (key === "urgency_prompt") delete mem().bundled_urgency;
     return;
   }
   const { error } = await admin()
     .from("engine_settings")
-    .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: "key" });
+    .upsert(
+      { owner_id: owner, key, value, updated_at: new Date().toISOString() },
+      { onConflict: "owner_id,key" }
+    );
   if (error) throw new Error(`settings write failed: ${error.message}`);
+  // Changing the urgency prompt clears the (global) bundled-urgency cache → re-derivation.
+  if (key === "urgency_prompt") {
+    await admin().from("engine_settings").delete().eq("key", "bundled_urgency").is("owner_id", null);
+  }
 }

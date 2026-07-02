@@ -1,0 +1,1179 @@
+// ANSWER-RELIABILITY eval — the HONEST, BROAD acceptance gate for the whole real
+// question range. This is the test that makes "green" MEAN "a real user reliably gets a
+// good answer."
+//
+// WHY THIS EXISTS (the meta-lesson it encodes): the prior case-file eval used pass@K
+// (K=3, green if 1 of 3 samples beat the bar). That is a 33%-success pass threshold and
+// it DEMONSTRABLY masked the real failure rate — the live logs proved the bluefalcon memo
+// question grounded only 6/10 (a 40% generic-punt rate) and overdue-payments only 2/10,
+// yet pass@3 would have shown GREEN. A test that is green while the behavior is
+// intermittently bad is a BAD test. So this eval does the OPPOSITE of pass@K:
+//
+//   • Every MUST-GROUND question is run on N=5 FRESH, INDEPENDENT runs (a full in-memory
+//     wipe before each, default model settings) and PASSES ONLY IF it grounds correctly
+//     on >= 5 of 5 runs (100%). A single bad run (a generic punt, a missing required fact,
+//     or a fabricated/uncited number) FAILS the question.
+//   • The NOT-must-ground questions (general-knowledge, meta/conversational, genuinely
+//     -absent) are graded on the SAME 5/5 basis against their OWN bar (a real helpful /
+//     honest-not-in-docs answer on 5/5; never a "I can only answer about your documents"
+//     refusal, never a fabricated figure).
+//   • EXPLICITLY FORBIDDEN here and nowhere reintroduced: any pass@K / best-of-K / "green
+//     if >= 1 of K beat the bar" scoring, or any threshold that passes below 80% per-run.
+//
+// Justification for 5/5 (from the pm's reliabilityRule): a 90%-reliable behavior fails
+// 5/5 about 41% of the time, so a green 5/5 is strong evidence of >~98% reliability; an
+// 80% behavior passes 5/5 only ~33% of the time, so it is reliably caught. The aggregate
+// per-question pass rate (R/5) is REPORTED for every question; the suite is GREEN only
+// when every question clears its 5/5 gate.
+//
+// GROUNDING CHECK (not exact-string): a must-ground question passes a run iff the required
+// corpus FACT appears in the answer AND a resolving [S:]/[P:] citation is present AND
+// validateAnswer is clean (mode === "grounded"). Wording variation never excuses a missing
+// fact, but it also never false-fails a correctly-grounded paraphrase.
+//
+// THREE CORPORA, all REAL (the same modules + live data the deployed app uses):
+//   • DEMO ADMIN  { isDemo:true, role:"admin" } — sees the bundled Carter corpus + EVERY
+//     uploaded doc/table (admin is unscoped): the family-court/MENDA/hebrew-invoice docs +
+//     the contracts/maintenance structured tables. The meridian client's real questions.
+//   • GMAIL USER  { ownerId:<her real uuid>, isDemo:false, role:"member" } — scoped to
+//     ONLY her one uploaded Hebrew national-service handover file (owner b01c311e, 3
+//     chunks). Her real logged Hebrew questions, re-asked against HER actual file.
+//   • THROWAWAY MEMO OWNER — a fresh non-demo auth user with a synthetic internal memo
+//     (codename/budget/lead) INGESTED here, to reproduce the bluefalcon ADOPTION exhibit
+//     (the 6/10 generic-punt) on the real ingest→ask path, then DELETED. (The fixture is a
+//     generic memo the engine has zero prior knowledge of — NOT corpus tuning.)
+//
+// RUN (from the repo root):   node tests/evals/answer-reliability.mjs
+//   RELIABILITY_RUNS=N overrides the 5 runs (default 5; never set below 5 for a real gate).
+// Loads the LLM key + Supabase creds from local secret files (read, NEVER printed). If
+// either is absent it SKIPS LOUDLY with exit 0 (never a false-green). It creates ONE
+// throwaway NON-DEMO user, ingests its memo, and DELETES the user (CASCADE clears the
+// memo's doc_chunks) at the end — no residue. It re-uses the EXISTING gmail/admin corpora
+// read-only (never mutates them).
+//
+// SECURITY: reads .env.local / .secrets/supabase.env / .vercel-prod.env into process.env
+// but NEVER prints, echoes, logs, or commits a secret value.
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
+import { skip as skipShared } from "./_skip.mjs";
+import { assertCleanBefore, assertCleanAfter, settleOwner } from "./_residue-guard.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+// ── ENV LOADING (secret-safe) ──────────────────────────────────────────────────
+const WANT = new Set([
+  "LLM_PROVIDER", "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL",
+  "SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY",
+]);
+function loadEnvFile(rel) {
+  const p = path.join(ROOT, rel);
+  if (!fs.existsSync(p)) return;
+  for (const raw of fs.readFileSync(p, "utf8").split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (!WANT.has(key)) continue;
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (process.env[key] == null || process.env[key] === "") process.env[key] = val;
+  }
+}
+loadEnvFile(".env.local");
+loadEnvFile(".secrets/supabase.env");
+loadEnvFile(".vercel-prod.env");
+if (!process.env.SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_URL) {
+  process.env.SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+}
+
+const haveSupabase = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+const haveLlm = !!(process.env.LLM_API_KEY && process.env.LLM_API_KEY.length > 8);
+
+// Exit code is honest under CI_STRICT/REQUIRE_CREDS: a creds-skip in CI is a FAILURE
+// (exit 1), never a silent pass. The loud "NOT a pass" banner prints in either mode. See _skip.mjs.
+const skip = (msg) => skipShared("answer-reliability", msg);
+if (!haveSupabase) skip("Supabase URL + SERVICE_ROLE_KEY not found — the corpus + auth path can't run.");
+if (!haveLlm) skip("No LLM_API_KEY found — the router + answer pipeline make real LLM calls and can't run.");
+
+// FORBIDDEN-SCORING GUARD: the runs-per-question must never drop below 5. A 5/5 gate that
+// someone quietly lowered to N=1 would silently become pass@1. Refuse to run below 5.
+const RUNS = Math.max(5, Number(process.env.RELIABILITY_RUNS || 5));
+if (RUNS < 5) skip("RELIABILITY_RUNS < 5 — refusing to run a weakened gate.");
+
+// SHARDING (a TIME convenience ONLY — never a gate change): the full suite is 34 questions
+// × 5 fresh runs × (router + multi-query expansion + generation + rescue) LLM calls, which
+// can exceed a single CI/shell wall-clock window against a live provider. RELIABILITY_ONLY
+// is an optional comma-separated list of question ids to run just those questions (each
+// still at the SAME strict 5/5 gate); unset → the FULL suite runs, byte-identical to before.
+// It NEVER lowers the per-question bar — it only selects WHICH questions run this invocation,
+// so the full range is covered by running every shard. (The whole-suite GREEN claim requires
+// every shard to pass; a shard run is not a substitute for eventually running them all.)
+//
+// MATCHING IS EXACT (not substring): a selector must equal the WHOLE question id. The old
+// substring match made "most-scheduled" ALSO select "august-most-scheduled" (and any other
+// id it is a substring of), so a cross-check meant to isolate ONE question silently ran a
+// sibling too. We still support an intentional GROUP selector via a trailing "/" — e.g.
+// "HE/" selects every Hebrew id — but a bare id only matches that exact id.
+const ONLY = (process.env.RELIABILITY_ONLY || "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const idMatchesOnly = (id) =>
+  ONLY.length === 0 || ONLY.some((sel) => id === sel || (sel.endsWith("/") && id.startsWith(sel)));
+
+// ── ENGINE (the real modules the live route uses) ──────────────────────────────
+const { answerQuestion } = await import("../../src/lib/engine/answer.ts");
+const { ingestPdf } = await import("../../src/lib/engine/ingest.ts");
+const { __resetRuntimeStoreForTests } = await import("../../src/lib/engine/runtime-store.ts");
+const { resetStore } = await import("../../src/lib/engine/structured-store.ts");
+const { listUploadedDocs: listDurableDocs, deleteUploadedDoc } = await import("../../src/lib/engine/pgvector-store.ts");
+const { supabaseEnabled, admin } = await import("../../src/lib/engine/supabase.ts");
+
+// ── REAL CORPUS HANDLES ────────────────────────────────────────────────────────
+// The gmail client's real owner id (read-only; her one Hebrew handover file).
+const GMAIL_OWNER = "b01c311e-bd28-4e43-ab1e-d6825bfeb929";
+// The SCHEDULING client's real owner id (read-only): her uploaded Hebrew Excel SHEETS —
+// monthly scheduling grids (שיבוצים) + intake sheets, in uploaded_rows. This is the
+// STRUCTURED/Excel lane and is DISTINCT from GMAIL_OWNER's handover DOCUMENT. Her logged
+// "who is scheduled most in August" question over THIS data was answered three different
+// wrong ways — the worst being an UNGROUNDED `general`-mode fabrication that denied her
+// file existed ("I don't have access to live data about August"). The hard guarantee under
+// test: a question routed to HER OWN uploaded data is NEVER answered in ungrounded general
+// mode — it grounds in her sheet, or makes an honest grounded-limit statement about it, and
+// NEVER fabricates a name/count or claims she uploaded nothing.
+const SCHED_OWNER = "3d1ca025-d718-4d55-bab5-821a239cadbf";
+const DEMO_ADMIN = { isDemo: true, role: "admin" };           // bundled + ALL uploaded docs/tables
+const GMAIL = { ownerId: GMAIL_OWNER, isDemo: false, role: "member" }; // ONLY her file
+const SCHED = { ownerId: SCHED_OWNER, isDemo: false, role: "member" }; // ONLY her Excel sheets
+// THE OWNER'S REAL ACCOUNT STATE: owner 3d1ca025 is is_demo=true in prod, so her catalog holds
+// BOTH her uploaded שיבוצים scheduling sheets AND the bundled demo corpus (contracts/payroll/
+// people/…). The cross-corpus mis-routing bug (an EN people-superlative answering with COMPANY
+// names from the bundled contracts table) ONLY reproduces under this condition — SCHED's
+// isDemo:false sandboxes the bundled corpus away and so can NEVER exercise the failure it is
+// meant to gate (the recorded META-MISS: a green eval that can't see the bug). SCHED_DEMO mirrors
+// the real account so the cross-corpus regression case below actually reproduces the condition.
+const SCHED_DEMO = { ownerId: SCHED_OWNER, isDemo: true, role: "member" }; // her sheets + bundled corpus
+
+// ── GRADING PRIMITIVES (fact + citation presence, never exact string) ──────────
+const cites = (a) => [...(a || "").matchAll(/\[[SP]:[^\]]+\]/g)].map((m) => m[0]);
+const docCites = (a) => [...(a || "").matchAll(/\[P:[^\]]+\]/g)].map((m) => m[0]);
+const sqlCites = (a) => [...(a || "").matchAll(/\[S:[^\]]+\]/g)].map((m) => m[0]);
+// A figure with comma/space/no-separator tolerance, e.g. 1,285 / 1285 / 1 285.
+const numRx = (digits) => new RegExp(digits.split("").join("[\\s,]?"));
+const hasAny = (a, ...subs) => subs.some((s) => (s instanceof RegExp ? s.test(a || "") : (a || "").includes(s)));
+
+// A grounded answer = mode grounded + at least one citation + the citation-fidelity gate
+// is clean on the FINAL text (no fabricated/unresolved/unsupported token slipped through).
+//
+// The gate result we trust is the ENGINE'S OWN `res.validation.ok` — that is the REAL
+// production gate (validateAnswer run with the REAL aggregate set the engine collected
+// from the result rows). Re-deriving evidence here would MISS those aggregates (a count
+// like "40 contracts [S:contracts#1]" is backed by the engine's aggregate set, not by a
+// literal field in row #1), which would WRONGLY fail a correctly-grounded aggregate answer.
+// So we assert mode + a citation + the engine's gate verdict — never a weaker re-derivation.
+// (validateAnswer is still imported and used by the unit tests; kept here for completeness.)
+function isGroundedClean(res) {
+  if (res.mode !== "grounded") return false;
+  if (cites(res.answer).length === 0) return false;
+  return res.validation?.ok === true;
+}
+
+// An "I can only answer about your documents" wrongful refusal of a general question.
+const ONLY_DOCS_REFUSAL =
+  /(only (answer|help).{0,30}(your )?(uploaded )?documents?|can'?t answer.{0,20}general|I can only (assist|answer).{0,30}documents?|restricted to.{0,20}documents?)/i;
+
+// ── THE QUESTION SET — every distinct real logged question + the edge/hard ones ──
+// Each entry: { id, q, ctx, history?, mustGround, grade(res) -> {ok, why} }.
+// `grade` returns whether THIS single run met the bar (and a short why on failure).
+// For mustGround questions, grade requires isGroundedClean AND the corpus fact(s).
+// For not-must-ground, grade encodes the question's own honest bar.
+
+function gFact(...rx) {
+  // A must-ground grader: grounded+clean AND every required fact/citation present.
+  return (res) => {
+    const a = res.answer ?? "";
+    if (!isGroundedClean(res)) return { ok: false, why: `not grounded-clean (mode=${res.mode} cites=${cites(a).length})` };
+    for (const r of rx) {
+      if (typeof r === "function") {
+        const v = r(res);
+        if (!v.ok) return v;
+      } else if (!(r instanceof RegExp ? r.test(a) : a.includes(r))) {
+        return { ok: false, why: `missing required fact: ${r}` };
+      }
+    }
+    return { ok: true };
+  };
+}
+
+// Helpers for honest-not-in-docs grading: says-not-in-docs AND offers/contains real content,
+// and crucially does NOT fabricate a specific answer-figure/name, and is NOT a bare
+// "I can only answer about your documents" refusal.
+// The Hebrew recognizer covers the phrasings the honest path actually produces — note
+// "אינו מכיל" / "אינם מכילים" (does/do not contain), "אין ... שיבוצ" (no scheduling), and
+// the plain "אין/לא" + content-noun forms. (Broadened to recognize a CORRECT honest answer:
+// the engine commonly says "הקובץ אינו מכיל מידע על שיבוצים" — a true not-in-docs reply.)
+// NOTE on the "contain" forms: the engine inflects the verb by the (Hebrew-gendered) SUBJECT
+// it picks — "הקובץ אינו מכיל" (m. sg.), "המסמכים אינם מכילים" (m. pl.), and "הראיות אינן
+// מכילות" (f. pl., when it refers to הראיות/the evidence). All three are the SAME honest
+// not-in-docs reply; the recognizer must accept every inflection or it false-fails a correct
+// answer purely on grammatical gender (a grader gap, not an engine miss).
+// "contain" inflects by the (gendered) subject: m.sg "אינו מכיל", m.pl "אינם מכילים", f.pl
+// "אינן מכילות", AND f.sg "אינה מכילה" (when the subject is העדות/הראיה — the evidence). The honest
+// path also commonly says "אינה מזכיר/ה" (does not mention), "לא הצלחתי למצוא" (I couldn't find),
+// and "לא נמצא/ה ... ב..." — all the SAME honest not-in-docs reply. Accepting every inflection/
+// phrasing is correctness, not weakening: the no-fabrication guarantee is checked SEPARATELY.
+const SAYS_NOT_IN_DOCS_HE =
+  /(אינו זמין|לא זמין|לא מצוין|אין במסמך|אין מידע|לא ניתן לקבוע|אינו מכיל|אינה מכילה|אינם מכילים|אינן מכילות|לא מכיל|אינה מזכיר|אינו מזכיר|לא מזכיר|לא הצלחתי למצוא|אין בהם|לא נמצא|אין שיבוצ|לא כולל|אין נתונ|אין רשימת שיבוצ)/;
+const SAYS_NOT_IN_DOCS_EN =
+  /(not (in|contain|include|available|present|stated|found)|does not (contain|include|have|cover)|do not contain|no (information|data|record|mention)|isn'?t (in|available)|cannot (find|determine)|I don'?t have (access|real-?time|live))/i;
+// Normalize markdown emphasis before matching so a correct honest answer that bolds a
+// word ("does **not** contain", "the file is *not*...") is still recognized — the
+// asterisks/underscores are presentation, not content, and must not hide a true
+// not-in-docs reply. (We strip *,_,` and collapse whitespace; the bar itself is unchanged.)
+const stripMd = (a) => String(a || "").replace(/[*_`]+/g, "").replace(/\s+/g, " ");
+const saysNotInDocs = (a) => {
+  const s = stripMd(a);
+  return SAYS_NOT_IN_DOCS_HE.test(s) || SAYS_NOT_IN_DOCS_EN.test(s);
+};
+
+// ── THE HARD-GUARANTEE GRADER: no ungrounded fabrication over the caller's OWN data ──
+// The recorded RED, verbatim from her logs, is an ungrounded `general`-mode answer that
+// DEFLECTS to "I have no access to live/real-time data" and DENIES her uploaded file — over a
+// file that literally holds her August schedule. This grader fails THAT and any fabricated
+// "the most scheduled is <name>" guess; it passes a grounded answer OR an honest grounded-
+// limit reply that acknowledges her file. It is GENERAL (no specific name/number expected).
+//
+// The fabrication/deflection phrasings the RED produced (must NEVER appear as the answer):
+//   • "no access to live/real-time/updated data" (HE: נתונים חיים / בזמן אמת / מעודכנים)
+//   • denying the upload exists (HE: לא העלית / לא סופק קובץ ; EN: you didn't upload / no file)
+const LIVE_DATA_DEFLECTION =
+  /(נתונים חיים|בזמן אמת|מידע עדכני|נתונים מעודכנים|אין לי גישה לנתונים|no access to (live|real-?time)|don'?t have (access to )?(live|real-?time)|real-?time data)/i;
+const DENIES_UPLOAD =
+  /(לא העלית|לא סופק קובץ|אין קובץ שהעלית|לא הועלה קובץ|you (did not|didn'?t) upload|no file (was )?(uploaded|provided)|haven'?t (uploaded|provided) (a|any) file)/i;
+// An answer that ACKNOWLEDGES her uploaded data is present (the honest grounded-limit floor).
+// This includes referring to "the provided/presented data" (הנתונים המובאים/המוצגים) — the
+// honest path legitimately discusses the retrieved data without the literal words "your file",
+// and that is still an acknowledgment that her data IS here (the opposite of the RED, which
+// denied any file/deflected to "no live data"). The forbidden RED patterns are checked first
+// and independently, so widening the acknowledgment recognizer never lets a fabrication pass.
+const ACKNOWLEDGES_FILE_HE =
+  /(הקובץ שלך|הקובץ שהעלית|יש לך קובץ|בקובץ שלך|הנתונים שלך|בנתונים שהעלית|הטבלה|הגיליון|הקובץ מכיל|הנתונים שהועלו|הנתונים המובאים|הנתונים המוצגים|הנתונים שהתקבלו|הנתונים הקיימים|המידע הקיים|הנתונים שנמצאו)/;
+const ACKNOWLEDGES_FILE_EN =
+  /(your (uploaded )?(file|data|sheet|table|spreadsheet)|the (file|data|sheet|table) you uploaded|in your data|the uploaded (file|data)|the (provided|retrieved|presented|available) (data|file|sheet|table)|the data (provided|retrieved|presented|available))/i;
+
+function gradeNoUngroundedOverOwnData(res) {
+  const a = res.answer ?? "";
+  const s = stripMd(a);
+  // (1) The router MUST route this to her own content (the question is about her uploaded
+  //     scheduling data). If it routed to NO source, the upstream catalog/hydrate broke —
+  //     surface it rather than silently passing on a general answer.
+  if (!(res.route?.sources?.length > 0)) {
+    return { ok: false, why: `routed to NO source (sources=${JSON.stringify(res.route?.sources)}) — her uploaded data wasn't seen` };
+  }
+  // (2) THE RED, forbidden outright: the live-data deflection or denying her upload.
+  if (LIVE_DATA_DEFLECTION.test(s)) return { ok: false, why: "RED: ungrounded 'no live/real-time data' deflection over her own uploaded file" };
+  if (DENIES_UPLOAD.test(s)) return { ok: false, why: "RED: denied she uploaded a file" };
+  // (3) Either it GROUNDED in her sheet (mode grounded + a resolving [S:]/[P:] cite, gate
+  //     clean), OR it is an HONEST grounded-limit reply that ACKNOWLEDGES her file. A bare
+  //     only-docs refusal is not acceptable.
+  if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "bare only-docs refusal" };
+  if (isGroundedClean(res)) return { ok: true };
+  const acknowledges = ACKNOWLEDGES_FILE_HE.test(s) || ACKNOWLEDGES_FILE_EN.test(s);
+  const honestLimit = saysNotInDocs(a);
+  if (acknowledges && honestLimit) return { ok: true };
+  return {
+    ok: false,
+    why: `not grounded AND not an honest grounded-limit over her file (mode=${res.mode}, acknowledges=${acknowledges}, honestLimit=${honestLimit})`,
+  };
+}
+
+// ── THE CORRECT-COUNT GRADER (cell-tally lane): over her real August grid, the engine must now
+// produce the CORRECT grounded ranking, not just an honest limit. GROUND TRUTH (hand-computed by
+// exact frequency tally over every cell of `שיבוצים-אוגוסט-2024…`, owner 3d1ca025): the top group
+// is SEVEN people tied at 5 occurrences. These are TEST ASSERTIONS against the data's ground truth
+// (verifying the engine's output) — NOT engine tuning; the engine names no hardcoded value.
+const AUG_TOP_LEADERS = ["אדירה סגל", "הדס נביאי", "הלל לוי", "מירה ארונוב", "נגה מאירסון", "נועה סביר", "רינה אנטוב"];
+// Known NON-people in that grid that must NEVER be reported as "the most scheduled" person — the
+// activity/place labels that out-rank the people in a NAIVE (unclassified) cell count. If any of
+// these is named as a person/answer, the name-vs-activity classification failed (RED #3).
+const AUG_ACTIVITIES = ["חדר מתנות", "הרכב + ימי הולדת", "חוויה עם נייר", "שזירת פרחים", "עציצי בטון", "טיול שיבא"];
+
+function gradeCorrectScheduleCount(res) {
+  // First the HARD floor: never an ungrounded fabrication / deflection / upload-denial.
+  const base = gradeNoUngroundedOverOwnData(res);
+  if (!base.ok) return base;
+  const a = res.answer ?? "";
+  // If it produced the grounded ranking (the desired outcome), it MUST be CORRECT:
+  if (isGroundedClean(res)) {
+    // (a) no activity label presented as the answer/person.
+    const activityShown = AUG_ACTIVITIES.find((act) => a.includes(act));
+    if (activityShown) return { ok: false, why: `RED#3: named an ACTIVITY ("${activityShown}") as a scheduled person` };
+    // (b) at least one real top-group leader is named (the answer actually ranks correctly).
+    const named = AUG_TOP_LEADERS.filter((n) => a.includes(n));
+    if (named.length === 0) return { ok: false, why: "grounded ranking but named NONE of the true 5-count leaders" };
+    // (c) the correct count (5) is stated for the top group.
+    if (!/\b5\b|חמ(ש|ישה)/.test(a)) return { ok: false, why: "named leaders but did not state the correct top count (5)" };
+    return { ok: true };
+  }
+  // An honest grounded-limit is still an acceptable FLOOR (base already verified it acknowledges
+  // her file + says-not-in-docs) — never a fabrication. (The tally lane makes the grounded case
+  // the norm; the floor catches a rare run where classification yielded nothing.)
+  return { ok: true };
+}
+
+// ── SELF-CONSISTENCY (SV1): the prose must AGREE with its own cited [S:] rows ─────────────────
+// The dangerous live bug was a SELF-CONTRADICTION: the cited evidence rows showed occurrences=10
+// while the prose declared "Rina=5" as the leader. A cell-tally answer's cited rows carry the
+// code-computed {entity, occurrences}; the prose MUST state the MAX of those cited occurrences and
+// name an entity that holds it. This grader fails the moment the prose disagrees with the evidence
+// it cites — independent of any external ground truth. (For a "least" question the leader is the
+// MIN of the cited rows; the direction is passed in.) GENERAL — reads only res.evidence.rows.
+function selfConsistencyCheck(res, direction = "most") {
+  const rows = (res.evidence?.rows ?? []).filter((r) => r?.data && typeof r.data.occurrences === "number");
+  if (rows.length === 0) return { ok: true }; // not a cell-tally/count answer → nothing to cross-check
+  const a = res.answer ?? "";
+  const counts = rows.map((r) => r.data.occurrences);
+  const extreme = direction === "least" ? Math.min(...counts) : Math.max(...counts);
+  // The prose MUST state the extreme count from its OWN cited rows (not some other number).
+  const statesExtreme = new RegExp(`(?<![\\d.,])${extreme}(?!\\d)(?![.,]\\d)`).test(a);
+  if (!statesExtreme) {
+    return { ok: false, why: `SELF-CONTRADICTION: cited rows show ${direction} occurrences=${extreme}, but the prose does not state ${extreme} (it reported a different number than its own evidence)` };
+  }
+  // At least one entity at that extreme (per the cited rows) must be NAMED in the prose.
+  const extremeEntities = rows.filter((r) => r.data.occurrences === extreme).map((r) => String(r.data.entity));
+  if (extremeEntities.length > 0 && !extremeEntities.some((e) => a.includes(e))) {
+    return { ok: false, why: `SELF-CONTRADICTION: cited rows put ${extremeEntities.join("/")} at the ${direction} count ${extreme}, but the prose names none of them` };
+  }
+  return { ok: true };
+}
+
+// ── THE VARIATION GRADER (the live count-regression fix) ─────────────────────────────────────
+// The live regression: the cell-tally lane passed the eval's exact "August" string but FAILED on
+// the NATURAL variations the client actually asks (no-month, system-wide, "most active", a
+// different month, "least"). The two RED failures were (1) a TIE COLLAPSED to a single crowned
+// winner with the co-leaders demoted, and (2) a NON-MAX reported as the max with a GREEN check.
+// This grader is direction- and scope-aware. It asserts, against the HAND-COMPUTED ground truth
+// of HER real sheets (exact frequency tally over every cell, owner 3d1ca025):
+//   • the answer GROUNDS in her data (mode grounded + a resolving [S:] cite + gate clean),
+//   • it states the TRUE extreme count for that scope,
+//   • it names the FULL tied group (no collapse) — every co-leader at the extreme,
+//   • it NEVER reports a non-extreme number as the answer,
+//   • it never names an activity/place label as the person.
+// These are TEST ASSERTIONS against the data's ground truth, not engine tuning (the engine names
+// no hardcoded value — it computes the tally in code from her live rows).
+//
+// opts: { maxCount, leaders[], runnerUpBelow?, forbidActivities? } — `leaders` is the full tied
+// group at the extreme; `runnerUpBelow` (optional) is a count that is the NEXT rank and must NOT
+// be presented as THE answer count (a guard the non-max-as-max RED would trip).
+function gradeCellTallyFaithful(opts) {
+  const { maxCount, leaders, forbidActivities = true, direction = "most" } = opts;
+  // Match the exact integer as a standalone token (not a substring of a larger number).
+  const statesCount = (a) => new RegExp(`(?<![\\d.,])${maxCount}(?!\\d)(?![.,]\\d)`).test(a);
+  return (res) => {
+    // HARD floor first: never an ungrounded fabrication / deflection / upload-denial over her data.
+    const base = gradeNoUngroundedOverOwnData(res);
+    if (!base.ok) return base;
+    const a = res.answer ?? "";
+    // The variation cases are a deterministic ranking the lane now OWNS — they must GROUND, not
+    // fall to an honest limit (an honest-limit here would mean the tally lane silently regressed).
+    if (!isGroundedClean(res)) {
+      return { ok: false, why: `expected a grounded tally answer, got mode=${res.mode} (tally lane did not fire / produce a ranking)` };
+    }
+    // (SV1) SELF-CONSISTENCY: the prose must agree with its OWN cited [S:] rows before we even
+    // check it against external ground truth — this catches the "evidence shows 29, prose says 5"
+    // contradiction class directly.
+    const sc = selfConsistencyCheck(res, direction);
+    if (!sc.ok) return sc;
+    // (a) the TRUE extreme count is stated.
+    if (!statesCount(a)) return { ok: false, why: `did not state the true extreme count (${maxCount}) — a non-extreme may have been reported as the answer` };
+    // (b) the FULL tied group is named — no collapse. Every co-leader at the extreme must appear.
+    const missing = leaders.filter((n) => !a.includes(n));
+    if (missing.length > 0) {
+      return { ok: false, why: `tie collapsed — omitted ${missing.length}/${leaders.length} co-leaders at ${maxCount}: ${missing.join(", ")}` };
+    }
+    // (c) no activity/place label presented as a person (the classification guard).
+    if (forbidActivities) {
+      const act = AUG_ACTIVITIES.find((x) => a.includes(x));
+      if (act) return { ok: false, why: `named an ACTIVITY/PLACE ("${act}") as a scheduled person` };
+    }
+    return { ok: true };
+  };
+}
+
+// Ground truth (hand-computed exact cell-frequency tally over her real sheets, owner 3d1ca025):
+//   • SYSTEM-WIDE (all 5 שיבוצים sheets, summed per person): the single MAX person is
+//     נגה מאירסון = 29 (unique — NOT a tie; runner-up אילת ברזין = 28).
+//   • DECEMBER (both גיליון1 + גיליון2 summed): a 3-way tie at 18 — אילת ברזין, נעה כהן צמח,
+//     שירה ליאור.
+const SYS_MAX_LEADER = ["נגה מאירסון"]; // sole max @29 system-wide
+const DEC_TOP_LEADERS = ["אילת ברזין", "נעה כהן צמח", "שירה ליאור"]; // 3-way tie @18
+
+const QUESTIONS = [
+  // ─────────────── GMAIL USER — her Hebrew national-service handover file ───────────────
+  {
+    id: "HE/sheba-coordinator", ctx: GMAIL, mustGround: true,
+    q: "איך קוראים לאחראית שירות לאומי בשיבא?",
+    grade: gFact(/אפרת/, (r) => ({ ok: docCites(r.answer).length > 0, why: "no [P:] citation" })),
+  },
+  {
+    id: "HE/apartment-addresses", ctx: GMAIL, mustGround: true,
+    q: "לגבי הקובץ שהעלתי לך, מה הכתובות של הדירות?",
+    // The addresses printed in her sheet: מנחם בגין 15 / יוני נתניהו 30 / מנחם בגין 23.
+    grade: gFact((r) => ({
+      ok: hasAny(r.answer, /מנחם בגין/, /יוני נתניהו/) && docCites(r.answer).length > 0,
+      why: "no apartment address + [P:] cite",
+    })),
+  },
+  {
+    id: "HE/file-summary", ctx: GMAIL, mustGround: true,
+    q: "במה עוסק הקובץ שהעלתי?",
+    // A meta-summary OF her doc must ground (service-national handover / Sheba).
+    grade: gFact((r) => ({
+      ok: hasAny(r.answer, /שירות לאומי/, /שיבא/, /גרעין/) && docCites(r.answer).length > 0,
+      why: "summary did not ground in her file",
+    })),
+  },
+  {
+    id: "HE/apartments-followup", ctx: GMAIL, mustGround: true,
+    // MULTI-TURN follow-up ("so from the file, what are the exact addresses?") — a prior
+    // turn established the file; the conversational follow-up must STILL resolve to her
+    // document and ground (it previously went general). The history names the file/topic.
+    q: "אז מתוך הקובץ, מה הכתובות המדויקות של הדירות?",
+    history: [
+      { question: "במה עוסק הקובץ שהעלתי?", answer: "הקובץ הוא מידע העברה לשירות לאומי בבית החולים שיבא. [P:מידע-כללי-העברת-מקל-חיה#1]" },
+    ],
+    grade: gFact((r) => ({
+      ok: hasAny(r.answer, /מנחם בגין/, /יוני נתניהו/) && docCites(r.answer).length > 0,
+      why: "conversational follow-up did not re-ground on her file's addresses",
+    })),
+  },
+  {
+    id: "HE/internal-garin-roles", ctx: GMAIL, mustGround: true,
+    q: "לגבי הקובץ שהעלתי לך, איך קוראים לבנות שאחראיות בתפקידי פנים גרעין?",
+    grade: gFact((r) => ({ ok: docCites(r.answer).length > 0, why: "no [P:] citation to her file" })),
+  },
+  {
+    id: "HE/internal-garin-roles-bare", ctx: GMAIL, mustGround: true,
+    q: "איך קוראים לבנות שאחראיות בתפקידי פנים גרעין?",
+    grade: gFact((r) => ({ ok: docCites(r.answer).length > 0, why: "bare phrasing dropped to general" })),
+  },
+  {
+    id: "HE/contacts-enum", ctx: GMAIL, mustGround: true,
+    q: "מי אנשי הקשר בקובץ ומה הטלפונים שלהם?",
+    // Enumeration over her אנשי קשר table — must name a contact + a phone, cited.
+    grade: gFact(/אפרת/, numRx("0545203283"), (r) => ({ ok: docCites(r.answer).length > 0, why: "no [P:] cite" })),
+  },
+  {
+    id: "HE/most-scheduled", ctx: GMAIL, mustGround: false,
+    q: "מי הבת שמשובצת הכי הרבה?",
+    // HONEST not-in-docs: no scheduling-count table. Must say so, NOT fabricate one girl as
+    // "the most scheduled", NOT a bare "I can only answer about your documents" refusal.
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "bare only-docs refusal" };
+      if (!saysNotInDocs(a)) return { ok: false, why: "did not honestly say the scheduling count isn't in the file" };
+      return { ok: true };
+    },
+  },
+  {
+    id: "HE/august-most-scheduled", ctx: GMAIL, mustGround: false,
+    q: "בשיבוצי אוגוסט מי הבת שמשובצת הכי הרבה?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "bare only-docs refusal" };
+      if (!saysNotInDocs(a)) return { ok: false, why: "did not honestly say August scheduling isn't in the file" };
+      return { ok: true };
+    },
+  },
+  {
+    id: "HE/general-paris", ctx: GMAIL, mustGround: false,
+    q: "מהי בירת צרפת?",
+    // Pure general-knowledge in Hebrew → must answer (פריז), never refuse with only-docs.
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "refused a general-knowledge question" };
+      return { ok: /פריז/.test(a), why: "did not answer Paris in Hebrew" };
+    },
+  },
+
+  // ─────────────── SCHEDULING USER — her real uploaded Excel SHEETS (structured lane) ───────────────
+  // THE HARD GUARANTEE (A): a question routed to HER OWN uploaded data must NEVER be answered
+  // in ungrounded `general` mode. The recorded RED was exactly that — over her real August
+  // scheduling sheet the engine answered mode=general with NO citations and a world-knowledge
+  // DEFLECTION ("I don't have access to live/real-time data about who's scheduled in August
+  // 2026"), denying her uploaded file exists. These graders FAIL that RED and PASS only an
+  // answer that is GROUNDED in her sheet OR an HONEST grounded-limit statement that
+  // acknowledges her file — never a fabricated name/count, never "no live data", never
+  // "you didn't upload anything". (B — a fully-correct person-frequency count over the messy
+  // calendar grid — is a separate, harder goal NOT asserted here; the bar here is "no
+  // ungrounded fabrication over her own data".)
+  {
+    id: "HE/sched-august-most", ctx: SCHED, mustGround: false,
+    q: "מי הכי משובץ באוגוסט?",
+    // The cell-tally lane must now produce the CORRECT grounded ranking (7 leaders tied at 5),
+    // not just an honest limit — and never an activity-as-person. Floor: no ungrounded fabrication.
+    grade: (res) => gradeCorrectScheduleCount(res),
+  },
+  {
+    id: "HE/sched-most-bare", ctx: SCHED, mustGround: false,
+    q: "מי הבת שמשובצת הכי הרבה?",
+    // Same data, no month qualifier — still must never fabricate/deflect over her own data
+    // (it may rank one month's grid or honestly state the limit; both are correct, no RED).
+    grade: (res) => gradeNoUngroundedOverOwnData(res),
+  },
+
+  // ── THE LIVE-REGRESSION VARIATIONS (Costume D — the eval was too narrow) ──────────────────────
+  // The cell-tally lane passed the single "August" string but FAILED the natural phrasings the
+  // client actually asks. Each variation asserts the FULL tied group + the TRUE extreme + no
+  // tie-collapse + no non-max-as-max, against her real-sheet ground truth. These are the gate
+  // the live failures must clear before redeploy.
+  {
+    // VARIATION: a bare no-month "who is scheduled the most?" — the live RED #1 (collapsed the
+    // tie, crowned one). With the unified cross-sheet tally this resolves to the system-wide
+    // sole max (נגה מאירסון = 29). Must state 29 and name נגה מאירסון, never a non-max.
+    id: "HE/sched-most-no-month", ctx: SCHED, mustGround: false,
+    q: "מי משובץ הכי הרבה?",
+    grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // VARIATION: SYSTEM-WIDE "במערכת" — the live RED #2, the DANGEROUS one (a GREEN check on a
+    // non-max count of 5). Must report the TRUE cross-sheet max (נגה מאירסון = 29), never 5.
+    id: "HE/sched-system-wide", ctx: SCHED, mustGround: false,
+    q: "מי משובץ הכי הרבה במערכת",
+    grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // VARIATION: a DIFFERENT month (December) — must scope to the Dec sheets and report their
+    // TRUE summed top (a 3-way tie at 18), proving the fix isn't August-specific and ties are kept.
+    id: "HE/sched-december-most", ctx: SCHED, mustGround: false,
+    q: "בשיבוצים של דצמבר - מי משובץ הכי הרבה?",
+    grade: gradeCellTallyFaithful({ maxCount: 18, leaders: DEC_TOP_LEADERS }),
+  },
+  {
+    // VARIATION: "most active" in English — this is the EXACT live-failing phrasing (NO trailing
+    // "in the schedules" scheduling-context cue). The prior eval string DID include "in the
+    // schedules?", which gave the flaky planner an anchor so it routed; the bare natural phrasing
+    // the client typed did NOT — the planner returned tables:[] and answerStructured bailed before
+    // the tally lane, deflecting to mode=general ("your file has no activity counts, try Asana/Jira",
+    // 0 cites). Fixed by letting the tally lane fire on a planner-punt. Must trigger the tally and
+    // report the system-wide sole max (נגה מאירסון = 29), full faithfulness.
+    id: "EN/sched-most-active", ctx: SCHED, mustGround: false,
+    q: "who is the most active person",
+    grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // KEEP the qualified phrasing too (it already worked live) — a regression guard that the
+    // scheduling-context cue still grounds, so the fix didn't trade one routing for another.
+    id: "EN/sched-most-active-qualified", ctx: SCHED, mustGround: false,
+    q: "who is the most active person in the schedules?",
+    grade: gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER }),
+  },
+  {
+    // CROSS-CORPUS REGRESSION (the recorded bug + the verifier's META-MISS fix). This is the SAME
+    // EN people-superlative, but run under SCHED_DEMO (isDemo:true) — the owner's REAL account
+    // state, where the bundled demo corpus (contracts/payroll/people) is visible ALONGSIDE her
+    // scheduling sheets. THAT is the only condition under which the bug reproduces: the live RED
+    // answered with COMPANY names from the bundled `contracts` table ("Blogspan and Brainsphere,
+    // 5 occurrences [S:contracts#…]") instead of the most-scheduled PERSON. The isDemo:false
+    // SCHED variant above CANNOT see the bundled corpus, so it could stay green even if the
+    // mis-routing returned — this case closes that gap by reproducing the real condition. It must
+    // ground to נגה מאירסון @29 AND must NOT cite a bundled table or name a bundled company.
+    id: "EN/sched-most-active-crosscorpus", ctx: SCHED_DEMO, mustGround: false,
+    q: "who is the most active person",
+    grade: (res) => {
+      const base = gradeCellTallyFaithful({ maxCount: 29, leaders: SYS_MAX_LEADER })(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      // Belt-and-braces over the faithful grader: no bundled-corpus citation, no bundled company.
+      // (The faithful grader already requires 29 + נגה מאירסון, which a contracts answer fails; this
+      // makes the cross-corpus intent explicit and catches a "names נגה but ALSO cites contracts".)
+      if (/\[S:(contracts|payroll|people|enrollment|maintenance)/i.test(a)) {
+        return { ok: false, why: "cited a BUNDLED demo table for a people-superlative over her sheets (cross-corpus mis-route)" };
+      }
+      if (/\b(Blogspan|Brainsphere)\b/i.test(a)) {
+        return { ok: false, why: "named a bundled-corpus COMPANY as the most-active person (the recorded cross-corpus RED)" };
+      }
+      return { ok: true };
+    },
+  },
+  {
+    // VARIATION: the LEAST direction — must compute the MINIMUM group, not the max. Ground truth:
+    // the min classified person occurs once (count 1). We assert it grounds, states "1", names a
+    // PERSON (no activity), and never reports a high number as "the least". (The specific name at
+    // the min varies with classification, so we assert the count + person-not-activity, not a name.)
+    id: "HE/sched-least", ctx: SCHED, mustGround: false,
+    q: "מי משובץ הכי מעט בשיבוצים?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded least-tally answer, got mode=${res.mode}` };
+      // States the minimum count (1) as a standalone token.
+      if (!/(?<![\d.,])1(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state the minimum count (1) — a non-min may have been reported" };
+      // Did NOT report a known HIGH (max-ish) count as the least — that would be a direction error.
+      if (/(?<![\d.,])29(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "reported the system MAX (29) for a LEAST question — direction flipped" };
+      // Never an activity/place label as the person.
+      const act = AUG_ACTIVITIES.find((x) => a.includes(x));
+      if (act) return { ok: false, why: `named an ACTIVITY/PLACE ("${act}") as the least-scheduled person` };
+      return { ok: true };
+    },
+  },
+
+  // ── FULL COUNT SPACE: per-month (June/July), specific-person count, exactly-N, activity-as-top ──
+  {
+    // PER-MONTH June — a SOLE leader (רינה אנטוב @5; חדר מתנות=6 is a place, excluded). Proves the
+    // engine names ONE when there's one winner (no fabricated tie) and scopes to the June sheet.
+    id: "HE/sched-june-most", ctx: SCHED, mustGround: false,
+    q: "בשיבוצי יוני מי משובץ הכי הרבה?",
+    grade: gradeCellTallyFaithful({ maxCount: 5, leaders: ["רינה אנטוב"] }),
+  },
+  {
+    // PER-MONTH July — a 7-way tie @5 (same shape as August). Proves per-month scoping + full tie.
+    id: "HE/sched-july-most", ctx: SCHED, mustGround: false,
+    q: "בשיבוצי יולי מי משובץ הכי הרבה?",
+    grade: gradeCellTallyFaithful({ maxCount: 5, leaders: AUG_TOP_LEADERS }),
+  },
+  {
+    // DV4 specific-person count, SYSTEM-WIDE (no month) — she appears 15× across the sheets. This is
+    // the EXACT live-failing phrasing (verb-before-name word order: "משובצת רינה אנטוב"), which is
+    // DISTINCT from the prior eval string "רינה אנטוב משובצת" (name-before-verb). The live RED: the
+    // planner returned tables:[] for this unscoped, no-month, cryptic-Hebrew-sheet question, so
+    // answerStructured bailed with "no relevant table" BEFORE the cell-count lane ran → a mode=general
+    // deflection ("couldn't find scheduling info for Rina, try COUNTIF", 0 cites) for a name that
+    // appears 15×. The prior eval string happened to route (planner picked a sheet); the natural
+    // verb-first phrasing the client typed did not. Fixed by letting the grid count/tally lanes fire
+    // even on a planner-punt (text-to-sql early-return guard). Must now say 15, cited.
+    id: "HE/sched-count-rina-system", ctx: SCHED, mustGround: false,
+    q: "כמה פעמים משובצת רינה אנטוב",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded count, got mode=${res.mode}` };
+      if (/(?<![\d.,])0(?!\d)(?![.,]\d)\s*(פעמים|times)/.test(a)) return { ok: false, why: "fabricated '0 times' for a name that appears 15×" };
+      if (!/(?<![\d.,])15(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state her true system-wide count (15)" };
+      const sc = selfConsistencyCheck(res, "most");
+      if (!sc.ok) return sc;
+      return { ok: true };
+    },
+  },
+  {
+    // DV4 specific-person count, SCOPED to a month — in August she appears exactly 5×. Proves the
+    // count lane narrows to the named month (5), not the system total (15).
+    id: "HE/sched-count-rina-august", ctx: SCHED, mustGround: false,
+    q: "כמה פעמים רינה אנטוב משובצת באוגוסט?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded count, got mode=${res.mode}` };
+      if (!/(?<![\d.,])5(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state her August count (5)" };
+      return { ok: true };
+    },
+  },
+  {
+    // ACTIVITY-AS-TOP (EG2 inverse) — when the question RANKS activities/places, the true top is
+    // חדר מתנות (gift room) @8, NOT a person. The classifier must rank the kind the question asks
+    // for: it must name חדר מתנות and must NOT name a person as the "activity".
+    id: "HE/sched-activity-top", ctx: SCHED, mustGround: false,
+    q: "איזו פעילות או מקום מופיע הכי הרבה באוגוסט?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded activity ranking, got mode=${res.mode}` };
+      if (!a.includes("חדר מתנות")) return { ok: false, why: "did not name the true top activity/place (חדר מתנות @8)" };
+      if (!/(?<![\d.,])8(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state the activity's true count (8)" };
+      // Must NOT name a PERSON as the activity (the classification-inversion bug).
+      const person = AUG_TOP_LEADERS.find((p) => a.includes(p));
+      if (person) return { ok: false, why: `named a PERSON ("${person}") as the most-frequent activity/place` };
+      return { ok: true };
+    },
+  },
+
+  // ── ADVERSARIAL — must NOT fabricate (AD1/AD2/AD3) ──────────────────────────────────────────
+  {
+    // AD1 — a fact NOT in her sheet (a phone number). Must honestly say it's not there, NEVER invent
+    // a number, and never deny her file. (Her scheduling grid has names, no phone numbers.)
+    id: "HE/sched-adv-phone", ctx: SCHED, mustGround: false,
+    q: "מה מספר הטלפון של רינה אנטוב?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      // A fabricated phone = a 9-10 digit run. Must NOT appear as her number.
+      if (/\b0\d{1,2}[-\s]?\d{7}\b|\b\d{9,10}\b/.test(a.replace(/[S:P:#\]]/g, ""))) {
+        return { ok: false, why: "fabricated a phone number not in her sheet" };
+      }
+      if (DENIES_UPLOAD.test(stripMd(a))) return { ok: false, why: "denied her file" };
+      if (!saysNotInDocs(a)) return { ok: false, why: "did not honestly say the phone isn't in her file" };
+      return { ok: true };
+    },
+  },
+  {
+    // AD2 — a superlative over a field that DOESN'T EXIST (ages). Must honestly say there are no ages
+    // to rank by, and NEVER fabricate "the oldest is <name>". (No date-of-birth/age column exists.)
+    id: "HE/sched-adv-oldest", ctx: SCHED, mustGround: false,
+    q: "מי הבת הכי מבוגרת בשיבוצים?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      // A fabricated ranking would confidently crown one girl as oldest. The honest answer says
+      // there's no age data (or honestly couldn't find ages). We FAIL a confident
+      // "<name> היא הכי מבוגרת" without a not-found hedge; the honest no-age reply passes.
+      const crowns = /(הכי מבוגרת היא|המבוגרת ביותר היא|the oldest is)\s*\S+/i.test(a);
+      const honest =
+        saysNotInDocs(a) || /(אין|לא|ללא|אינו|אינה).{0,40}(גיל|גילא|תאריך לידה|age|birth)/i.test(a);
+      if (crowns && !honest) return { ok: false, why: "fabricated an 'oldest' ranking with no age data" };
+      if (!honest) return { ok: false, why: "did not honestly flag that there is no age data to rank by" };
+      return { ok: true };
+    },
+  },
+  {
+    // AD3 — a FALSE PREMISE ("Rina is scheduled 20 times, who else?"). She is NOT scheduled 20× (15
+    // system-wide / 5 per sheet). Must NOT accept the premise or manufacture others "at 20". Honest:
+    // correct or decline the premise, no fabricated 20-count list.
+    id: "HE/sched-adv-false-premise", ctx: SCHED, mustGround: false,
+    q: "רינה אנטוב משובצת 20 פעמים, מי עוד משובץ ככה?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      // FABRICATION = naming people "also scheduled 20 times" / confirming the 20. The honest answer
+      // does not assert a 20-count. We FAIL if it confirms "20" as a real count for anyone.
+      const confirms20 = /20\s*(פעמים|times)/.test(a) && !/(לא|אינ|not|no|incorrect|אינה משובצת 20)/i.test(a);
+      if (confirms20) return { ok: false, why: "accepted/echoed the false 20-times premise as fact" };
+      return { ok: true };
+    },
+  },
+
+  // ── DV5 FILTER-BY-COUNT — "who is scheduled EXACTLY N times" ──────────────────────────────────
+  {
+    // Ground truth (exact cell tally over her real August sheet, owner 3d1ca025): the PEOPLE at
+    // exactly 5 occurrences are the 7 AUG_TOP_LEADERS (the activity "הרכב + ימי הולדת" is also @5 but
+    // is a place/activity, never a person). The filter-by-count lane must return that exact SET,
+    // cited — never a fabricated member, never an activity-as-person.
+    id: "HE/sched-exactly-5-august", ctx: SCHED, mustGround: false,
+    q: "מי משובצת בדיוק 5 פעמים באוגוסט?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      if (!isGroundedClean(res)) return { ok: false, why: `expected a grounded exact-count set, got mode=${res.mode}` };
+      // States the target count 5.
+      if (!/(?<![\d.,])5(?!\d)(?![.,]\d)/.test(a)) return { ok: false, why: "did not state the target count (5)" };
+      // Names the real exactly-5 people: require a strong majority (≥5 of 7) so a paraphrase that
+      // drops one isn't false-failed, but a near-empty/wrong answer is. No activity-as-person.
+      const named = AUG_TOP_LEADERS.filter((n) => a.includes(n));
+      if (named.length < 5) return { ok: false, why: `named only ${named.length}/7 of the exactly-5 people` };
+      const act = AUG_ACTIVITIES.find((x) => a.includes(x));
+      if (act) return { ok: false, why: `named an ACTIVITY/PLACE ("${act}") as a person scheduled 5 times` };
+      return { ok: true };
+    },
+  },
+
+  // ── EG4 SPARSE / NO DETERMINABLE RANKING — honest, no fabricated winner ───────────────────────
+  {
+    // Her intake/assessment grids (עותק_של_שם_צעיר…) are NOT recurrence grids — names appear once,
+    // there is no "most scheduled" to rank. A ranking question scoped to that kind of content must
+    // be HONEST ("there's no schedule-count to rank by here"), never crown a fabricated winner.
+    // This is the sparse/no-determinable-ranking row: the honest floor (no ungrounded fabrication)
+    // plus "does not fabricate a single crowned leader with a count it can't support."
+    id: "HE/sched-no-ranking-intake", ctx: SCHED, mustGround: false,
+    q: "מי הכי פעילה בתיק הצעיר במסלול דניאלי?",
+    grade: (res) => {
+      const base = gradeNoUngroundedOverOwnData(res);
+      if (!base.ok) return base;
+      const a = res.answer ?? "";
+      // If it grounded a frequency ranking, it MUST be self-consistent (its cited rows back the
+      // stated leader/count). If it can't determine a ranking, it must say so honestly — never crown
+      // a single name with an invented frequency. A confident "X היא הכי פעילה, N פעמים" with no
+      // self-consistent backing is the fabrication we forbid.
+      if (isGroundedClean(res)) {
+        const sc = selfConsistencyCheck(res, "most");
+        if (!sc.ok) return sc;
+        return { ok: true };
+      }
+      // Not grounded → must be an honest limit, not a fabricated crowning.
+      if (!saysNotInDocs(a) && !ACKNOWLEDGES_FILE_HE.test(stripMd(a)) && !ACKNOWLEDGES_FILE_EN.test(stripMd(a))) {
+        return { ok: false, why: "neither grounded nor an honest acknowledgment of her file" };
+      }
+      return { ok: true };
+    },
+  },
+
+  // ── AD4 NON-EXISTENT NAME → HONEST 0, never invent a count ────────────────────────────────────
+  {
+    // A made-up name that is in NONE of her sheets. The cell-count lane must report an HONEST 0 /
+    // "not in your file" — NEVER a fabricated non-zero count. (The name below is invented; if it
+    // ever appears in real data this asserts the honest-absence behavior regardless.)
+    id: "HE/sched-count-nonexistent", ctx: SCHED, mustGround: false,
+    q: "כמה פעמים משובצת זלדה נונאקזיסטנט?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (DENIES_UPLOAD.test(stripMd(a))) return { ok: false, why: "denied her file exists" };
+      // A fabricated non-zero count for the made-up name. Honest answers say 0 / not found.
+      const claimsNonZero = /([1-9]\d*)\s*(פעמים|times)/.test(a);
+      const saysZeroOrAbsent =
+        /(?<![\d.,])0(?!\d)\s*(פעמים|times)/.test(a) ||
+        /(לא נמצא|אינה מופיע|לא מופיע|אינה משובצת|לא משובצת|not (found|in|present)|does not appear|no (record|mention|occurrence))/i.test(a) ||
+        saysNotInDocs(a);
+      if (claimsNonZero && !saysZeroOrAbsent) {
+        return { ok: false, why: "fabricated a non-zero count for a name that is not in her sheets" };
+      }
+      if (!saysZeroOrAbsent) return { ok: false, why: "did not honestly state the name is absent / count 0" };
+      return { ok: true };
+    },
+  },
+
+  // ─────────────── MERIDIAN DEMO — Carter case file (bundled) ───────────────
+  {
+    id: "EN/child-support", ctx: DEMO_ADMIN, mustGround: true,
+    q: "What was the final child support amount, and who got primary residence?",
+    grade: gFact(numRx("1285"), /joni/i, (r) => ({ ok: docCites(r.answer).length > 0, why: "no [P:] cite" })),
+  },
+  {
+    id: "EN/child-support-terse", ctx: DEMO_ADMIN, mustGround: true,
+    q: "What was the final child support amount?",
+    grade: gFact(numRx("1285")),
+  },
+  {
+    id: "HE/child-support-xlingual", ctx: DEMO_ADMIN, mustGround: true,
+    q: "מה גובה דמי המזונות שנפסקו ולמי ניתנה המשמורת העיקרית?",
+    grade: gFact(numRx("1285"), /ג.וני|joni/i),
+  },
+  {
+    id: "EN/parties-decided", ctx: DEMO_ADMIN, mustGround: true,
+    q: "Who are the parties in the Carter family court case, and what was decided?",
+    grade: gFact(/joni/i, /mich/i, (r) => ({ ok: docCites(r.answer).length > 0, why: "no [P:] cite" })),
+  },
+  {
+    id: "EN/case-child-support", ctx: DEMO_ADMIN, mustGround: true,
+    q: "What does the case file say about child support for the Carter case?",
+    grade: gFact(numRx("1285")),
+  },
+  {
+    id: "EN/alimony-advice", ctx: DEMO_ADMIN, mustGround: true,
+    // The original MVP miss — advice over retrieved evidence must GROUND, never Route-NONE.
+    q: "if i were to be a senior lawyer on the carter's case how would i present michael's case in order for him to pay less alimony?",
+    grade: gFact(numRx("1285"), (r) => ({ ok: docCites(r.answer).length > 0, why: "advice not grounded in cited facts" })),
+  },
+  {
+    id: "EN/income-compare", ctx: DEMO_ADMIN, mustGround: true,
+    // The pm bar: "compare the two parties' incomes AS STATED IN THE FAMILY-COURT FILE
+    // (family-court#15 carries the incomes)". The bare "Is Michel's income higher than
+    // Joni's" is genuinely ambiguous in the DEMO corpus, which also ships unrelated
+    // payroll_v1/payroll_v2 tables — so the router reasonably tries the structured payroll
+    // lane (which has no Carter parties → a null difference). That is a demo-corpus routing
+    // collision, NOT the grounding fix: anchoring the comparison to the case file (how a
+    // user comparing the parties in THIS case actually asks) grounds it on family-court#15,
+    // exactly as the pm bar describes. No engine/per-question tuning — the question simply
+    // names the document the incomes live in.
+    q: "In the Carter family court case file, is Michel's annual income higher than Joni's, and by how much?",
+    grade: gFact(numRx("130000"), numRx("95000"), (r) => ({ ok: docCites(r.answer).length > 0, why: "no [P:] cite to the case file" })),
+  },
+  {
+    id: "EN/cs-followup", ctx: DEMO_ADMIN, mustGround: true,
+    q: "You mentioned $1,285 — is that monthly or annual, and for how many children?",
+    history: [{ question: "What is the child support in the Carter case?", answer: "Child support is $1,285/month. [P:family-court#24]" }],
+    grade: gFact(/month/i, (r) => ({ ok: docCites(r.answer).length > 0, why: "follow-up did not re-ground" })),
+  },
+  {
+    id: "EN/carter-3bullets", ctx: DEMO_ADMIN, mustGround: true,
+    q: "Summarize everything you know about the Carter case in 3 bullet points.",
+    grade: gFact(/joni/i, (r) => ({ ok: docCites(r.answer).length > 0, why: "open summary did not ground" })),
+  },
+
+  // ─────────────── MERIDIAN DEMO — structured tables (contracts / maintenance) ───────────────
+  {
+    id: "EN/maintenance-total", ctx: DEMO_ADMIN, mustGround: true,
+    q: "What is the maintenance total?",
+    grade: gFact(numRx("40597"), (r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite" })),
+  },
+  {
+    id: "EN/maintenance-summary", ctx: DEMO_ADMIN, mustGround: true,
+    q: "Summarize the maintenance invoices.",
+    grade: gFact(numRx("40597"), (r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite" })),
+  },
+  {
+    id: "EN/maintenance-all-time", ctx: DEMO_ADMIN, mustGround: true,
+    // The STABLE aggregation anchor (grounds 10/10 in logs) — keep it green.
+    q: "What was our total maintenance spend all-time, and how many tickets?",
+    grade: gFact(numRx("40597"), (r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite" })),
+  },
+  {
+    id: "EN/contracts-90day-value", ctx: DEMO_ADMIN, mustGround: true,
+    // Two-part aggregation over the contracts table (the 90-day count + combined annual
+    // value). The count is date-relative; assert grounded STRUCTURE + a [S:] cite, not a
+    // pinned literal (which would be demo-tuned/brittle).
+    q: "What contracts expire in the next 90 days, and what's their combined annual value?",
+    grade: gFact(/\b[\d,]+\b.{0,40}(value|annual|\$)/is, (r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite for the two-part aggregation" })),
+  },
+  {
+    id: "EN/contracts-90day", ctx: DEMO_ADMIN, mustGround: true,
+    q: "How many contracts are expiring in the next 90 days?",
+    // The COUNT is DATE-RELATIVE (computed against today via text-to-SQL), so we assert
+    // grounded STRUCTURE — a concrete count + the [S:contracts#1] citation — NOT a pinned
+    // number (the golden "41" was the count on the day the bar was written; today it differs).
+    // Pinning the literal would be a demo-tuned, brittle assertion; grounded-count-with-cite
+    // is the honest invariant.
+    grade: gFact(/\b\d{1,4}\b.{0,40}(contract|expir)/is, (r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite" })),
+  },
+  {
+    id: "EN/vendor-contracts-value", ctx: DEMO_ADMIN, mustGround: true,
+    q: "How many vendor contracts are there, and what is their combined annual value?",
+    grade: gFact(numRx("1000"), (r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite" })),
+  },
+  {
+    id: "EN/vendor-most-contracts", ctx: DEMO_ADMIN, mustGround: true,
+    q: "Which vendor has the most contracts?",
+    grade: gFact(/meevee/i, (r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite" })),
+  },
+  {
+    id: "EN/contracts-count-soonest", ctx: DEMO_ADMIN, mustGround: true,
+    q: "How many contracts are there, and which one expires soonest?",
+    grade: gFact(numRx("1000"), (r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite" })),
+  },
+  {
+    id: "EN/contracts-argmax-value", ctx: DEMO_ADMIN, mustGround: true,
+    q: "Which contract has the highest annual value, and who is the vendor?",
+    grade: gFact((r) => ({ ok: sqlCites(r.answer).length > 0, why: "no [S:] cite for argmax" })),
+  },
+
+  // ─────────────── MERIDIAN DEMO — Hebrew invoice ───────────────
+  {
+    id: "HE/even-yasmin-invoice", ctx: DEMO_ADMIN, mustGround: true,
+    q: "מהו הסכום הכולל לתשלום בחשבונית של חברת אבן יסמין?",
+    grade: gFact(numRx("52800")),
+  },
+
+  // ─────────────── NOT-IN-DOCS / GENERAL / META (graded on their own bar, 5/5) ───────────────
+  {
+    id: "EN/overdue-payments", ctx: DEMO_ADMIN, mustGround: false,
+    q: "Which customers have overdue payments and what does the agreement say about service suspension?",
+    // The corpus has no payments table / suspension agreement → must HONESTLY say so,
+    // grounded in what WAS retrieved (correct the premise), NOT generic A/R boilerplate.
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (/A\/R aging|accounts receivable aging|run an aging report/i.test(a)) return { ok: false, why: "generic A/R boilerplate punt" };
+      if (!saysNotInDocs(a)) return { ok: false, why: "did not honestly flag the absence" };
+      // Must reference what WAS retrieved (the Carter/business docs) — not a bare refusal.
+      return { ok: /carter|divorce|menda|family|document|evidence/i.test(a), why: "did not anchor in retrieved content" };
+    },
+  },
+  {
+    id: "EN/general-paris", ctx: DEMO_ADMIN, mustGround: false,
+    q: "What is the capital of France?",
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "refused a general-knowledge question" };
+      return { ok: /paris/i.test(a), why: "did not answer Paris" };
+    },
+  },
+  {
+    id: "EN/general-child-support-def", ctx: DEMO_ADMIN, mustGround: false,
+    q: "Explain what 'child support' generally means in family law.",
+    // A definitional general-knowledge question: must give a real plain explanation, and
+    // must NOT present a Carter-case figure AS the general definition. (Grounding on the
+    // case while ALSO explaining the general concept is fine; refusing is not.)
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "refused a general-knowledge question" };
+      const explainsGenerally = /(payment|support).{0,80}(child|parent).{0,80}(expense|need|care|cost|raising)/is.test(a)
+        || /generally|in family law|typically|usually/i.test(a);
+      return { ok: explainsGenerally, why: "did not give a general plain-language explanation" };
+    },
+  },
+  {
+    id: "EN/meta-previous", ctx: DEMO_ADMIN, mustGround: false,
+    q: "What did I just ask you in my previous question?",
+    history: [{ question: "How many contracts are expiring in the next 90 days?", answer: "There are 41 contracts expiring in the next 90 days. [S:contracts#1]" }],
+    grade: (res) => {
+      const a = res.answer ?? "";
+      if (ONLY_DOCS_REFUSAL.test(a)) return { ok: false, why: "refused a meta question with only-docs" };
+      return { ok: /contract|expir|90/i.test(a), why: "did not recap the prior turn from history" };
+    },
+  },
+  {
+    id: "EN/weather", ctx: DEMO_ADMIN, mustGround: false,
+    q: "What's the weather in Tel Aviv tomorrow?",
+    // Genuinely-unanswerable live data: must say it has no real-time access, NOT fabricate.
+    grade: (res) => {
+      const a = res.answer ?? "";
+      // A fabricated forecast names a temperature / condition as fact.
+      const fabricated = /\b\d{1,2}\s?°|\b\d{1,2}\s?(degrees|°c|°f)\b|(sunny|rainy|cloudy|hot|cold|clear)\b.{0,30}(tomorrow|high|low)/i.test(a)
+        && !/(don'?t|do not|cannot|can'?t|no).{0,30}(real-?time|live|access|forecast|current)/i.test(a);
+      if (fabricated) return { ok: false, why: "fabricated a specific forecast" };
+      const honest = /(don'?t|do not|cannot|can'?t|no).{0,40}(real-?time|live|access|current weather|forecast)/i.test(a);
+      return { ok: honest, why: "did not honestly say it has no real-time weather access" };
+    },
+  },
+];
+
+// ── A throwaway MEMO owner reproduces the bluefalcon ADOPTION exhibit on the real path ──
+// The fixture is a generic internal memo (codename/budget/lead) the engine has NO prior
+// knowledge of — ingested here, asked 5x, then deleted. This is the 6/10-generic-punt
+// exhibit the salvage fix targets, exercised end-to-end (ingest → ask → cited memo answer).
+const BF_PDF = path.join("/tmp", "bluefalcon.pdf");
+let MEMO_OWNER = null, MEMO_DOC = null, memoReady = false;
+
+async function newOwner(tag) {
+  const email = `reliability-${tag}-${crypto.randomUUID().slice(0, 8)}@nucleus-eval.invalid`;
+  const { data, error } = await admin().auth.admin.createUser({ email, password: crypto.randomUUID(), email_confirm: true });
+  if (error || !data?.user?.id) throw new Error(`could not create throwaway owner: ${error?.message ?? "no id"}`);
+  return settleOwner(data.user.id);
+}
+
+// ── THE STRICT 5/5 RUNNER ───────────────────────────────────────────────────────
+const results = [];
+function record(id, desc, ok, detail = "") {
+  results.push({ id, ok: !!ok });
+  console.log(`  ${ok ? "✓ PASS" : "✗ FAIL"} [${id}] ${desc}${detail ? `\n         ↳ ${detail}` : ""}`);
+}
+
+async function runQuestion(item) {
+  // N FRESH, INDEPENDENT runs — a full in-memory wipe before EACH so every run is a cold,
+  // independent draw (no warm-state carryover lets one good run prime the next).
+  let passes = 0;
+  const fails = [];
+  for (let i = 0; i < RUNS; i++) {
+    __resetRuntimeStoreForTests();
+    resetStore();
+    const res = await answerQuestion(item.q, { ...item.ctx, history: item.history });
+    const g = item.grade(res);
+    if (g.ok) passes++;
+    else fails.push(`run${i + 1}: ${g.why} :: mode=${res.mode} cites=${cites(res.answer).join(" ") || "(none)"} :: "${(res.answer || "").slice(0, 120).replace(/\n/g, " ")}"`);
+  }
+  const ratio = `${passes}/${RUNS}`;
+  const ok = passes === RUNS; // STRICT 5/5 — never a lenient pass@K.
+  record(
+    `${item.mustGround ? "GROUND" : "BRANCH"}/${item.id}`,
+    `${item.mustGround ? "must-ground" : "must give honest/helpful answer"} on ${RUNS}/${RUNS} fresh runs — measured ${ratio}`,
+    ok,
+    ok ? "" : `FAILED runs:\n         ↳ ${fails.join("\n         ↳ ")}`
+  );
+  return { id: item.id, mustGround: item.mustGround, ratio, passes, ok };
+}
+
+async function main() {
+  record("ENV/supabase", "the engine sees Supabase as configured (real corpora live)", supabaseEnabled());
+  if (!supabaseEnabled()) throw new Error("supabaseEnabled() is false despite env — aborting to avoid a meaningless run");
+
+  console.log(`\n▶ ANSWER RELIABILITY — STRICT ${RUNS}/${RUNS} gate per question (no pass@K). ${QUESTIONS.length} real+edge questions.`);
+
+  // Reproduce the bluefalcon ADOPTION exhibit on the real ingest→ask path (throwaway owner).
+  // Skip the ingest entirely when this shard selects no memo question (saves time + a
+  // throwaway user) — the memo exhibit is only added when its id is in scope.
+  const wantMemo = idMatchesOnly("EN/memo-adoption-exhibit") || idMatchesOnly("EN/memo-false-premise");
+  if (fs.existsSync(BF_PDF) && wantMemo) {
+    MEMO_OWNER = await newOwner("memo");
+    const buf = new Uint8Array(fs.readFileSync(BF_PDF));
+    const ing = await ingestPdf(buf, "internal-memo.pdf", "Internal memo", MEMO_OWNER);
+    MEMO_DOC = ing.doc;
+    memoReady = (ing.persisted ?? 0) > 0;
+    record("MEMO/ingest", "synthetic internal memo ingested + persisted for the throwaway owner",
+      memoReady, `doc=${MEMO_DOC} persisted=${ing.persisted}`);
+    if (memoReady) {
+      // The PRIMARY INTERMITTENCY EXHIBIT — must ground 5/5 (was 6/10 generic-punt in logs).
+      QUESTIONS.push({
+        id: "EN/memo-adoption-exhibit",
+        ctx: { ownerId: MEMO_OWNER, isDemo: false, role: "member" },
+        mustGround: true,
+        q: "According to the uploaded internal memo, what is the classified project codename, the approved budget, and the project lead?",
+        grade: gFact(/bluefalcon/i, numRx("42000"), /whitfield|dana/i,
+          (r) => ({ ok: docCites(r.answer).length > 0, why: "no [P:] cite to the memo" })),
+      });
+      // FALSE-PREMISE over the same memo: must confirm the lead AND correct the wrong budget.
+      QUESTIONS.push({
+        id: "EN/memo-false-premise",
+        ctx: { ownerId: MEMO_OWNER, isDemo: false, role: "member" },
+        mustGround: true,
+        q: "The memo says the budget was $420,000 — can you confirm the project lead?",
+        grade: gFact(/whitfield|dana/i, numRx("42000"),
+          (r) => ({ ok: docCites(r.answer).length > 0, why: "no [P:] cite" })),
+      });
+    }
+  } else if (wantMemo) {
+    console.log("  ℹ /tmp/bluefalcon.pdf not present — skipping the throwaway-memo adoption exhibit (the real-corpus questions still gate the fix).");
+  }
+
+  const selected = QUESTIONS.filter((item) => idMatchesOnly(item.id));
+  if (ONLY.length) {
+    console.log(`  (RELIABILITY_ONLY=${ONLY.join(",")} → running ${selected.length}/${QUESTIONS.length} questions this shard, each at the SAME ${RUNS}/${RUNS} gate)`);
+  }
+  const perQ = [];
+  for (const item of selected) {
+    perQ.push(await runQuestion(item));
+  }
+
+  // ── RELIABILITY REPORT across the FULL range (per-question N/M) ──────────────────
+  console.log(`\n${"─".repeat(72)}`);
+  console.log("PER-QUESTION RELIABILITY (the honest measure — every question's true N/M):");
+  const mustG = perQ.filter((p) => p.mustGround);
+  const branch = perQ.filter((p) => !p.mustGround);
+  for (const p of perQ) {
+    console.log(`  ${p.ok ? "✓" : "✗"} ${p.ratio.padStart(4)}  ${p.mustGround ? "[GROUND]" : "[BRANCH]"} ${p.id}`);
+  }
+  const mustGreen = mustG.filter((p) => p.ok).length;
+  const branchGreen = branch.filter((p) => p.ok).length;
+  console.log(`\n  MUST-GROUND: ${mustGreen}/${mustG.length} questions cleared their ${RUNS}/${RUNS} gate`);
+  console.log(`  BRANCH (general/meta/absent): ${branchGreen}/${branch.length} cleared their ${RUNS}/${RUNS} gate`);
+  const totalRuns = perQ.reduce((s, p) => s + RUNS, 0);
+  const totalPass = perQ.reduce((s, p) => s + p.passes, 0);
+  console.log(`  AGGREGATE per-run success across the whole range: ${totalPass}/${totalRuns} (${((100 * totalPass) / totalRuns).toFixed(1)}%)`);
+}
+
+async function cleanup() {
+  let usersDeleted = 0, docsAfter = -1;
+  try {
+    if (MEMO_OWNER && MEMO_DOC) await deleteUploadedDoc(MEMO_OWNER, MEMO_DOC, false).catch(() => {});
+    if (MEMO_OWNER) docsAfter = (await listDurableDocs(MEMO_OWNER).catch(() => [])).length;
+  } catch (e) {
+    console.error("memo cleanup error:", e instanceof Error ? e.message : e);
+  }
+  if (MEMO_OWNER) {
+    try {
+      const { error } = await admin().auth.admin.deleteUser(MEMO_OWNER); // CASCADE clears doc_chunks
+      if (!error) usersDeleted++; else console.error("user delete error:", error.message);
+    } catch (e) { console.error("user delete threw:", e instanceof Error ? e.message : e); }
+  }
+  console.log(`\n↩ cleanup: throwaway memo owner deleted: ${usersDeleted}/${MEMO_OWNER ? 1 : 0} (docs remaining: ${docsAfter})`);
+  record("CLEANUP/clean", "the throwaway memo owner + its doc_chunks were deleted (no residue)",
+    !MEMO_OWNER || (usersDeleted === 1 && docsAfter === 0), `usersDeleted=${usersDeleted} docsRemaining=${docsAfter}`);
+}
+
+// RESIDUE GUARD (#79): refuse to run over a DB a prior leaked run left dirty (a polluted
+// catalog produces a FALSE GREEN); abort loudly. Asserts 0 throwaway orphan rows BEFORE the run.
+await assertCleanBefore("answer-reliability");
+let runError = null;
+try {
+  await main();
+} catch (e) {
+  runError = e;
+  console.error("\nEVAL RUNNER ERROR:", e instanceof Error ? e.stack : e);
+} finally {
+  await cleanup();
+}
+// RESIDUE GUARD (#79): this run must leave 0 throwaway residue — fail loudly if its cleanup leaked.
+await assertCleanAfter("answer-reliability");
+
+const fails = results.filter((r) => !r.ok);
+console.log(`\n${"═".repeat(72)}`);
+// HONEST BANNER (the meta-fix): a runError (e.g. a transient `fetch failed` to the
+// provider that ABORTED main() before the questions ran) must NEVER read as "ALL GREEN"
+// — the exit code already fails, but a green banner over an aborted run is a false-green
+// to a human skimming the log. So we only say GREEN when there were zero fails AND no
+// runError; otherwise we say plainly that the run did not complete / had failures.
+if (runError) {
+  console.log(
+    `ANSWER RELIABILITY: DID NOT COMPLETE — the run was ABORTED by an error (NOT a pass): ${
+      runError instanceof Error ? runError.message : String(runError)
+    }. Re-run (a transient provider 'fetch failed' is common under concurrent shards — run shards one at a time).`
+  );
+} else {
+  console.log(
+    `ANSWER RELIABILITY: ${results.length - fails.length}/${results.length} gates passed` +
+      (fails.length ? ` · FAILED: ${fails.map((f) => f.id).join(", ")}` : " · ALL GREEN")
+  );
+}
+if (fails.length || runError) process.exit(1);
+process.exit(0);

@@ -32,12 +32,12 @@ export default function DevInspectorPage() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-canvas">
-      <AppSidebar active="documents" />
+      <AppSidebar active="chat" />
       <main className="flex flex-1 flex-col overflow-hidden">
         <header className="flex flex-wrap items-center gap-3 border-b border-line bg-surface px-7 py-4">
           <div className="mr-auto">
             <h1 className="font-display text-xl font-bold tracking-tight text-ink">
-              AI Business Assistant
+              NUCLEUS 770
             </h1>
             <p className="text-sm text-faint">
               Inspector preview (UI render from engine structure)

@@ -6,7 +6,7 @@ import { createClient } from "@/lib/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { THEME_KEY } from "@/components/theme-toggle";
+import { THEME_KEY, currentBrand, setBrand, type Brand } from "@/components/theme-toggle";
 import { validatePassword, validateDisplayName, MIN_PASSWORD_LENGTH } from "@/lib/account/validate";
 import { cn } from "@/lib/utils";
 
@@ -44,8 +44,9 @@ export function AccountPanel() {
   const [pwSaved, setPwSaved] = useState(false);
   const [pwError, setPwError] = useState<string | null>(null);
 
-  // ── theme state ───────────────────────────────────────────────────────────
+  // ── theme + brand state ───────────────────────────────────────────────────
   const [theme, setTheme] = useState<Theme | null>(null);
+  const [brand, setBrandSel] = useState<Brand | null>(null);
 
   useEffect(() => {
     const supabase = createClient();
@@ -59,6 +60,7 @@ export function AccountPanel() {
       setIdentityLoaded(true);
     });
     setTheme(currentTheme());
+    setBrandSel(currentBrand());
   }, []);
 
   async function saveDisplayName(e: React.FormEvent) {
@@ -124,6 +126,16 @@ export function AccountPanel() {
     }
     setTheme(next);
   }
+
+  function pickBrand(next: Brand) {
+    setBrand(next); // sets the data-brand attribute + persists "ab-brand"
+    setBrandSel(next);
+  }
+
+  const BRANDS: { value: Brand; label: string; sub: string; swatch: string; soft: string }[] = [
+    { value: "violet", label: "Violet", sub: "Default", swatch: "#7c3aed", soft: "#f3effe" },
+    { value: "teal", label: "Teal", sub: "Alternate", swatch: "#0d9488", soft: "#f0fdfa" },
+  ];
 
   const nameDirty = identityLoaded && displayName.trim() !== loadedName.trim();
   const isDark = theme === "dark";
@@ -307,7 +319,41 @@ export function AccountPanel() {
           <Palette className="size-4 text-accent" />
           <div className="min-w-0 flex-1">
             <h2 className="font-display text-base font-semibold text-ink">Appearance</h2>
-            <p className="text-sm text-faint">Choose a light or dark theme for this browser.</p>
+            <p className="text-sm text-faint">Brand color and light/dark theme — saved for this browser.</p>
+          </div>
+        </div>
+
+        {/* Brand color (violet / teal) */}
+        <div className="border-b border-line p-6">
+          <span className="mb-3 block text-sm font-semibold text-ink">Brand color</span>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2" data-testid="brand-picker">
+            {BRANDS.map((b) => {
+              const active = brand === b.value;
+              return (
+                <button
+                  key={b.value}
+                  type="button"
+                  onClick={() => pickBrand(b.value)}
+                  data-testid={`brand-${b.value}`}
+                  data-active={active}
+                  aria-pressed={active}
+                  className={cn(
+                    "flex items-center gap-3 rounded-2xl border bg-surface px-4 py-3 text-left transition-colors",
+                    active ? "border-accent ring-2 ring-accent-ring" : "border-line hover:border-line-strong"
+                  )}
+                >
+                  <span
+                    className="size-9 shrink-0 rounded-xl border border-black/5"
+                    style={{ background: `linear-gradient(135deg, ${b.swatch}, ${b.soft})` }}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-semibold text-ink">{b.label}</span>
+                    <span className="block text-xs text-faint">{b.sub}</span>
+                  </span>
+                  {active && <Check className="size-4 shrink-0 text-accent" strokeWidth={2.5} />}
+                </button>
+              );
+            })}
           </div>
         </div>
 

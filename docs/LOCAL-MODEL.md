@@ -6,17 +6,31 @@
 
 ---
 
+## ⚠️ v0.5 scope — Local mode is CHAT-ONLY (read this first)
+
+Local mode today is **chat-only**. When you switch to Local:
+
+- ✅ Your message genuinely round-trips through **your own model** (e.g. Ollama on your box) and the reply renders in the app. Your prompt goes **only to your endpoint** — never to a cloud AI provider.
+- ❌ Local mode **does NOT read your uploaded documents, spreadsheets, or business data.** It answers from the model's **own general knowledge only**.
+- ✅ **It is honest about that.** If you ask about your files, Local mode says plainly *that it can't read documents in Local mode* and suggests switching to Cloud — it **never** makes up what a document says. (This is enforced two ways: a system-prompt instruction that names your files and forbids fabricating their contents, and a visible note in **Settings → Model**.)
+
+**Why chat-only?** A small local CPU model can't do the document retrieval + citation work the Cloud engine does. Rather than fake it (fabricated "citations" from a model that never read the file), Local mode stays honest and does the one thing it can do well: chat. **Reading your documents in Local mode is the planned upgrade** — see **[The GPU-day upgrade path](#the-gpu-day-upgrade-path)** at the end.
+
+> To ask questions **about your documents/data**, use **Cloud** mode. That is the full retrieval + citation engine.
+
+---
+
 ## What "Local" means
 
 The AI assistant has a model switch with **three** choices (top of the Ask panel, and in **Settings → Model**):
 
-| Mode | Where the AI that writes the answer runs | Key it uses |
-|---|---|---|
-| **Cloud** | a hosted model (the demo ships on one we configured — no setup) | any OpenAI-compatible key (DeepSeek / OpenAI / Gemini …) |
-| **HIPAA** | a HIPAA-eligible hosted model | your **Azure OpenAI** key (under a Microsoft BAA) |
-| **Local** | **your own computer or server** | none — it's your machine |
+| Mode | Where the AI runs | Reads your documents? | Key it uses |
+|---|---|---|---|
+| **Cloud** | a hosted model (the demo ships on one we configured — no setup) | ✅ yes — full retrieval + citations | the server's Anthropic key (or your own) |
+| **HIPAA** | a HIPAA-eligible hosted model (Azure OpenAI) | ✅ yes (when wired) | your **Azure OpenAI** key (under a Microsoft BAA) |
+| **Local** | **your own computer or server** | ❌ **no (v0.5, chat-only)** | none — it's your machine |
 
-This guide is about **Local**: the part of the system that *writes the answer sentences* runs on **your** hardware. Everything else about an answer — finding the right contract rows, retrieving the right document pages, and **citing** them — is **identical** no matter which model writes; the model is just the final writer. (So a weak local model still gets the *right* documents retrieved and shown; see "Which model" below.)
+This guide is about **Local**: the model that *writes the answer* runs on **your** hardware, from its own general knowledge. Document search, retrieval, and citation are **Cloud-only** in this version.
 
 ---
 
@@ -42,7 +56,7 @@ On the box that will run the AI:
 ```bash
 # 1. install Ollama (one click): https://ollama.com
 # 2. pull a model and start the server:
-ollama pull qwen2.5:1.5b      # the default — small + fast on a plain CPU (see "Which model")
+ollama pull llama3.2:3b       # a small, fast chat model (verified on a plain CPU box, ~5s cold)
 ollama serve                  # usually already running after install
 ```
 
@@ -51,41 +65,44 @@ Ollama now serves an **OpenAI-compatible** API at **`http://localhost:11434/v1`*
 Verify it works (optional):
 ```bash
 curl http://localhost:11434/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"qwen2.5:1.5b","messages":[{"role":"user","content":"say OK"}],"stream":false}'
-# → returns a JSON chat completion. (Verified: ~1s warm on a CPU box.)
+  -d '{"model":"llama3.2:3b","messages":[{"role":"user","content":"say OK"}],"stream":false}'
+# → returns a JSON chat completion. (Verified live.)
 ```
 
 ---
 
 ## A) Self-host the app on your box (no tunnel)
 
-You run the app and the model on the same machine. *(Verified on a real box: `npm run build` exits 0, `npm start` serves, and Local answers cite the right pages.)*
+You run the app and the model on the same machine.
 
 ```bash
-# on the box (needs Node.js 20+):
+# on the box (needs Node.js 20+ and pnpm: `npm install -g pnpm`):
 git clone <your-nucleus-repo-url>
 cd nucleus
-npm install
-npm run build        # verified: builds clean
-npm start            # serves http://localhost:3000  (verified: "Ready" + HTTP 200)
+pnpm install
+pnpm approve-builds --all   # approve native build scripts (sharp, tesseract.js, …) so the
+                            # build/run isn't blocked (ERR_PNPM_IGNORED_BUILDS)
+pnpm build                  # builds the production app
+pnpm start                  # serves http://localhost:3000  ("Ready" + HTTP 200)
 ```
 
-> Logins (Supabase) and uploaded-document search (Gemini) still use their own keys — see **HANDOFF.md**. Switching the **model** to Local changes only *who writes the answer*, not the rest of the app.
+> Logins run on your **Supabase** — set that up first via **[SETUP.md](SETUP.md)**. Switching the **model** to Local changes only *who writes the answer* (and, in v0.5, means documents aren't read — see the scope note above).
 
 Then in the app (`http://localhost:3000`), signed in as **admin**:
 1. **Settings → Model**.
-2. **Local model endpoint:** `http://localhost:11434/v1`
-3. Click **Detect models on your box** → it lists the models you've pulled → **click one** (e.g. `qwen2.5:1.5b`). *(Or type the name in the field — both work.)*
-4. **Save**, then flip the switch to **Local**.
-5. Ask a question — the answer is now written on your box. 🎉
+2. Flip the switch to **Local**. (Read the on-screen note: *documents are not read in Local mode*.)
+3. **Local model endpoint:** `http://localhost:11434/v1`
+4. Click **Detect models on your box** → it lists the models you've pulled → **click one** (e.g. `llama3.2:3b`). *(Or type the name in the field — both work.)*
+5. **Save**. Optionally use a **Test connection** to confirm the endpoint answers.
+6. Ask a chat question — the answer is now written on your box. 🎉
 
-People you give the box's address to all get answers generated on your hardware.
+People you give the box's address to all get chat answers generated on your hardware.
 
 ---
 
 ## B) Cloud app on Vercel + model on your box (tunnel)
 
-The Vercel app can't reach your machine's `localhost` directly — a **tunnel** gives your model a public URL the cloud app can call.
+The Vercel app can't reach your machine's `localhost` directly — a **tunnel** gives your model a public URL the cloud app can call. (The app calls your endpoint server-side, so it works from anywhere the tunnel is reachable.)
 
 ### B1. Open the tunnel (the two flags are NOT optional)
 
@@ -106,10 +123,11 @@ cloudflared tunnel --url http://localhost:11434 \
 ### B2. Point the app at it
 
 In the hosted app → **Settings → Model** (signed in as admin):
+- Flip to **Local**.
 - **Local model endpoint:** your tunnel URL **+ `/v1`** → e.g. `https://random-words.trycloudflare.com/v1`
-- **Save**, then click **Detect models on your box** → click your model → **Local**.
+- **Save**, then click **Detect models on your box** → click your model.
 
-*(Verified end-to-end: the hosted Vercel demo, flipped to Local through this exact tunnel, answered a document question with the correct figure + page citation, generated on the box.)*
+*(A chat message sent in Local mode round-trips through the box over the tunnel and renders; the response is stamped `model: local:<name>` so you can confirm it came from your model. Documents are still not read — that's Cloud mode.)*
 
 ### B3. Make it 24/7 (always-on box)
 
@@ -130,39 +148,50 @@ bash scripts/local-tunnel-supervisor.sh   # leave it running (or install as a se
 
 ## Which model? (the model is the swappable knob)
 
-The answer is only as good as the model writing it; the retrieval + citation machinery is identical regardless. Tested trade-off on a plain CPU box:
+In v0.5 the model's job is **chat**, so pick for chat quality + speed on your box:
 
-| Model | Speed (warm) | Answer quality | Use it when |
+| Model | Speed (warm) | Chat quality | Use it when |
 |---|---|---|---|
-| **`qwen2.5:1.5b`** (default) | fastest (~1s) | **weak** — often answers generally and **won't cite**, even though the right docs were retrieved | smallest footprint; you accept hit-or-miss answers |
-| **`qwen2.5:3b`** | ~1–2s warm | **good** — reliably cites the right page | you want consistent, cited answers (recommended if your box can run it) |
-| **`qwen2.5:7b`+** | slower on CPU | best | you have a strong box / GPU |
+| **`llama3.2:3b`** | fast (~1–5s CPU) | good general chat | a solid default on a plain CPU box (tested) |
+| **`qwen2.5:1.5b`** | fastest | weaker, terser | smallest footprint; you want speed over depth |
+| **`qwen2.5:7b`+ / llama3.1:8b** | slower on CPU | best | you have a strong box / GPU |
 
-Switching is one click — **Detect models → click another model**. Other families work too (`llama3`, `mistral`, …).
-
-**What a *weak* model looks like (and why it's honest):** with 1.5b you may ask "what's the child support?" and get *"generally, child support involves…"* with **no citation**. That is **not** the system failing — open the **Inspector** and you'll see the whole chain: the **Router** correctly picked *documents*, **Retrieval** found the right 8 passages (shown, with real cosine scores), and the **Generation** step honestly says *"answered from general knowledge (uncited) — the model didn't ground in the 8 retrieved items, still shown below."* The model was just too small to commit to the evidence; the system stayed honest (no fabricated citation) and still shows you the documents. A bigger model cites them.
+Switching is one click — **Detect models → click another model**. Other families work too (`llama3`, `mistral`, …). Answer *quality* is out of scope to certify in v0.5 (a small CPU model is a small CPU model); what's guaranteed is that the message genuinely runs on **your** model and that Local mode never pretends to read your files.
 
 ---
 
 ## If Local isn't set up / can't be reached
 
-- **No endpoint entered**, then you ask in Local mode → a calm message: *"Local mode is on, but no local model is set up yet…"* (no crash).
-- **Endpoint set but unreachable** (Ollama off, wrong URL, tunnel down) → *"Local mode is on, but I couldn't reach your local model at \<endpoint\>…"* — names the address, fails in a few seconds, never hangs.
+- **No endpoint entered**, then you ask in Local mode → a calm message: *"Local mode is on, but no local model endpoint is set yet — open Settings → Model…"* (no crash, no fabricated answer).
+- **Endpoint set but unreachable** (Ollama off, wrong URL, tunnel down) → *"Local model endpoint unreachable at \<endpoint\> — is Ollama running / is the tunnel up?…"* — names the address, fails in a few seconds, never hangs, never 500s.
+
+Both are friendly `200` answers carrying a `localGuidance` flag, so the Ask surface shows a calm setup/troubleshooting note instead of an error.
 
 ---
 
-## Honest caveat — "Local model" ≠ fully offline
+## Honest caveat — "Local model" ≠ fully offline, and ≠ document-aware
 
-Switching the **model** to Local runs **the AI on your hardware**. It does not, by itself, make the whole app offline:
+Switching the **model** to Local runs **the chat AI on your hardware**. It does not, by itself, make the whole app offline, and (v0.5) it does not read your documents:
 
-| Part | After switching to Local | Still cloud? |
+| Part | After switching to Local | Notes |
 |---|---|---|
-| **The AI that writes answers** | **your hardware** | ✅ now local |
-| Login / accounts | Supabase | ⚠️ unless you self-host Supabase |
-| Uploaded-document search | Gemini File Search | ⚠️ unless separately localized |
-| Structured data (contracts/maintenance) | in the app, on your box | ✅ already local |
+| **The AI that writes chat answers** | **your hardware** | ✅ now local; your prompt goes only to your endpoint |
+| **Reading uploaded documents/data** | **not done in Local mode** | ❌ v0.5 chat-only — use Cloud to ask about files |
+| Login / accounts | Supabase | ⚠️ cloud unless you self-host Supabase |
+| Structured/document storage | your Supabase | ⚠️ on your Supabase (unused by the Local chat path) |
 
-A full air-gap is a further step (self-host the login + document-search lanes too). The switch gives you the biggest piece: **the AI itself on your machine.**
+A full air-gap is a further step (self-host Supabase too). The switch gives you the biggest privacy piece for chat: **the model itself on your machine.**
+
+---
+
+## The GPU-day upgrade path
+
+Reading documents in Local mode is **designed, not built** — it's the natural next version once the hardware can run a model big enough to use it:
+
+- **v1 (the plan): file the document TEXT straight into the model's context, within a token budget.** When the owner has a GPU that can run a capable model with a large context window, the simplest honest upgrade is to fetch the in-scope files' extracted text and put it directly in the prompt (bounded by a token budget), then let the model answer + cite from what it was given. This is deliberately **simpler** than rebuilding the full hybrid-RAG retrieval stack locally ("the RAG swamp") — it trades cost/context for a large reduction in moving parts, and it's honest (the model only sees text it was actually given). See `docs/overnight-2026-07-02-plan.md` for the framing.
+- **v2 (parked): an agent framework + Docker sidecar** (e.g. smolagents in a container) is **explicitly out of scope** and parked — see `docs/AGENT-HANDOFF.md`. Do not build it as part of Local mode.
+
+Until then, Local mode is chat-only and says so.
 
 ---
 
@@ -170,12 +199,14 @@ A full air-gap is a further step (self-host the login + document-search lanes to
 
 | Thing | Value |
 |---|---|
+| What Local does (v0.5) | **chat only**, on your model; **does not read your documents** |
 | Ollama endpoint | `http://localhost:11434/v1` (self-host) · `https://<tunnel>/v1` (cloud app + tunnel) |
-| Recommended model | **`qwen2.5:1.5b`** default (fast, weak); **`qwen2.5:3b`** for reliable citations |
+| Tested model | **`llama3.2:3b`** (small, fast on CPU) |
 | Pick a model | **Detect models on your box** → click one (or type it) |
+| Confirm it ran locally | the answer's response JSON is stamped `model: local:<name>` |
+| Ask about documents | use **Cloud** mode (Local can't read files in v0.5) |
 | Tunnel command | `cloudflared tunnel --url http://localhost:11434 --http-host-header localhost:11434 --protocol http2` |
 | 24/7 tunnel | `scripts/local-tunnel-supervisor.sh` (self-healing) or a named Cloudflare tunnel (fixed URL) |
-| Hosted demo can use Local? | **Yes — with a tunnel.** Without one it shows the friendly setup message |
-| If unreachable | calm, fast message naming the endpoint (no hang) |
+| If unreachable | calm, fast message naming the endpoint (no hang, no 500) |
 
 *Setup of the rest of the app (logins, document search, the cloud/HIPAA models) is in [HANDOFF.md](HANDOFF.md).*
